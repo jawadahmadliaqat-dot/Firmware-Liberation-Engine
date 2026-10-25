@@ -1,0 +1,17 @@
+# Build outputs and machine-local state — never published
+projects/
+lean/.lake/
+__pycache__/
+*.pyc
+
+# Binaries are reproducible or upstream — never published
+*.elf
+binaries/
+
+# Large derived reports — the small blink report IS published; the big
+# BMP (39 MB) and ls (16 MB) reports live on Drive, linked from the README
+analysis_reports/blackmagic-native-v2_0_0.elf_report.json
+analysis_reports/ls_report.json
+
+# VM-recovery helper (references a VM-local Ghidra zip path) — stays local
+reinstall_ghidra.sh
