@@ -1,8 +1,23 @@
 # Black Magic Probe v2.0.0 — Register Map (extracted, not assumed)
 
-Source: `blackmagic-native-v2_0_0.elf_report.json` (213 MMIO accesses, 32 distinct registers).
-Method: static Ghidra P-Code extraction (ExtractIR v3.1) + CFG fixpoint register tracking.
+Source: `blackmagic-native-v2_0_0.elf_report.json` (235 MMIO accesses, 35 distinct registers).
+Method: static Ghidra P-Code extraction (ExtractIR v3.3) + CFG fixpoint register tracking.
 Register names come from the public STM32F1 reference map (RM0008).
+
+## What changed in v3.3 (TBB/TBH jump-table recovery)
+
+- Must-accesses grew 213 -> 235 (0 dropped, 0 may-sites changed): the
+  recovered TBB/TBH case blocks restored `rcc_is_osc_ready` (7 accesses:
+  RCC CR/BDCR/CSR), `rcc_osc_on` (9), and `remote_packet_process`'s 5
+  GPIOB stores, plus 19 jtagtap accesses v3's list-order scan had
+  missed. 35 distinct registers (was 32): RCC CR, BDCR, CSR return.
+- vs the original v3 (226): 15 claims are still absent, all explained
+  -- 6 converted to honest MAY-accesses (one-sided v3 claims),
+  1 phantom (`renesas_uid`) correctly gone, 1 v3 error corrected
+  (`platform_nrst_set_val` GPIOC BRR -> GPIOA BSRR), and 7
+  argument-dependent addresses that are TOP in both analyses
+  (`exti_select_source` AFIO EXTICR1, `jtagtap_cycle` AFIO EVCR,
+  `st_usbfs_endpoints_reset` USB+0x04).
 
 ## What changed vs the v3 map (226 accesses, 40 registers)
 
@@ -31,7 +46,7 @@ Register names come from the public STM32F1 reference map (RM0008).
 | TIM3 | CCR2 | 0x40000438 | 0 | 1 | tim3_isr(1) | - |
 | USB | +0x00 | 0x40005c00 | 1 | 1 | st_usbfs_ep_stall_set(2) | - |
 | USB | CNTR | 0x40005c40 | 4 | 2 | st_usbfs_poll(4), st_usbfs_v1_usbd_init(2) | 0, 39936 |
-| USB | ISTR | 0x40005c44 | 5 | 1 | st_usbfs_poll(5), st_usbfs_v1_usbd_init(1) | 0, 61439, 63487, 64511, 65023 |
+| USB | ISTR | 0x40005c44 | 5 | 1 | st_usbfs_poll(5), st_usbfs_v1_usbd_init(1) | 0, 64511, 63487, 61439, 65023 |
 | USB | DADDR | 0x40005c4c | 1 | 0 | st_usbfs_set_address(1) | - |
 | USB | BTABLE | 0x40005c50 | 1 | 8 | st_usbfs_ep_read_packet(3), st_usbfs_ep_setup(2), st_usbfs_ep_write_packet(2) +2 more | 0 |
 | AFIO | MAPR | 0x40010004 | 1 | 1 | gpio_primary_remap(2) | - |
@@ -42,24 +57,25 @@ Register names come from the public STM32F1 reference map (RM0008).
 | EXTI | PR | 0x40010414 | 1 | 0 | exti_reset_request(1) | - |
 | GPIOA | CRL | 0x40010800 | 3 | 3 | swdptap_seq_in(2), swdptap_seq_in_parity(2), swdptap_seq_out(2) | - |
 | GPIOA | IDR | 0x40010808 | 0 | 9 | platform_nrst_get_val(2), jtagtap_next(2), jtagtap_tdi_tdo_seq(2) +2 more | - |
-| GPIOA | BSRR | 0x40010810 | 44 | 0 | jtagtap_tdi_tdo_seq(6), jtagtap_tdi_seq(6), swdptap_seq_out(6) +12 more | 2, 4, 16, 32, 256, 1024 |
-| GPIOA | BRR | 0x40010814 | 45 | 0 | jtagtap_tdi_tdo_seq(9), jtagtap_tdi_seq(8), swdptap_seq_out(6) +9 more | 2, 4, 16, 32, 256, 6144 |
+| GPIOA | BSRR | 0x40010810 | 44 | 0 | jtagtap_tdi_tdo_seq(6), jtagtap_tdi_seq(6), swdptap_seq_out(6) +12 more | 32×18, 16×11, 2×4, 4, 256, 1024 |
+| GPIOA | BRR | 0x40010814 | 45 | 0 | jtagtap_tdi_tdo_seq(9), jtagtap_tdi_seq(8), swdptap_seq_out(6) +9 more | 32×22, 16×12, 4, 6144, 256, 2 |
 | GPIOB | IDR | 0x40010c08 | 0 | 3 | platform_init(2), platform_target_voltage(1) | - |
-| GPIOB | BSRR | 0x40010c10 | 10 | 0 | platform_init(5), main(1), platform_target_set_power(1) +3 more | 2, 4, 96, 128, 224, 1024 |
-| GPIOB | BRR | 0x40010c14 | 9 | 0 | main(2), platform_init(2), platform_target_set_power(1) +4 more | 1, 2, 4, 224, 1024, 2048 |
+| GPIOB | BSRR | 0x40010c10 | 12 | 0 | platform_init(5), remote_packet_process(2), main(1) +4 more | 2×4, 1024×3, 96, 128, 224, 4 |
+| GPIOB | BRR | 0x40010c14 | 12 | 0 | remote_packet_process(3), main(2), platform_init(2) +5 more | 1024×5, 2×2, 4096, 224, 1, 4 |
 | GPIOC | BSRR | 0x40011010 | 1 | 0 | platform_target_clk_output_enable(1) | 32768 |
-| GPIOC | BRR | 0x40011014 | 2 | 0 | platform_target_clk_output_enable(1), platform_init(1) | 32768 |
+| GPIOC | BRR | 0x40011014 | 2 | 0 | platform_target_clk_output_enable(1), platform_init(1) | 32768×2 |
 | ADC1 | SR | 0x40012400 | 2 | 2 | platform_target_voltage_sense(2), sys_tick_handler(2) | - |
 | ADC1 | CR2 | 0x40012408 | 1 | 1 | adc_enable_temperature_sensor(2) | - |
+| RCC | CR | 0x40021000 | 1 | 10 | rcc_osc_on(6), rcc_is_osc_ready(5) | - |
 | RCC | CFGR | 0x40021004 | 9 | 9 | rcc_set_sysclk_source(2), rcc_set_pll_multiplication_factor(2), rcc_set_pll_source(2) +6 more | - |
 | RCC | APB2ENR | 0x40021018 | 0 | 1 | debug_serial_receive_callback(1) | - |
 | RCC | APB1ENR | 0x4002101c | 0 | 1 | debug_serial_receive_callback(1) | - |
+| RCC | BDCR | 0x40021020 | 1 | 2 | rcc_osc_on(2), rcc_is_osc_ready(1) | - |
+| RCC | CSR | 0x40021024 | 1 | 2 | rcc_osc_on(2), rcc_is_osc_ready(1) | - |
 | RCC | +0x2C | 0x4002102c | 5 | 5 | rcc_set_pll2_multiplication_factor(2), rcc_set_pll3_multiplication_factor(2), rcc_set_prediv1(2) +2 more | - |
 | FLASH | ACR | 0x40022000 | 1 | 1 | flash_set_ws(2) | - |
 | CRC | DR | 0x40023000 | 1 | 1 | stm32_crc32(2) | - |
 | CRC | CR | 0x40023008 | 1 | 1 | stm32_crc32(2) | - |
-
-Total: 32 distinct registers, 213 accesses.
 
 ## MAY-accesses (v3.2): possible, not certain
 
@@ -81,3 +97,5 @@ here. Verified against the ELF literal-pool words.
 
 Note: `rcc_get_usart_clk_freq` → USART1 is the single may-confinement
 flag (the rcc_ family is profiled RCC-only); adjudication open.
+
+Total: 35 distinct registers, 235 accesses.

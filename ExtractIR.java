@@ -69,6 +69,19 @@ import java.util.Set;
  * sees what a driver COULD touch. Jump-table blocks stay unreachable
  * (BRANCHIND has no successors) -- recovering those needs table
  * recovery, a separate step.
+ *
+ * v3.3 adds TBB/TBH jump-table recovery: the successor computation
+ * recognises Ghidra's ARM TBB/TBH P-Code shape (table LOAD + ZEXT +
+ * x2 + table base -> pc -> BRANCHIND), reads the table entries from
+ * program memory, and adds every entry's target that is a real
+ * instruction start in the same function as a CFG successor (both
+ * fixpoints share the recovered map). The table read stops when the
+ * next entry address reaches the smallest target seen so far (the
+ * table ends where the first case block begins), when it leaves the
+ * function's address range, or at 64 entries. Non-matching
+ * BRANCHINDs (pointer tables, bx reg) keep no successors: pointer
+ * targets are other functions, not successors here -- call-graph
+ * recovery is a separate step.
  * If the fixpoint does not converge within 100 rounds, every state is
  * reset to fully unknown (sound: fewer accesses recorded, never false
  * ones) and "fixpoint_converged" reports false for that function.
@@ -76,8 +89,9 @@ import java.util.Set;
  * disagree -- a true access may be missed, never invented); no
  * inter-procedural analysis (callees are opaque beyond the clobber);
  * no RAM model (loads from RAM other than program memory read unknown);
- * indirect branches (BRANCHIND) have no successors (sound under-
- * approximation: paths through jump tables may be missed).
+ * indirect branches (BRANCHIND) have recovered TBB/TBH successors
+ * (v3.3); other indirect branches still have no successors (sound
+ * under-approximation: paths through them may be missed).
  */
 public class ExtractIR extends GhidraScript {
 
@@ -450,7 +464,8 @@ public class ExtractIR extends GhidraScript {
     }
 
     @SuppressWarnings("unchecked")
-    private FixResult runFixpoint(List<OpRec> ops, Memory mem) {
+    private FixResult runFixpoint(List<OpRec> ops, Memory mem,
+        Map<Integer, List<Integer>> branchTargets) {
         int n = ops.size();
         Map<String, Bits>[] in = new Map[n];
         if (n == 0) return new FixResult(in, true);
@@ -488,9 +503,13 @@ public class ExtractIR extends GhidraScript {
                     // mov.gt/mov.le copies were skipped).
                     if (i + 1 < n) succ.get(i).add(i + 1);
                 }
-            } else if (mnem.equals("RETURN") || mnem.equals("BRANCHIND")) {
-                // No successors: sound under-approximation (paths through
-                // jump tables may be missed, never invented).
+            } else if (mnem.equals("RETURN")) {
+                // No successors: RETURN ends the function.
+            } else if (mnem.equals("BRANCHIND")) {
+                // v3.3: recovered TBB/TBH targets; anything else
+                // (pointer tables, bx reg) keeps no successors.
+                List<Integer> bt = branchTargets.get(i);
+                if (bt != null) succ.get(i).addAll(bt);
             } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
                 if (i + 1 < n) succ.get(i).add(i + 1);
             } else {
@@ -816,7 +835,8 @@ public class ExtractIR extends GhidraScript {
     }
 
     @SuppressWarnings("unchecked")
-    private MayResult runMayFixpoint(List<OpRec> ops, Memory mem) {
+    private MayResult runMayFixpoint(List<OpRec> ops, Memory mem,
+        Map<Integer, List<Integer>> branchTargets) {
         int n = ops.size();
         Map<String, Set<Long>>[] in = new Map[n];
         if (n == 0) return new MayResult(in, true);
@@ -845,8 +865,13 @@ public class ExtractIR extends GhidraScript {
                 if (mnem.equals("CBRANCH")) {
                     if (i + 1 < n) succ.get(i).add(i + 1);
                 }
-            } else if (mnem.equals("RETURN") || mnem.equals("BRANCHIND")) {
-                // No successors: same sound under-approximation as must.
+            } else if (mnem.equals("RETURN")) {
+                // No successors: RETURN ends the function.
+            } else if (mnem.equals("BRANCHIND")) {
+                // v3.3: recovered TBB/TBH targets; anything else
+                // (pointer tables, bx reg) keeps no successors.
+                List<Integer> bt = branchTargets.get(i);
+                if (bt != null) succ.get(i).addAll(bt);
             } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
                 if (i + 1 < n) succ.get(i).add(i + 1);
             } else {
@@ -885,6 +910,134 @@ public class ExtractIR extends GhidraScript {
         return new MayResult(in, converged);
     }
 
+    /** Most recent op before beforeIdx (exclusive) whose output
+        varnode has the given key, searching back at most 40 ops.
+        -1 if none. Used by the TBB/TBH backward slice. */
+    private static int findDef(List<OpRec> ops, String key, int beforeIdx) {
+        for (int j = beforeIdx - 1; j >= 0 && j >= beforeIdx - 40; j--) {
+            Varnode out = ops.get(j).out;
+            if (out != null && vkey(out).equals(key)) return j;
+        }
+        return -1;
+    }
+
+    /** v3.3: recover TBB/TBH jump-table targets as CFG successors.
+        Pattern (Ghidra ARM P-Code, verified on BMP):
+          COPY index -> U1
+          INT_ADD [const BASE, U1] -> U1
+          LOAD [ram, U1] -> U2            (output size 1 = TBB, 2 = TBH)
+          INT_ZEXT [U2] -> U1
+          INT_MULT [U1, const 2] -> U3
+          INT_ADD [const BASE, U3] -> pc
+          BRANCHIND [pc]
+        Targets = BASE + 2*entry for each table entry. Returns a map
+        from BRANCHIND op index to successor op indices (empty for
+        non-matching BRANCHINDs). */
+    private Map<Integer, List<Integer>> recoverTbbTargets(
+        List<OpRec> ops, Memory mem) {
+        Map<Integer, List<Integer>> result =
+            new HashMap<Integer, List<Integer>>();
+        if (ops.isEmpty()) return result;
+        Map<String, Integer> firstAt = new HashMap<String, Integer>();
+        long maxAddr = 0;
+        for (int i = 0; i < ops.size(); i++) {
+            String a = ops.get(i).instrAddr.toString();
+            if (!firstAt.containsKey(a)) firstAt.put(a, i);
+            try {
+                long v = Long.parseLong(a, 16);
+                if (v > maxAddr) maxAddr = v;
+            } catch (Exception e) {
+                // Ignore unparseable addresses.
+            }
+        }
+        for (int i = 0; i < ops.size(); i++) {
+            OpRec br = ops.get(i);
+            if (!br.mnem.equals("BRANCHIND") || br.ins.length < 1) continue;
+            int defPc = findDef(ops, vkey(br.ins[0]), i);
+            if (defPc < 0) continue;
+            OpRec addFinal = ops.get(defPc);
+            if (!addFinal.mnem.equals("INT_ADD") ||
+                addFinal.ins.length != 2) continue;
+            Long base = null;
+            String prodKey = null;
+            for (int s = 0; s < 2; s++) {
+                Varnode v = addFinal.ins[s];
+                if (v.isConstant()) {
+                    base = v.getOffset();
+                } else {
+                    prodKey = vkey(v);
+                }
+            }
+            if (base == null || prodKey == null) continue;
+            int defProd = findDef(ops, prodKey, defPc);
+            if (defProd < 0) continue;
+            OpRec mult = ops.get(defProd);
+            if (!mult.mnem.equals("INT_MULT") || mult.ins.length != 2) continue;
+            String entryKey = null;
+            boolean timesTwo = false;
+            for (int s = 0; s < 2; s++) {
+                Varnode v = mult.ins[s];
+                if (v.isConstant() && v.getOffset() == 2L) {
+                    timesTwo = true;
+                } else {
+                    entryKey = vkey(v);
+                }
+            }
+            if (!timesTwo || entryKey == null) continue;
+            int defEntry = findDef(ops, entryKey, defProd);
+            if (defEntry < 0) continue;
+            OpRec zext = ops.get(defEntry);
+            if (!zext.mnem.equals("INT_ZEXT") || zext.ins.length != 1) continue;
+            int defLoad = findDef(ops, vkey(zext.ins[0]), defEntry);
+            if (defLoad < 0) continue;
+            OpRec load = ops.get(defLoad);
+            if (!load.mnem.equals("LOAD") || load.ins.length < 2 ||
+                load.out == null) continue;
+            int entrySize = load.out.getSize();
+            if (entrySize != 1 && entrySize != 2) continue;
+            int defLoadAddr = findDef(ops, vkey(load.ins[1]), defLoad);
+            if (defLoadAddr < 0) continue;
+            OpRec addLoad = ops.get(defLoadAddr);
+            if (!addLoad.mnem.equals("INT_ADD") ||
+                addLoad.ins.length != 2) continue;
+            Long base2 = null;
+            for (int s = 0; s < 2; s++) {
+                Varnode v = addLoad.ins[s];
+                if (v.isConstant()) base2 = v.getOffset();
+            }
+            if (base2 == null ||
+                base2.longValue() != base.longValue()) continue;
+            // Pattern matched: read the table.
+            List<Integer> targets = new ArrayList<Integer>();
+            long minTarget = Long.MAX_VALUE;
+            for (int k = 0; k < 64; k++) {
+                long entryAddr = base.longValue() + (long) k * entrySize;
+                if (k > 0 && entryAddr >= minTarget) break;
+                if (entryAddr > maxAddr) break;
+                long entry;
+                try {
+                    Address ad = toAddr(entryAddr);
+                    if (entrySize == 1) {
+                        entry = mem.getByte(ad) & 0xffL;
+                    } else {
+                        entry = mem.getShort(ad) & 0xffffL;
+                    }
+                } catch (Exception e) {
+                    break;
+                }
+                long target = base.longValue() + 2L * entry;
+                if (target < minTarget) minTarget = target;
+                Integer j = firstAt.get(String.format("%08x", target));
+                if (j == null) {
+                    j = firstAt.get(String.format("%08x", target & ~1L));
+                }
+                if (j != null && !targets.contains(j)) targets.add(j);
+            }
+            if (!targets.isEmpty()) result.put(i, targets);
+        }
+        return result;
+    }
+
     @Override
     public void run() throws Exception {
         if (getScriptArgs().length < 1) {
@@ -898,7 +1051,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.2-may-analysis\",");
+        w.println("  \"extractor_version\": \"v3.3-tbb-recovery\",");
         w.println("  \"functions\": [");
 
         FunctionIterator functions = currentProgram.getFunctionManager().getFunctions(true);
@@ -974,9 +1127,20 @@ public class ExtractIR extends GhidraScript {
             } catch (Exception e) {
                 // keep JSON valid even if P-Code walk fails for a function
             }
+            // v3.3: TBB/TBH jump-table targets, shared by both fixpoints.
+            // On any recovery failure, fall back to no targets (same
+            // behaviour as before v3.3 -- sound, just less recall).
+            Map<Integer, List<Integer>> branchTargets;
+            try {
+                branchTargets = recoverTbbTargets(ops,
+                    currentProgram.getMemory());
+            } catch (Exception e) {
+                branchTargets = new HashMap<Integer, List<Integer>>();
+            }
             FixResult fx;
             try {
-                fx = runFixpoint(ops, currentProgram.getMemory());
+                fx = runFixpoint(ops, currentProgram.getMemory(),
+                    branchTargets);
             } catch (Exception e) {
                 Map<String, Bits>[] empty = new Map[ops.size()];
                 for (int i = 0; i < empty.length; i++) {
@@ -986,7 +1150,8 @@ public class ExtractIR extends GhidraScript {
             }
             MayResult my;
             try {
-                my = runMayFixpoint(ops, currentProgram.getMemory());
+                my = runMayFixpoint(ops, currentProgram.getMemory(),
+                    branchTargets);
             } catch (Exception e) {
                 Map<String, Set<Long>>[] emptyMay = new Map[ops.size()];
                 for (int i = 0; i < emptyMay.length; i++) {
