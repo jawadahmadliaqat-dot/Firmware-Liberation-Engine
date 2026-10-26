@@ -82,6 +82,27 @@ import java.util.Set;
  * BRANCHINDs (pointer tables, bx reg) keep no successors: pointer
  * targets are other functions, not successors here -- call-graph
  * recovery is a separate step.
+ *
+ * v3.4 adds call-graph recovery for pointer-table dispatch: a backward
+ * slice from each CALLIND/BRANCHIND destination recognises a single
+ * constant target (one COPY hop allowed) or a constant-base table of
+ * 4-byte pointers (index*4, optional Thumb-bit AND); table entries
+ * are kept while each pointer (& ~1) is a real function entry, and
+ * the read stops at the first pointer that is not (or an unreadable
+ * address), capped at 64. TBB/TBH BRANCHINDs are skipped here (they
+ * are CFG successors, not calls). Argument-dependent dispatch (vtable
+ * via object pointer) has no constant base and is left for points-to
+ * analysis. Every reported target is a real function entry by
+ * construction -- this recovers edges, never invents them.
+ * FIXED Oct 26 (same v3.4, before landing): the first build found 0
+ * edges because the table base can sit in a register (`adr` -> COPY
+ * const -> reg), not only as a direct constant -- the slice now
+ * follows one COPY hop for the base. The same fix revealed that
+ * `remote_packet_process`'s pointer table points INSIDE its own
+ * function (computed goto, not calls), so pointer-table entries that
+ * are real instruction starts in the same function now become CFG
+ * successors (BRANCHIND only), while function-entry entries become
+ * call-graph edges.
  * If the fixpoint does not converge within 100 rounds, every state is
  * reset to fully unknown (sound: fewer accesses recorded, never false
  * ones) and "fixpoint_converged" reports false for that function.
@@ -1038,6 +1059,203 @@ public class ExtractIR extends GhidraScript {
         return result;
     }
 
+    private static class IndirectResult {
+        final List<String> sites;
+        final int edges;
+        final Map<Integer, List<Integer>> successors;
+        IndirectResult(List<String> sites, int edges,
+            Map<Integer, List<Integer>> successors) {
+            this.sites = sites;
+            this.edges = edges;
+            this.successors = successors;
+        }
+    }
+
+    /** Backward slice for pointer-table dispatch: from a CALLIND /
+        BRANCHIND destination, unwrap an optional Thumb-bit AND and a
+        4-byte LOAD, and return the table base if the LOAD address is
+        INT_ADD [base, index*4] where base is a constant or a COPY of
+        a constant (one hop, e.g. via `adr`). Null if no match. */
+    private static Long findPtrTableBase(List<OpRec> ops, int brIdx) {
+        OpRec br = ops.get(brIdx);
+        if (br.ins.length < 1) return null;
+        int cur = findDef(ops, vkey(br.ins[0]), brIdx);
+        if (cur < 0) return null;
+        OpRec d = ops.get(cur);
+        if (d.mnem.equals("INT_AND") && d.ins.length == 2) {
+            boolean unwrapped = false;
+            for (int s = 0; s < 2; s++) {
+                Varnode v = d.ins[s];
+                if (v.isConstant() &&
+                    (v.getOffset() & 0xFFFFFFFFL) == 0xFFFFFFFEL) {
+                    cur = findDef(ops, vkey(d.ins[1 - s]), cur);
+                    unwrapped = true;
+                    break;
+                }
+            }
+            if (!unwrapped || cur < 0) return null;
+            d = ops.get(cur);
+        }
+        if (!d.mnem.equals("LOAD") || d.ins.length < 2 ||
+            d.out == null || d.out.getSize() != 4) return null;
+        int defAddr = findDef(ops, vkey(d.ins[1]), cur);
+        if (defAddr < 0) return null;
+        OpRec add = ops.get(defAddr);
+        if (!add.mnem.equals("INT_ADD") || add.ins.length != 2) return null;
+        // Try each side as the base (const, or COPY-of-const) with the
+        // other side as the scaled index.
+        for (int s = 0; s < 2; s++) {
+            Varnode v = add.ins[s];
+            Long base = null;
+            if (v.isConstant()) {
+                base = v.getOffset();
+            } else {
+                int defBase = findDef(ops, vkey(v), defAddr);
+                if (defBase < 0) continue;
+                OpRec cb = ops.get(defBase);
+                if (!cb.mnem.equals("COPY") || cb.ins.length != 1 ||
+                    !cb.ins[0].isConstant()) continue;
+                base = cb.ins[0].getOffset();
+            }
+            String otherKey = vkey(add.ins[1 - s]);
+            int defIdx = findDef(ops, otherKey, defAddr);
+            if (defIdx < 0) continue;
+            OpRec sc = ops.get(defIdx);
+            boolean scaled = false;
+            if (sc.mnem.equals("INT_LEFT") && sc.ins.length == 2 &&
+                sc.ins[1].isConstant() &&
+                sc.ins[1].getOffset() == 2L) {
+                scaled = true;
+            } else if (sc.mnem.equals("INT_MULT") && sc.ins.length == 2) {
+                for (int t = 0; t < 2; t++) {
+                    if (sc.ins[t].isConstant() &&
+                        sc.ins[t].getOffset() == 4L) {
+                        scaled = true;
+                    }
+                }
+            }
+            if (scaled) return base;
+        }
+        return null;
+    }
+
+    /** v3.4 (fixed): recover call-graph edges AND intra-function
+        pointer-table successors. For each CALLIND/BRANCHIND (skipping
+        TBB/TBH ones, which are already CFG successors):
+          - single constant destination -> function-entry edge;
+          - pointer table (see findPtrTableBase): each entry (& ~1)
+            that is a function entry becomes an edge; each entry that
+            is a real instruction start in THIS function becomes a
+            CFG successor (BRANCHIND only -- a computed goto, not a
+            call); the read stops at the first entry that is neither,
+            or an unreadable address, capped at 64.
+        Argument-dependent dispatch (vtable via object pointer) has no
+        constant base and is left for points-to analysis. Every
+        reported edge target is a real function entry by construction. */
+    private IndirectResult recoverIndirect(List<OpRec> ops, Memory mem,
+        FunctionManager fm, Set<Integer> tbbBranchInds) {
+        List<String> out = new ArrayList<String>();
+        Map<Integer, List<Integer>> succ =
+            new HashMap<Integer, List<Integer>>();
+        int edges = 0;
+        Map<String, Integer> firstAt = new HashMap<String, Integer>();
+        for (int i = 0; i < ops.size(); i++) {
+            String a = ops.get(i).instrAddr.toString();
+            if (!firstAt.containsKey(a)) firstAt.put(a, i);
+        }
+        for (int i = 0; i < ops.size(); i++) {
+            OpRec call = ops.get(i);
+            if (!call.mnem.equals("CALLIND") &&
+                !call.mnem.equals("BRANCHIND")) continue;
+            if (call.mnem.equals("BRANCHIND") &&
+                tbbBranchInds.contains(i)) continue;
+            if (call.ins.length < 1) continue;
+            List<String> targets = new ArrayList<String>();
+            List<Integer> mySucc = new ArrayList<Integer>();
+            int def = findDef(ops, vkey(call.ins[0]), i);
+            if (def >= 0) {
+                OpRec dd = ops.get(def);
+                if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
+                    Long c = null;
+                    if (dd.ins[0].isConstant()) {
+                        c = dd.ins[0].getOffset();
+                    } else {
+                        int def2 = findDef(ops, vkey(dd.ins[0]), def);
+                        if (def2 >= 0) {
+                            OpRec d2 = ops.get(def2);
+                            if (d2.mnem.equals("COPY") && d2.ins.length == 1 &&
+                                d2.ins[0].isConstant()) {
+                                c = d2.ins[0].getOffset();
+                            }
+                        }
+                    }
+                    if (c != null) {
+                        try {
+                            Function fn = fm.getFunctionAt(toAddr(c & ~1L));
+                            if (fn != null) targets.add(fn.getName());
+                        } catch (Exception e) {
+                            // Ignore unresolvable targets.
+                        }
+                    }
+                }
+            }
+            if (targets.isEmpty() && mySucc.isEmpty()) {
+                Long base = findPtrTableBase(ops, i);
+                if (base != null) {
+                    for (int k = 0; k < 64; k++) {
+                        long entryAddr = base.longValue() + 4L * k;
+                        long ptr;
+                        try {
+                            ptr = mem.getInt(toAddr(entryAddr)) & 0xffffffffL;
+                        } catch (Exception e) {
+                            break;
+                        }
+                        long t = ptr & ~1L;
+                        Function fn = null;
+                        try {
+                            fn = fm.getFunctionAt(toAddr(t));
+                        } catch (Exception e) {
+                            break;
+                        }
+                        if (fn != null) {
+                            String nm = fn.getName();
+                            if (!targets.contains(nm)) targets.add(nm);
+                            continue;
+                        }
+                        if (call.mnem.equals("BRANCHIND")) {
+                            Integer j = firstAt.get(
+                                String.format("%08x", t));
+                            if (j == null) {
+                                j = firstAt.get(
+                                    String.format("%08x", t & ~1L));
+                            }
+                            if (j != null) {
+                                if (!mySucc.contains(j)) {
+                                    mySucc.add(j);
+                                }
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            if (!targets.isEmpty()) {
+                StringBuilder tb = new StringBuilder();
+                for (int k = 0; k < targets.size(); k++) {
+                    if (k > 0) tb.append(", ");
+                    tb.append("\"").append(esc(targets.get(k))).append("\"");
+                }
+                out.add("{\"instr\": \"" + ops.get(i).instrAddr +
+                    "\", \"op\": \"" + call.mnem +
+                    "\", \"targets\": [" + tb.toString() + "]}");
+                edges += targets.size();
+            }
+            if (!mySucc.isEmpty()) succ.put(i, mySucc);
+        }
+        return new IndirectResult(out, edges, succ);
+    }
+
     @Override
     public void run() throws Exception {
         if (getScriptArgs().length < 1) {
@@ -1051,7 +1269,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.3-tbb-recovery\",");
+        w.println("  \"extractor_version\": \"v3.4-callgraph\",");
         w.println("  \"functions\": [");
 
         FunctionIterator functions = currentProgram.getFunctionManager().getFunctions(true);
@@ -1059,6 +1277,8 @@ public class ExtractIR extends GhidraScript {
         int fnCount = 0;
         int totalMmio = 0;
         int totalMay = 0;
+        int totalIndirect = 0;
+        int totalIndSucc = 0;
         while (functions.hasNext() && !monitor.isCancelled()) {
             Function f = functions.next();
             if (!firstFn) w.println(",");
@@ -1136,6 +1356,29 @@ public class ExtractIR extends GhidraScript {
                     currentProgram.getMemory());
             } catch (Exception e) {
                 branchTargets = new HashMap<Integer, List<Integer>>();
+            }
+            // v3.4: indirect recovery runs BEFORE the fixpoints, so
+            // pointer-table intra-function successors join the shared
+            // map (call-graph edges are printed, not successors).
+            IndirectResult ind;
+            try {
+                ind = recoverIndirect(ops, currentProgram.getMemory(),
+                    currentProgram.getFunctionManager(),
+                    branchTargets.keySet());
+            } catch (Exception e) {
+                ind = new IndirectResult(new ArrayList<String>(), 0,
+                    new HashMap<Integer, List<Integer>>());
+            }
+            for (Map.Entry<Integer, List<Integer>> e :
+                ind.successors.entrySet()) {
+                List<Integer> cur = branchTargets.get(e.getKey());
+                if (cur == null) {
+                    branchTargets.put(e.getKey(), e.getValue());
+                } else {
+                    for (Integer j : e.getValue()) {
+                        if (!cur.contains(j)) cur.add(j);
+                    }
+                }
             }
             FixResult fx;
             try {
@@ -1276,7 +1519,23 @@ public class ExtractIR extends GhidraScript {
             w.println();
             w.println("      ],");
             w.println("      \"may_access_count\": " + may.size() + ",");
-            w.println("      \"may_fixpoint_converged\": " + my.converged);
+            w.println("      \"may_fixpoint_converged\": " + my.converged + ",");
+            w.println("      \"indirect_calls\": [");
+            for (int i = 0; i < ind.sites.size(); i++) {
+                if (i > 0) w.println(",");
+                w.print("        " + ind.sites.get(i));
+            }
+            w.println();
+            w.println("      ],");
+            int indSucc = 0;
+            for (List<Integer> s : ind.successors.values()) {
+                indSucc += s.size();
+            }
+            w.println("      \"indirect_call_count\": " + ind.sites.size() + ",");
+            w.println("      \"indirect_call_edges\": " + ind.edges + ",");
+            w.println("      \"indirect_successor_count\": " + indSucc);
+            totalIndirect += ind.edges;
+            totalIndSucc += indSucc;
             totalMmio += mmio.size();
             totalMay += may.size();
             w.print("    }");
@@ -1365,7 +1624,9 @@ public class ExtractIR extends GhidraScript {
         w.println("  ],");
         w.println("  \"function_count\": " + fnCount + ",");
         w.println("  \"mmio_access_total\": " + totalMmio + ",");
-        w.println("  \"may_access_total\": " + totalMay);
+        w.println("  \"may_access_total\": " + totalMay + ",");
+        w.println("  \"indirect_call_edges_total\": " + totalIndirect + ",");
+        w.println("  \"indirect_successor_total\": " + totalIndSucc);
         w.println("}");
         w.close();
         println("[+] JSON Export Complete: " + outputJson +

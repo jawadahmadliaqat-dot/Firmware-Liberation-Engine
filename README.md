@@ -32,9 +32,19 @@ firmware.elf ──► Ghidra headless + ExtractIR ──► MMIO JSON ──►
   a real instruction start in the same function becomes a CFG successor
   (both fixpoints share the map). On BMP this restores 22 must-accesses
   with 0 dropped, including the `rcc_*` oscillator cases and
-  `remote_packet_process`'s GPIOB stores. Pointer-table BRANCHINDs
-  (targets are other functions) are intentionally left alone —
-  call-graph recovery is a separate step.
+  `remote_packet_process`'s GPIOB stores.
+- **Call-graph recovery (v3.4)**: pointer-table dispatch is recovered
+  from a backward slice (single constant target, or a constant-base
+  table of 4-byte pointers with the base allowed in a register via
+  `adr`). Entries that are real function entries become call-graph
+  edges (`indirect_calls`); entries that are instruction starts in the
+  same function become CFG successors (computed goto, BRANCHIND only).
+  On BMP this finds 10 pointer-table sites / 57 successors across 8
+  functions — and, honestly, 0 function-entry edges: BMP's indirect
+  calls are vtable/struct-based (argument-dependent, left for points-to
+  analysis), while its tables are all intra-function gotos. Must 235 /
+  may 8 are unchanged (the newly reached blocks hold no MMIO), but the
+  CFG is now complete across computed jumps too.
 - **Value export (v3)**: every MMIO access carries `value` (exact or null)
   plus `value_known_ones` / `value_known_zeroes` bit masks, so
   read-modify-write stores still yield provable bit effects.
@@ -98,6 +108,7 @@ upload. `FIRMWARE_WORKSPACE` and `GHIDRA_HEADLESS` env vars override paths.
 Perfect portfolio (this repo + write-up) → big pipeline: register-map
 export (done for BMP) → CFG fixpoint resolver (done, v3.1) → local-vs-target
 classifier v1 (done) → MAY-analysis (done, v3.2) → jump-table recovery
-(done, v3.3) → call-graph recovery (pointer-table targets) →
+(done, v3.3) → call-graph recovery (done, v3.4: 10 pointer-table sites,
+57 successors, 0 function-entry edges) →
 P-Code→Lean deepening → typestate Rust + Kani → path pruning → HIL (needs
 physical hardware) → boot shims (last).
