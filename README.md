@@ -119,9 +119,10 @@ upload. `FIRMWARE_WORKSPACE` and `GHIDRA_HEADLESS` env vars override paths.
   calls (parameter-passed struct pointers need inter-procedural
   argument tracking), struct-type sensitivity to narrow the wide
   offset-shared may-sets, argument-dependent addresses
-  (TOP in both analyses), and the may-analysis false positive on
-  `rcc_get_usart_clk_freq` (predicated-def value-set leak,
-  hypothesized — fix is next). Name-based literal attribution has
+  (TOP in both analyses). The rcc may false positive is FIXED in
+  v3.7 (its mechanism was the path-insensitive join across
+  correlated if/else branches, not a predicated-def leak as first
+  hypothesized). Name-based literal attribution has
   one known noise case (`st_usbfs_endpoints_reset` in the reset
   family); command handlers are excluded from attribution by rule.
 - Checks are **static per-function facts**, not runtime execution order.
