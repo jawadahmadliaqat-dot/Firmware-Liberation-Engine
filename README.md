@@ -92,6 +92,7 @@ full pipeline under a 512 MB Ghidra heap:
 | Negative tests | Tampered reports **FAIL** as required (confinement violation, mask overlap) |
 | Register map | [`blackmagic_registermap.md`](blackmagic_registermap.md) — 35 registers, all labelled from the public STM32F1 map |
 | Local-vs-target classifier | [`classify_mmio.py`](classify_mmio.py) + chip profiles — BMP: 235 known / **0 suspects**, may addresses 13 known / **0 suspects** |
+| SVD importer | [`svd_import.py`](svd_import.py) — CMSIS-SVD → chip profile JSON (`python3 svd_import.py <device.svd> <profile.json>`). Generated STM32F103 profile reproduces the hand-written verdict on BMP: 235 known / 0 suspects, may 13 / 0. |
 
 ## Quickstart (any Linux box)
 
