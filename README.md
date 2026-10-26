@@ -87,6 +87,7 @@ full pipeline under a 512 MB Ghidra heap:
 | MAY confinement (every possible address within its family) | **FLAGS one case**: `rcc_get_usart_clk_freq` may read USART1_CR1 (0x40013800) — source cross-check (Oct 26, 2026) verified this as a **false positive**: the flagged `LOAD` reads RAM globals (`0x20001108`/`0x2000110c`, the `rcc_apbX_frequency` variables), not USART1. The profile stays strict; no adjudication needed |
 | Indirect-call resolution (points-to, v3.5) | **159/178 CALLINDs resolved as may-sets** (1216 targets; 44 exact singletons, e.g. `cmd_tdi_low_reset` → `jtagtap_next`; wide sets = one ops-table field shared by a driver family); 19 unresolved, counted; certain edges 0 (the one single-const case resolves to 0x16, not a function) |
 | Source cross-check (v3.5 vs BMP v2.0.0 source) | **Singletons 44/44 exact, 0 mismatches; field truth 99/116 (85%) covered.** 17 misses in three explained classes: tail calls (6 — reset/halt dispatch compiles to `BRANCHIND`, not `CALLIND`), store-visibility gap (11 — function-pointer literals present in the image but no `LOAD` of them in any function pcode), the no-op stub (1). The 19 unresolved are classified (libc/stdio, parameter callbacks, vector table) — none are BMP driver ops. Full report: [`bmp_source_crosscheck.md`](bmp_source_crosscheck.md) |
+| Tail-call recovery + literal scan (v3.6) | **Field truth now 116/116 (100%).** 43 tail-call sites / 399 targets recovered (`target_reset` → `cortexm_reset` + `samd_reset`, halt family exact); whole-image literal scan (157 stored pointers, name-attributed) + dual store recording (exact address AND field offset) closed the remaining 11 store-visibility misses. CALLIND may-sets: 159 sites, 1930 targets (v3.5: 1216), zero v3.5 targets lost. Unresolved tail calls: 4 (USB/parameter callbacks). Lean BMP still FAILs only on the known rcc may-FP (fix is next, not v3.6). |
 | Negative tests | Tampered reports **FAIL** as required (confinement violation, mask overlap) |
 | Register map | [`blackmagic_registermap.md`](blackmagic_registermap.md) — 35 registers, all labelled from the public STM32F1 map |
 | Local-vs-target classifier | [`classify_mmio.py`](classify_mmio.py) + chip profiles — BMP: 235 known / **0 suspects**, may addresses 14 known / **0 suspects** |
@@ -110,15 +111,18 @@ upload. `FIRMWARE_WORKSPACE` and `GHIDRA_HEADLESS` env vars override paths.
   MAY-analysis recovers the predicated/branch-merge cases as
   possible-address sets, v3.3 recovers TBB/TBH jump-table blocks as
   CFG successors, v3.4 recovers pointer-table call-graph edges, and v3.5
-  resolves 159/178 indirect calls as may-sets. Still missing: the 19
-  unresolved CALLINDs (parameter-passed struct pointers need
-  inter-procedural argument tracking), struct-type sensitivity to narrow
-  the wide offset-shared may-sets, argument-dependent addresses
-  (TOP in both analyses), and **tail-call dispatch** — the reset/halt
-  family compiles to `BRANCHIND`, not `CALLIND`, so v3.5 cannot see it
-  (source cross-check, Oct 26, 2026). Some stores are also invisible
-  because their code falls outside Ghidra's recognized function pcodes
-  (literals present in the image, no `LOAD` of them anywhere).
+  resolves 159/178 indirect calls as may-sets, and v3.6 recovers
+  43 tail-call sites as may-sets plus a whole-image literal scan
+  with dual store recording (exact address AND field offset).
+  Still missing: the 19 unresolved CALLINDs and 4 unresolved tail
+  calls (parameter-passed struct pointers need inter-procedural
+  argument tracking), struct-type sensitivity to narrow the wide
+  offset-shared may-sets, argument-dependent addresses
+  (TOP in both analyses), and the may-analysis false positive on
+  `rcc_get_usart_clk_freq` (predicated-def value-set leak,
+  hypothesized — fix is next). Name-based literal attribution has
+  one known noise case (`st_usbfs_endpoints_reset` in the reset
+  family); command handlers are excluded from attribution by rule.
 - Checks are **static per-function facts**, not runtime execution order.
 - Local vs target separation is v1: the classifier flags addresses outside
   the chip's documented peripheral blocks (BMP now 0 suspects), but deciding
@@ -141,6 +145,9 @@ classifier v1 (done) → MAY-analysis (done, v3.2) → jump-table recovery
 159/178 CALLINDs as may-sets, 19 unresolved) → BMP source cross-check
 (done, Oct 26, 2026: singletons 44/44 exact, field truth 99/116;
 rcc may-flag proven a false positive) → v3.6 tail-call recovery +
-whole-image literal scan (evidence-backed next step) →
-P-Code→Lean deepening → typestate Rust + Kani → path pruning → HIL (needs
+whole-image literal scan + dual store recording (done, Oct 26, 2026:
+field truth 116/116; 43 tail sites / 399 targets; CALLIND sets
+159 sites / 1930 targets, zero v3.5 targets lost) →
+may-analysis false-positive fix (rcc case) → P-Code→Lean deepening →
+typestate Rust + Kani → path pruning → HIL (needs
 physical hardware) → boot shims (last).

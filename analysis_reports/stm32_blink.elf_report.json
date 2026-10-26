@@ -1,7 +1,7 @@
 {
   "binary_name": "stm32_blink.elf",
   "language": "ARM:LE:32:v8",
-  "extractor_version": "v3.5-pointsto",
+  "extractor_version": "v3.6-tailcall-literals",
   "functions": [
     {
       "name": "delay",
@@ -89,7 +89,13 @@
       ],
       "may_call_site_count": 0,
       "may_call_target_count": 0,
-      "unresolved_indirect_count": 0
+      "unresolved_indirect_count": 0,
+      "may_tail_call_edges": [
+
+      ],
+      "may_tail_call_site_count": 0,
+      "may_tail_call_target_count": 0,
+      "unresolved_tail_call_count": 0
     },
     {
       "name": "main",
@@ -218,7 +224,13 @@
       ],
       "may_call_site_count": 0,
       "may_call_target_count": 0,
-      "unresolved_indirect_count": 0
+      "unresolved_indirect_count": 0,
+      "may_tail_call_edges": [
+
+      ],
+      "may_tail_call_site_count": 0,
+      "may_tail_call_target_count": 0,
+      "unresolved_tail_call_count": 0
     }
   ],
   "strings": [
@@ -265,5 +277,13 @@
   "indirect_successor_total": 0,
   "may_call_site_total": 0,
   "may_call_target_total": 0,
-  "unresolved_indirect_total": 0
+  "unresolved_indirect_total": 0,
+  "may_tail_call_site_total": 0,
+  "may_tail_call_target_total": 0,
+  "unresolved_tail_call_total": 0,
+  "literal_scan": {
+    "literal_count": 0,
+    "attributed": {},
+    "unattributed": []
+  }
 }
