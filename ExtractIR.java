@@ -233,7 +233,9 @@ public class ExtractIR extends GhidraScript {
             List<OpRec> ops, Memory mem);
     }
 
-    private final IsaAdapter isa = new ArmIsa();
+    // Selected in run() from the program's processor (default ARM:
+    // the pre-step-1 behaviour). RISC-V programs get a RiscVIsa.
+    private IsaAdapter isa = new ArmIsa();
 
     /** ARM (Cortex-M, Thumb) adapter: holds every ARM-specific fact. */
     private class ArmIsa implements IsaAdapter {
@@ -381,6 +383,130 @@ public class ExtractIR extends GhidraScript {
                         j = firstAt.get(formatCodeAddress(stripInstructionTag(target)));
                     }
                     if (j != null && !targets.contains(j)) targets.add(j);
+                }
+                if (!targets.isEmpty()) result.put(i, targets);
+            }
+            return result;
+        }
+    }
+
+    /** RISC-V adapter (RV32 first; RV64 via the width flag, structural
+        only -- untested, see below). All facts are EMPIRICAL
+        (Ghidra 11.4.2 RISCV sleigh + probe runs on a real RV32IMC
+        binary), not from memory:
+        - Language auto-detected on import: RISCV:LE:32:RV32IMC.
+        - Register space "register", base 0x2000, stride XLEN:
+          x0 zero 0x2000, x1 ra, x2 sp, x3 gp, x4 tp, x5-x7 t0-t2,
+          x8-x9 s0-s1, x10-x17 a0-a7, x18-x27 s2-s11, x28-x31 t3-t6.
+        - Caller-saved per the RISC-V ABI: t0-t6, a0-a7. ra is
+          EXCLUDED: Ghidra's jal P-Code COPYs the return address into
+          ra before the CALL op (verified in the probe dump), exactly
+          like ARM's lr handling -- clobbering it would lose the known
+          return address and break return detection.
+        - No instruction-address tagging (no Thumb bit); compressed
+          instructions lift to ordinary P-Code, so nothing special.
+        - Constant materialization: lui = INT_LEFT [imm, 12] (+ COPY);
+          auipc = INT_LEFT [imm, 12] + INT_ADD [that, PC-const];
+          addi = INT_ADD. All constant-foldable (see constFold).
+        - Jump tables hold ABSOLUTE pointers (non-PIC) or base-relative
+          OFFSETS (PIC: target = base + loaded). Same-function entries
+          become CFG successors here; cross-function entries are left
+          for recoverIndirect (pointer-table edges). RV64 note: the
+          width flag sets stride/pointer/shift, but RV64 offset tables
+          (32-bit offsets via lw) do not match the pointer-sized LOAD
+          check -- RV64 jump-table recovery is untested. */
+    private class RiscVIsa implements IsaAdapter {
+        private final int stride;       // 4 (RV32) or 8 (RV64)
+        private final int ptrSize;      // 4 or 8
+        private final int ptrShift;     // 2 or 3
+        private final long addrMask;    // 0xffffffffL or -1L
+        private final List<long[]> mmioWindows;
+
+        RiscVIsa(boolean is64, List<long[]> windows) {
+            stride = is64 ? 8 : 4;
+            ptrSize = is64 ? 8 : 4;
+            ptrShift = is64 ? 3 : 2;
+            addrMask = is64 ? -1L : 0xffffffffL;
+            mmioWindows = windows;
+        }
+
+        private long reg(int n) { return 0x2000L + (long) stride * n; }
+
+        public String name() { return "RISCV"; }
+        public String registerSpaceName() { return "register"; }
+        public long[] callerSavedRegisterOffsets() {
+            // t0-t2 (x5-x7), a0-a7 (x10-x17), t3-t6 (x28-x31).
+            int[] nums = {5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17,
+                28, 29, 30, 31};
+            long[] offs = new long[nums.length];
+            for (int i = 0; i < nums.length; i++) offs[i] = reg(nums[i]);
+            return offs;
+        }
+        public long returnAddressRegisterOffset() { return reg(1); }
+        public boolean isReturnAddressRegister(Varnode v) {
+            return v != null && v.getAddress() != null &&
+                registerSpaceName().equals(
+                    v.getAddress().getAddressSpace().getName()) &&
+                v.getOffset() == returnAddressRegisterOffset();
+        }
+        public long stripInstructionTag(long addr) { return addr; }
+        public boolean isInstructionTagMask(long constValue) { return false; }
+        public int pointerSize() { return ptrSize; }
+        public int pointerIndexShift() { return ptrShift; }
+        public long readPointer(Memory mem, Address addr) throws Exception {
+            if (ptrSize == 8) return mem.getLong(addr);
+            return mem.getInt(addr) & 0xffffffffL;
+        }
+        public String formatCodeAddress(long addr) {
+            return String.format("%08x", addr);
+        }
+        public boolean isMmioAddress(long addr) {
+            // RISC-V has no fixed peripheral window (unlike ARM
+            // Cortex-M): the map is platform-specific. These default
+            // bands cover the common families without overlapping
+            // their flash/RAM (see defaultRiscvMmioWindows); a caller
+            // may override them with the mmio= script argument, and
+            // the SVD-profile classifier remains the authority on
+            // known-vs-suspect peripherals.
+            for (long[] w : mmioWindows) {
+                if (addr >= w[0] && addr < w[1]) return true;
+            }
+            return false;
+        }
+        public Map<Integer, List<Integer>> recoverJumpTableTargets(
+            List<OpRec> ops, Memory mem) {
+            Map<Integer, List<Integer>> result =
+                new HashMap<Integer, List<Integer>>();
+            if (ops.isEmpty()) return result;
+            Map<String, Integer> firstAt = new HashMap<String, Integer>();
+            for (int i = 0; i < ops.size(); i++) {
+                String a = ops.get(i).instrAddr.toString();
+                if (!firstAt.containsKey(a)) firstAt.put(a, i);
+            }
+            for (int i = 0; i < ops.size(); i++) {
+                OpRec br = ops.get(i);
+                if (!br.mnem.equals("BRANCHIND") || br.ins.length < 1) continue;
+                TableMatch m = matchBranchTable(ops, i, ptrSize, ptrShift,
+                    addrMask);
+                if (m == null) continue;
+                List<Integer> targets = new ArrayList<Integer>();
+                for (int k = 0; k < 64; k++) {
+                    long entryAddr = m.base + (long) ptrSize * k;
+                    long entry;
+                    try {
+                        entry = readPointer(mem, toAddr(entryAddr));
+                    } catch (Exception e) {
+                        break;
+                    }
+                    long t;
+                    if (m.offset) {
+                        t = (m.base + (int) entry) & addrMask;
+                    } else {
+                        t = stripInstructionTag(entry);
+                    }
+                    Integer j = firstAt.get(formatCodeAddress(t));
+                    if (j == null) break;
+                    if (!targets.contains(j)) targets.add(j);
                 }
                 if (!targets.isEmpty()) result.put(i, targets);
             }
@@ -1512,11 +1638,178 @@ public class ExtractIR extends GhidraScript {
         }
     }
 
+    /** One pointer-table match: the table's base address and whether
+        entries are base-relative offsets (PIC) or absolute pointers. */
+    private static class TableMatch {
+        final long base;
+        final boolean offset;
+        TableMatch(long base, boolean offset) {
+            this.base = base;
+            this.offset = offset;
+        }
+    }
+
+    /** Constant-fold a varnode's def chain (COPY / INT_ADD / INT_SUB /
+        INT_LEFT / INT_MULT / INT_AND / INT_OR / INT_XOR of constants,
+        depth-capped). Follows lui (INT_LEFT by 12) and auipc
+        (INT_LEFT + INT_ADD of a PC constant), so RISC-V table bases
+        built by lui+addi or auipc+addi fold to one constant. Results
+        are masked to the ISA's address width. Null when not constant
+        (register/unique inputs without a constant def, depth out). */
+    private static Long constFold(List<OpRec> ops, String key,
+        int beforeIdx, int depth, long mask) {
+        if (key.startsWith("const:")) {
+            try {
+                String[] parts = key.split(":");
+                return Long.parseLong(parts[1]) & mask;
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        if (depth <= 0) return null;
+        int def = findDef(ops, key, beforeIdx);
+        if (def < 0) return null;
+        OpRec d = ops.get(def);
+        if (d.mnem.equals("COPY") && d.ins.length == 1) {
+            return constFold(ops, vkey(d.ins[0]), def, depth - 1, mask);
+        }
+        if (d.ins.length == 2) {
+            Long a = constFold(ops, vkey(d.ins[0]), def, depth - 1, mask);
+            Long b = constFold(ops, vkey(d.ins[1]), def, depth - 1, mask);
+            if (a == null || b == null) return null;
+            if (d.mnem.equals("INT_ADD")) {
+                return (a.longValue() + b.longValue()) & mask;
+            }
+            if (d.mnem.equals("INT_SUB")) {
+                return (a.longValue() - b.longValue()) & mask;
+            }
+            if (d.mnem.equals("INT_MULT")) {
+                return (a.longValue() * b.longValue()) & mask;
+            }
+            if (d.mnem.equals("INT_AND")) {
+                return (a.longValue() & b.longValue()) & mask;
+            }
+            if (d.mnem.equals("INT_OR")) {
+                return (a.longValue() | b.longValue()) & mask;
+            }
+            if (d.mnem.equals("INT_XOR")) {
+                return (a.longValue() ^ b.longValue()) & mask;
+            }
+            if (d.mnem.equals("INT_LEFT")) {
+                return (a.longValue() << b.longValue()) & mask;
+            }
+        }
+        return null;
+    }
+
+    /** True when a varnode's def is a pointer-index scaling:
+        INT_LEFT by pointerIndexShift, or INT_MULT by pointerSize
+        (either side). The scale operand is constant-FOLDED, not
+        required to be a direct constant: Ghidra lifts RISC-V
+        `slli` as COPY const -> unique, then INT_LEFT [reg, unique],
+        so a direct-constant check misses every RISC-V table. */
+    private static boolean isScaledIndex(List<OpRec> ops, Varnode v,
+        int beforeIdx, int pointerSize, int pointerShift, long mask) {
+        int def = findDef(ops, vkey(v), beforeIdx);
+        if (def < 0) return false;
+        OpRec sc = ops.get(def);
+        if (sc.mnem.equals("INT_LEFT") && sc.ins.length == 2) {
+            Long sh = constFold(ops, vkey(sc.ins[1]), def, 16, mask);
+            return sh != null && sh.longValue() == (long) pointerShift;
+        }
+        if (sc.mnem.equals("INT_MULT") && sc.ins.length == 2) {
+            for (int t = 0; t < 2; t++) {
+                Long c = constFold(ops, vkey(sc.ins[t]), def, 16, mask);
+                if (c != null && c.longValue() == (long) pointerSize) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Walk an address expression: INT_ADDs accumulating constants
+        until one side is a scaled index and the other side folds to
+        the table base. Returns the base, or null. Generalizes the
+        old one-level findPtrTableBase match (const base + scaled
+        index, or COPY-of-const base): RISC-V bases need two levels
+        (an outer INT_ADD carrying the lw offset, around
+        INT_ADD [scaled, lui+addi base]). */
+    private static Long matchAddr(List<OpRec> ops, String key,
+        int beforeIdx, long acc, int depth, long mask,
+        int pointerSize, int pointerShift) {
+        if (depth <= 0) return null;
+        int def = findDef(ops, key, beforeIdx);
+        if (def < 0) return null;
+        OpRec d = ops.get(def);
+        if (d.mnem.equals("COPY") && d.ins.length == 1) {
+            Long c = constFold(ops, vkey(d.ins[0]), def, 16, mask);
+            if (c != null) return null; // whole expr constant: not a table
+            return matchAddr(ops, vkey(d.ins[0]), def, acc, depth - 1,
+                mask, pointerSize, pointerShift);
+        }
+        if (!d.mnem.equals("INT_ADD") || d.ins.length != 2) return null;
+        for (int s = 0; s < 2; s++) {
+            Long c = constFold(ops, vkey(d.ins[s]), def, 16, mask);
+            if (c == null) continue;
+            if (isScaledIndex(ops, d.ins[1 - s], def,
+                pointerSize, pointerShift, mask)) {
+                return (acc + c.longValue()) & mask;
+            }
+            Long nested = matchAddr(ops, vkey(d.ins[1 - s]), def,
+                (acc + c.longValue()) & mask, depth - 1, mask,
+                pointerSize, pointerShift);
+            if (nested != null) return nested;
+        }
+        return null;
+    }
+
+    /** Match a BRANCHIND's table: absolute-pointer tables (the
+        BRANCHIND target's def is a pointer-sized LOAD) and
+        base-relative offset tables (target's def is
+        INT_ADD [loaded, base] with base equal to the table base).
+        Returns null when no table matches. */
+    private static TableMatch matchBranchTable(List<OpRec> ops, int brIdx,
+        int pointerSize, int pointerShift, long mask) {
+        OpRec br = ops.get(brIdx);
+        if (br.ins.length < 1) return null;
+        int cur = findDef(ops, vkey(br.ins[0]), brIdx);
+        if (cur < 0) return null;
+        OpRec d = ops.get(cur);
+        if (d.mnem.equals("INT_ADD") && d.ins.length == 2) {
+            // Offset table: one side loads the entry, the other side
+            // must fold to the same base as the load's address chain.
+            for (int s = 0; s < 2; s++) {
+                int defLoad = findDef(ops, vkey(d.ins[s]), cur);
+                if (defLoad < 0) continue;
+                OpRec ld = ops.get(defLoad);
+                if (!ld.mnem.equals("LOAD") || ld.ins.length < 2 ||
+                    ld.out == null || ld.out.getSize() != pointerSize) continue;
+                Long base = matchAddr(ops, vkey(ld.ins[1]), defLoad, 0L,
+                    8, mask, pointerSize, pointerShift);
+                if (base == null) continue;
+                Long side = constFold(ops, vkey(d.ins[1 - s]), cur, 16, mask);
+                if (side != null && side.longValue() == base.longValue()) {
+                    return new TableMatch(base.longValue(), true);
+                }
+            }
+            return null;
+        }
+        if (!d.mnem.equals("LOAD") || d.ins.length < 2 ||
+            d.out == null || d.out.getSize() != pointerSize) return null;
+        Long base = matchAddr(ops, vkey(d.ins[1]), cur, 0L, 8, mask,
+            pointerSize, pointerShift);
+        if (base == null) return null;
+        return new TableMatch(base.longValue(), false);
+    }
+
     /** Backward slice for pointer-table dispatch: from a CALLIND /
         BRANCHIND destination, unwrap an optional Thumb-bit AND and a
-        4-byte LOAD, and return the table base if the LOAD address is
-        INT_ADD [base, index*4] where base is a constant or a COPY of
-        a constant (one hop, e.g. via `adr`). Null if no match. */
+        pointer-sized LOAD, and return the table base. The LOAD
+        address may be a nested INT_ADD chain (RISC-V lui+addi /
+        auipc+addi bases with an lw offset level); the old one-level
+        match (const base + scaled index, or COPY-of-const base via
+        `adr`) is subsumed by matchAddr. Null if no match. */
     private Long findPtrTableBase(List<OpRec> ops, int brIdx) {
         OpRec br = ops.get(brIdx);
         if (br.ins.length < 1) return null;
@@ -1539,45 +1832,9 @@ public class ExtractIR extends GhidraScript {
         }
         if (!d.mnem.equals("LOAD") || d.ins.length < 2 ||
             d.out == null || d.out.getSize() != isa.pointerSize()) return null;
-        int defAddr = findDef(ops, vkey(d.ins[1]), cur);
-        if (defAddr < 0) return null;
-        OpRec add = ops.get(defAddr);
-        if (!add.mnem.equals("INT_ADD") || add.ins.length != 2) return null;
-        // Try each side as the base (const, or COPY-of-const) with the
-        // other side as the scaled index.
-        for (int s = 0; s < 2; s++) {
-            Varnode v = add.ins[s];
-            Long base = null;
-            if (v.isConstant()) {
-                base = v.getOffset();
-            } else {
-                int defBase = findDef(ops, vkey(v), defAddr);
-                if (defBase < 0) continue;
-                OpRec cb = ops.get(defBase);
-                if (!cb.mnem.equals("COPY") || cb.ins.length != 1 ||
-                    !cb.ins[0].isConstant()) continue;
-                base = cb.ins[0].getOffset();
-            }
-            String otherKey = vkey(add.ins[1 - s]);
-            int defIdx = findDef(ops, otherKey, defAddr);
-            if (defIdx < 0) continue;
-            OpRec sc = ops.get(defIdx);
-            boolean scaled = false;
-            if (sc.mnem.equals("INT_LEFT") && sc.ins.length == 2 &&
-                sc.ins[1].isConstant() &&
-                sc.ins[1].getOffset() == (long) isa.pointerIndexShift()) {
-                scaled = true;
-            } else if (sc.mnem.equals("INT_MULT") && sc.ins.length == 2) {
-                for (int t = 0; t < 2; t++) {
-                    if (sc.ins[t].isConstant() &&
-                        sc.ins[t].getOffset() == (long) isa.pointerSize()) {
-                        scaled = true;
-                    }
-                }
-            }
-            if (scaled) return base;
-        }
-        return null;
+        long mask = isa.pointerSize() == 4 ? 0xffffffffL : -1L;
+        return matchAddr(ops, vkey(d.ins[1]), cur, 0L, 8, mask,
+            isa.pointerSize(), isa.pointerIndexShift());
     }
 
     /** v3.4 (fixed): recover call-graph edges AND intra-function
@@ -2371,6 +2628,50 @@ public class ExtractIR extends GhidraScript {
         }
     }
 
+    /** Default RISC-V peripheral bands (see RiscVIsa.isMmioAddress).
+        RISC-V has no fixed window: these bands cover the common
+        families (CLINT, PLIC, FE310-style, GD32/STM32-like + K210,
+        ESP32-like) without overlapping their flash/RAM. A caller may
+        override them with the mmio= script argument; the
+        SVD-profile classifier remains the authority on
+        known-vs-suspect peripherals. Known caveat: ESP32-C3 XIP flash
+        (0x42000000) falls inside the GD32 band, so flash-constant
+        loads on ESP32-C3 would read as MMIO -- override with mmio=
+        for that platform, or wait for profile-driven classification. */
+    private static List<long[]> defaultRiscvMmioWindows() {
+        List<long[]> w = new ArrayList<long[]>();
+        w.add(new long[] {0x02000000L, 0x02010000L}); // CLINT
+        w.add(new long[] {0x0C000000L, 0x10000000L}); // PLIC
+        w.add(new long[] {0x10000000L, 0x20000000L}); // FE310-style
+        w.add(new long[] {0x40000000L, 0x60000000L}); // GD32/K210
+        w.add(new long[] {0x60000000L, 0x60100000L}); // ESP32-style
+        return w;
+    }
+
+    /** Parse "start-end,start-end,..." (hex, optional 0x) into
+        windows. Null on any parse failure. */
+    private static List<long[]> parseMmioWindows(String spec) {
+        try {
+            List<long[]> w = new ArrayList<long[]>();
+            for (String part : spec.split(",")) {
+                String[] se = part.split("-");
+                if (se.length != 2) return null;
+                long s = parseHex(se[0].trim());
+                long e = parseHex(se[1].trim());
+                if (e <= s) return null;
+                w.add(new long[] {s, e});
+            }
+            return w;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static long parseHex(String s) {
+        if (s.startsWith("0x") || s.startsWith("0X")) s = s.substring(2);
+        return Long.parseLong(s, 16);
+    }
+
     @Override
     public void run() throws Exception {
         if (getScriptArgs().length < 1) {
@@ -2378,6 +2679,37 @@ public class ExtractIR extends GhidraScript {
             return;
         }
         String outputJson = getScriptArgs()[0];
+        // ISA selection: Ghidra auto-detects the language on import
+        // (ingest passes no language flag), so select the adapter from
+        // the program's processor. Default stays ARM (pre-step-1
+        // behaviour, unchanged for ARM programs).
+        String proc = currentProgram.getLanguage().getProcessor().toString();
+        if ("RISCV".equals(proc)) {
+            boolean is64 = false;
+            try {
+                String langId = currentProgram.getLanguage()
+                    .getLanguageID().getIdAsString();
+                String[] parts = langId.split(":");
+                is64 = parts.length >= 3 && "64".equals(parts[2]);
+            } catch (Exception e) {
+                // Fall through to RV32.
+            }
+            List<long[]> windows = defaultRiscvMmioWindows();
+            if (getScriptArgs().length >= 2 &&
+                getScriptArgs()[1].startsWith("mmio=")) {
+                List<long[]> parsed = parseMmioWindows(
+                    getScriptArgs()[1].substring(5));
+                if (parsed != null && !parsed.isEmpty()) {
+                    windows = parsed;
+                } else {
+                    println("[!] Bad mmio= window spec, using " +
+                        "RISC-V defaults.");
+                }
+            }
+            isa = new RiscVIsa(is64, windows);
+            println("[*] ISA adapter: RISCV (" + (is64 ? "RV64" : "RV32") +
+                ")");
+        }
         PrintWriter w = new PrintWriter(new FileWriter(outputJson));
 
         w.println("{");

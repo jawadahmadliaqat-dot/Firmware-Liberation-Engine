@@ -93,6 +93,7 @@ full pipeline under a 512 MB Ghidra heap:
 | Register map | [`blackmagic_registermap.md`](blackmagic_registermap.md) — 35 registers, all labelled from the public STM32F1 map |
 | Local-vs-target classifier | [`classify_mmio.py`](classify_mmio.py) + chip profiles — BMP: 235 known / **0 suspects**, may addresses 13 known / **0 suspects** |
 | SVD importer | [`svd_import.py`](svd_import.py) — CMSIS-SVD → chip profile JSON (`python3 svd_import.py <device.svd> <profile.json>`). Generated STM32F103 profile reproduces the hand-written verdict on BMP: 235 known / 0 suspects, may 13 / 0. |
+| RISC-V support | `RiscVIsa` (RV32) — auto-selected by Ghidra language. Verified on `targets/riscv_blink` built from source: 18 trace ops, may 0, Lean generic PASS; ARM output unchanged. Test ELFs ship base64-encoded (`.b64`, decode like the blink fixture). |
 
 ## Quickstart (any Linux box)
 
