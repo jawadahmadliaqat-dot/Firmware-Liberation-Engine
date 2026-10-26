@@ -1,6 +1,6 @@
 /-
   Main.lean — ingest_check executable.
-  Usage: lake exe ingest_check <report.json> [blink|generic]
+  Usage: lake exe ingest_check <report.json> [blink|generic|bmp]
   Default mode is blink (the PA5 spec); generic runs only the
   firmware-agnostic invariants (non-empty trace, consistent masks,
   addresses inside the MMIO window).

@@ -12,12 +12,13 @@ import java.io.FileWriter;
 import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 /**
- * ExtractIR v3: exports functions + P-Code IR + strings + imports + XREFs as JSON.
+ * ExtractIR v3.1: exports functions + P-Code IR + strings + imports + XREFs as JSON.
  * Streams output (no big in-memory buffers) so it stays safe under a 512M heap.
  * Caps: 5000 P-Code ops per function, 10000 strings (both flagged when hit).
  *
@@ -28,20 +29,52 @@ import java.util.Set;
  * (e.g. GPIOA_ODR |= (1<<5)), so the stored value depends on runtime
  * register state and is NOT statically exact -- but the bit effect IS:
  * bit 5 forced to 1 (LED ON) or forced to 0 (LED OFF). The known-bit masks
- * capture exactly that, via the same linear scan (last definition wins)
- * already used for address resolution. Ops folded: COPY, LOAD (program
- * memory only), INT_ADD/SUB/MULT (exact-only), INT_AND/OR/XOR/NOT (mask
- * algebra, exact even on partial knowledge), INT_LEFT/RIGHT, INT_2COMP
- * (arithmetic negation), INT_NEGATE (bitwise NOT -- NOT arithmetic
- * negation; ARM BIC sleigh proves it: "Rd = rn&(~shift1)"), INT_ZEXT/SEXT,
- * SUBPIECE. Everything else yields unknown
- * bits (ones=0, zeroes=0), which mask algebra still handles safely.
- * LIMIT (same as v2): linear scan, not branch-sensitive -- fine for -O0.
+ * capture exactly that. Ops folded: COPY, LOAD (program memory only),
+ * INT_ADD/SUB/MULT (exact-only), INT_AND/OR/XOR/NOT (mask algebra, exact
+ * even on partial knowledge), INT_LEFT/RIGHT, INT_2COMP (arithmetic
+ * negation), INT_NEGATE (bitwise NOT -- NOT arithmetic negation; ARM BIC
+ * sleigh proves it: "Rd = rn&(~shift1)"), INT_ZEXT/SEXT, SUBPIECE.
+ * Everything else yields unknown bits (ones=0, zeroes=0).
+ *
+ * v3.1 replaces the v3 LINEAR scan (last definition wins) with a CFG
+ * FIXPOINT scan, because the linear scan was PROVEN to hallucinate:
+ * Black Magic Probe renesas_uid recorded a LOAD at 0x4136544A, but the
+ * literal-pool words show the list-order definition gave 0x41365432
+ * (+0x18 = 0x4136544A) while the definition on the path that actually
+ * reaches the LOAD gives 0x41365431 (+0x18 = 0x41365449). The linear
+ * scan took another branch's value. The fixpoint is a must-analysis:
+ * states flow along CFG edges (fallthrough + branch targets); at joins,
+ * conflicting exact values become UNKNOWN and known-bit masks are
+ * AND-merged (a bit is claimed only if it holds on EVERY incoming path).
+ * Two more soundness rules: (1) unique-space varnodes are temporaries
+ * LOCAL to one instruction, so their values are stripped whenever control
+ * crosses an instruction boundary; (2) CALL/CALLIND clobber the AAPCS
+ * caller-saved registers r0-r3, r12 (Ghidra ARM offsets 32, 36, 40, 44,
+ * 80 -- confirmed empirically: the epilogue pop targets 0x30/0x34/0x38/
+ * 0x3c/0x5c decode as r4/r5/r6/r7/pc under rN = 0x20 + 4N, sp = 0x54,
+ * lr = 0x58, pc = 0x5c). Callee-saved r4-r11 and sp are preserved; lr
+ * is NOT clobbered because Ghidra's own P-Code models the link value.
+ * CBRANCH fallthrough is the NEXT OP (not the next instruction): ARM
+ * predicated instructions model as [condition, CBRANCH, guarded ops]
+ * inside one instruction, and skipping to the next instruction would
+ * wrongly make the guarded ops unreachable (caught Oct 26: the first
+ * v3.1 build did exactly that and produced a phantom exact 0xFFFF in
+ * jtagtap_tdi_seq).
+ * If the fixpoint does not converge within 100 rounds, every state is
+ * reset to fully unknown (sound: fewer accesses recorded, never false
+ * ones) and "fixpoint_converged" reports false for that function.
+ * Remaining limits: path-INSENSITIVE (merge loses precision where paths
+ * disagree -- a true access may be missed, never invented); no
+ * inter-procedural analysis (callees are opaque beyond the clobber);
+ * no RAM model (loads from RAM other than program memory read unknown);
+ * indirect branches (BRANCHIND) have no successors (sound under-
+ * approximation: paths through jump tables may be missed).
  */
 public class ExtractIR extends GhidraScript {
 
     private static final int MAX_PCODE_PER_FUNCTION = 5000;
     private static final int MAX_STRINGS = 10000;
+    private static final int MAX_FIXPOINT_ROUNDS = 100;
 
     private static String esc(String s) {
         if (s == null) return "";
@@ -159,6 +192,333 @@ public class ExtractIR extends GhidraScript {
         }
     }
 
+    // ---------------- v3.1 CFG fixpoint machinery ----------------
+
+    /** One collected P-Code op, kept so the fixpoint can run before
+        anything is streamed out. */
+    private static class OpRec {
+        final Address instrAddr;
+        final String instrAsm;
+        final String mnem;
+        final Varnode[] ins;
+        final Varnode out;
+        OpRec(Address a, String asm, String mnem, Varnode[] ins, Varnode out) {
+            this.instrAddr = a;
+            this.instrAsm = asm;
+            this.mnem = mnem;
+            this.ins = ins;
+            this.out = out;
+        }
+    }
+
+    private static class FixResult {
+        final Map<String, Bits>[] inStates;
+        final boolean converged;
+        FixResult(Map<String, Bits>[] inStates, boolean converged) {
+            this.inStates = inStates;
+            this.converged = converged;
+        }
+    }
+
+    /** Put a value canonically: unknown entries are dropped (missing key
+        already means unknown), which keeps states comparable. */
+    private static void putKnown(Map<String, Bits> m, String key, Bits b) {
+        if (b.ones == 0 && b.zeroes == 0) {
+            m.remove(key);
+        } else {
+            m.put(key, b);
+        }
+    }
+
+    /** The transfer function: the v3 op-folding algebra, applied to a
+        COPY of the incoming state. No MMIO recording here -- that happens
+        once, after convergence, from the final states. */
+    private void applyTransfer(Map<String, Bits> bvals, OpRec op, Memory mem) {
+        String mnem = op.mnem;
+        Varnode[] ins = op.ins;
+        Varnode out = op.out;
+        if (mnem.equals("COPY") && ins.length == 1) {
+            if (out != null) {
+                putKnown(bvals, vkey(out), copyBits(ins[0], mem, bvals));
+            }
+        } else if (mnem.equals("INT_AND") || mnem.equals("INT_OR") ||
+            mnem.equals("INT_XOR")) {
+            if (ins.length == 2 && out != null) {
+                Bits a = resolveBits(ins[0], bvals);
+                Bits bb = resolveBits(ins[1], bvals);
+                long mask = sizeMask(out.getSize());
+                Bits r;
+                if (mnem.equals("INT_AND")) {
+                    r = new Bits((a.ones & bb.ones) & mask,
+                        (a.zeroes | bb.zeroes) & mask);
+                } else if (mnem.equals("INT_OR")) {
+                    r = new Bits((a.ones | bb.ones) & mask,
+                        (a.zeroes & bb.zeroes) & mask);
+                } else {
+                    r = new Bits(((a.ones & bb.zeroes) |
+                        (a.zeroes & bb.ones)) & mask,
+                        ((a.ones & bb.ones) |
+                        (a.zeroes & bb.zeroes)) & mask);
+                }
+                putKnown(bvals, vkey(out), r);
+            }
+        } else if (mnem.equals("INT_ADD") || mnem.equals("INT_SUB") ||
+            mnem.equals("INT_MULT")) {
+            if (ins.length == 2 && out != null) {
+                Long a = resolveExact(ins[0], bvals);
+                Long b = resolveExact(ins[1], bvals);
+                long mask = sizeMask(out.getSize());
+                if (a != null && b != null) {
+                    long r = 0;
+                    if (mnem.equals("INT_ADD")) r = a + b;
+                    else if (mnem.equals("INT_SUB")) r = a - b;
+                    else r = a * b;
+                    putKnown(bvals, vkey(out), Bits.exact(r, mask));
+                } else {
+                    putKnown(bvals, vkey(out), Bits.unknown());
+                }
+            }
+        } else if ((mnem.equals("INT_NOT") || mnem.equals("INT_NEGATE")) &&
+            ins.length == 1 && out != null) {
+            // CAREFUL: Ghidra's INT_NEGATE is bitwise NOT (~),
+            // NOT arithmetic negation. Proof: the ARM sleigh
+            // defines BIC as "Rd = rn&(~shift1)" and it
+            // compiles to INT_NEGATE + INT_AND. (Arithmetic
+            // negation is INT_2COMP.)
+            Bits a = resolveBits(ins[0], bvals);
+            long mask = sizeMask(out.getSize());
+            putKnown(bvals, vkey(out),
+                new Bits(a.zeroes & mask, a.ones & mask));
+        } else if (mnem.equals("INT_2COMP") &&
+            ins.length == 1 && out != null) {
+            Long a = resolveExact(ins[0], bvals);
+            long mask = sizeMask(out.getSize());
+            if (a != null) {
+                putKnown(bvals, vkey(out), Bits.exact(-a, mask));
+            } else {
+                putKnown(bvals, vkey(out), Bits.unknown());
+            }
+        } else if ((mnem.equals("INT_LEFT") || mnem.equals("INT_RIGHT")) &&
+            ins.length == 2 && out != null) {
+            Bits a = resolveBits(ins[0], bvals);
+            Long n = resolveExact(ins[1], bvals);
+            long mask = sizeMask(out.getSize());
+            int width = out.getSize() * 8;
+            if (n != null && n.longValue() >= 0) {
+                int sh = (int) Math.min(n.longValue(), 1000000L);
+                Bits r;
+                if (sh >= width) {
+                    r = new Bits(0, mask);
+                } else if (mnem.equals("INT_LEFT")) {
+                    long low = (sh == 0) ? 0 : ((1L << sh) - 1);
+                    r = new Bits((a.ones << sh) & mask,
+                        ((a.zeroes << sh) | low) & mask);
+                } else {
+                    long high = (sh == 0) ? 0 :
+                        (~((1L << (width - sh)) - 1) & mask);
+                    r = new Bits((a.ones >>> sh) & mask,
+                        ((a.zeroes >>> sh) | high) & mask);
+                }
+                putKnown(bvals, vkey(out), r);
+            } else {
+                putKnown(bvals, vkey(out), Bits.unknown());
+            }
+        } else if (mnem.equals("INT_SRIGHT") && ins.length == 2 && out != null) {
+            Long a = resolveExact(ins[0], bvals);
+            Long n = resolveExact(ins[1], bvals);
+            long mask = sizeMask(out.getSize());
+            int width = out.getSize() * 8;
+            if (a != null && n != null && n.longValue() >= 0 &&
+                n.longValue() < 64) {
+                long sa = a.longValue();
+                if ((sa & (1L << (width - 1))) != 0) sa |= ~mask;
+                putKnown(bvals, vkey(out),
+                    Bits.exact(sa >> n.intValue(), mask));
+            } else {
+                putKnown(bvals, vkey(out), Bits.unknown());
+            }
+        } else if (mnem.equals("INT_ZEXT") && ins.length == 1 && out != null) {
+            Bits a = resolveBits(ins[0], bvals);
+            long outMask = sizeMask(out.getSize());
+            long inMask = sizeMask(ins[0].getSize());
+            putKnown(bvals, vkey(out), new Bits(a.ones & outMask,
+                (a.zeroes | ~inMask) & outMask));
+        } else if (mnem.equals("INT_SEXT") && ins.length == 1 && out != null) {
+            Bits a = resolveBits(ins[0], bvals);
+            long outMask = sizeMask(out.getSize());
+            long inMask = sizeMask(ins[0].getSize());
+            long signBit = 1L << (ins[0].getSize() * 8 - 1);
+            Bits r;
+            if ((a.ones & signBit) != 0) {
+                r = new Bits((a.ones | ~inMask) & outMask, a.zeroes & outMask);
+            } else if ((a.zeroes & signBit) != 0) {
+                r = new Bits(a.ones & outMask, (a.zeroes | ~inMask) & outMask);
+            } else {
+                r = Bits.unknown();
+            }
+            putKnown(bvals, vkey(out), r);
+        } else if (mnem.equals("SUBPIECE") && ins.length == 2 && out != null) {
+            Bits a = resolveBits(ins[0], bvals);
+            Long off = resolveExact(ins[1], bvals);
+            long mask = sizeMask(out.getSize());
+            if (off != null && off.longValue() >= 0) {
+                int sh = off.intValue() * 8;
+                putKnown(bvals, vkey(out), new Bits((a.ones >>> sh) & mask,
+                    (a.zeroes >>> sh) & mask));
+            } else {
+                putKnown(bvals, vkey(out), Bits.unknown());
+            }
+        } else if (mnem.equals("LOAD") && out != null) {
+            putKnown(bvals, vkey(out), loadBits(ins, out, bvals, mem));
+        } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
+            // AAPCS caller-saved registers are dead after the call.
+            // Ghidra ARM offsets (rN = 0x20 + 4N): r0=32, r1=36, r2=40,
+            // r3=44, r12=80. Callee-saved r4-r11 and sp are preserved;
+            // lr is NOT clobbered: Ghidra's own P-Code models it.
+            long[] clobber = {32L, 36L, 40L, 44L, 80L};
+            Set<String> drop = new HashSet<String>();
+            for (String k : bvals.keySet()) {
+                for (long off : clobber) {
+                    if (k.startsWith("register:" + off + ":")) {
+                        drop.add(k);
+                    }
+                }
+            }
+            for (String k : drop) bvals.remove(k);
+            if (out != null) putKnown(bvals, vkey(out), Bits.unknown());
+        } else {
+            if (out != null) putKnown(bvals, vkey(out), Bits.unknown());
+        }
+    }
+
+    /** Must-meet of two states: null means "unreached" (identity). A bit
+        survives only if it agrees on every incoming path. */
+    private static Map<String, Bits> meet(Map<String, Bits> a,
+        Map<String, Bits> b) {
+        if (a == null) return b;
+        if (b == null) return a;
+        Map<String, Bits> r = new HashMap<String, Bits>();
+        Set<String> keys = new HashSet<String>();
+        keys.addAll(a.keySet());
+        keys.addAll(b.keySet());
+        for (String k : keys) {
+            Bits x = a.get(k);
+            Bits y = b.get(k);
+            long ones = (x == null ? 0 : x.ones) & (y == null ? 0 : y.ones);
+            long zeroes = (x == null ? 0 : x.zeroes) &
+                (y == null ? 0 : y.zeroes);
+            if (ones != 0 || zeroes != 0) {
+                r.put(k, new Bits(ones, zeroes));
+            }
+        }
+        return r;
+    }
+
+    private static boolean sameState(Map<String, Bits> a,
+        Map<String, Bits> b) {
+        if (a == null || b == null) return a == b;
+        if (a.size() != b.size()) return false;
+        for (Map.Entry<String, Bits> e : a.entrySet()) {
+            Bits o = b.get(e.getKey());
+            if (o == null || o.ones != e.getValue().ones ||
+                o.zeroes != e.getValue().zeroes) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Strip instruction-local temporaries: unique-space varnodes never
+        carry values across an instruction boundary. */
+    private static Map<String, Bits> stripUniques(Map<String, Bits> m) {
+        Map<String, Bits> r = new HashMap<String, Bits>();
+        for (Map.Entry<String, Bits> e : m.entrySet()) {
+            if (!e.getKey().startsWith("unique:")) {
+                r.put(e.getKey(), e.getValue());
+            }
+        }
+        return r;
+    }
+
+    @SuppressWarnings("unchecked")
+    private FixResult runFixpoint(List<OpRec> ops, Memory mem) {
+        int n = ops.size();
+        Map<String, Bits>[] in = new Map[n];
+        if (n == 0) return new FixResult(in, true);
+        in[0] = new HashMap<String, Bits>();
+
+        // First op index per instruction address (for branch targets).
+        Map<String, Integer> firstAt = new HashMap<String, Integer>();
+        for (int i = 0; i < n; i++) {
+            String a = ops.get(i).instrAddr.toString();
+            if (!firstAt.containsKey(a)) firstAt.put(a, i);
+        }
+        // Successor lists.
+        List<List<Integer>> succ = new ArrayList<List<Integer>>(n);
+        for (int i = 0; i < n; i++) succ.add(new ArrayList<Integer>());
+        for (int i = 0; i < n; i++) {
+            OpRec op = ops.get(i);
+            String mnem = op.mnem;
+            if (mnem.equals("BRANCH") || mnem.equals("CBRANCH")) {
+                if (op.ins.length >= 1) {
+                    long t = op.ins[0].getOffset();
+                    Integer j = firstAt.get(String.format("%08x", t));
+                    if (j == null) {
+                        j = firstAt.get(String.format("%08x", t & ~1L));
+                    }
+                    if (j != null) succ.get(i).add(j);
+                }
+                if (mnem.equals("CBRANCH")) {
+                    // Fallthrough is the NEXT OP, not the next instruction:
+                    // ARM predicated instructions (mov.gt/mov.le/it-blocks)
+                    // model as [condition, CBRANCH -> next instruction,
+                    // guarded ops...] inside ONE instruction. Skipping to
+                    // the next instruction would wrongly make the guarded
+                    // ops unreachable (caught Oct 26: jtagtap_tdi_seq got
+                    // a phantom exact 0xFFFF because its predicated
+                    // mov.gt/mov.le copies were skipped).
+                    if (i + 1 < n) succ.get(i).add(i + 1);
+                }
+            } else if (mnem.equals("RETURN") || mnem.equals("BRANCHIND")) {
+                // No successors: sound under-approximation (paths through
+                // jump tables may be missed, never invented).
+            } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
+                if (i + 1 < n) succ.get(i).add(i + 1);
+            } else {
+                if (i + 1 < n) succ.get(i).add(i + 1);
+            }
+        }
+
+        boolean converged = false;
+        for (int round = 0; round < MAX_FIXPOINT_ROUNDS && !converged; round++) {
+            boolean changed = false;
+            for (int i = 0; i < n; i++) {
+                if (in[i] == null) continue;
+                Map<String, Bits> out = new HashMap<String, Bits>(in[i]);
+                applyTransfer(out, ops.get(i), mem);
+                for (int j : succ.get(i)) {
+                    Map<String, Bits> prop = out;
+                    if (!ops.get(j).instrAddr.equals(ops.get(i).instrAddr)) {
+                        prop = stripUniques(out);
+                    }
+                    Map<String, Bits> merged = meet(in[j], prop);
+                    if (!sameState(in[j], merged)) {
+                        in[j] = merged;
+                        changed = true;
+                    }
+                }
+            }
+            if (!changed) converged = true;
+        }
+        if (!converged) {
+            // Sound fallback: claim nothing rather than a stale value.
+            for (int i = 0; i < n; i++) {
+                in[i] = new HashMap<String, Bits>();
+            }
+        }
+        return new FixResult(in, converged);
+    }
+
     @Override
     public void run() throws Exception {
         if (getScriptArgs().length < 1) {
@@ -172,7 +532,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3-value-export\",");
+        w.println("  \"extractor_version\": \"v3.1-cfg-fixpoint\",");
         w.println("  \"functions\": [");
 
         FunctionIterator functions = currentProgram.getFunctionManager().getFunctions(true);
@@ -218,221 +578,98 @@ public class ExtractIR extends GhidraScript {
             }
             w.println("],");
 
-            // P-Code IR for this function (control flow + ops) plus an
-            // MMIO resolver with VALUE EXPORT (v3): bare-metal code
-            // reaches hardware registers INDIRECTLY (literal-pool load
-            // into a register, then STORE/LOAD through it), so raw P-Code
-            // never shows the address. We track known-bit masks linearly
-            // (last definition wins) and resolve STORE/LOAD targets that
-            // land in the MMIO window 0x40000000-0x60000000, capturing
-            // the stored/loaded value bits alongside each access.
-            w.println("      \"pcode\": [");
+            // Phase 1: collect this function's P-Code ops (capped).
+            // Phase 2: CFG fixpoint over them (see header: must-analysis,
+            // unique-strip at instruction boundaries, CALL clobber).
+            // Phase 3: stream the P-Code JSON and record MMIO accesses
+            // from the FINAL states -- never from a running linear scan.
+            List<OpRec> ops = new ArrayList<OpRec>();
             int opCount = 0;
             boolean truncated = false;
-            boolean firstInstr = true;
-            Map<String, Bits> bvals = new HashMap<String, Bits>();
-            List<String> mmio = new ArrayList<String>();
-            Memory mem = currentProgram.getMemory();
             try {
                 InstructionIterator instrs =
                     currentProgram.getListing().getInstructions(f.getBody(), true);
                 while (instrs.hasNext() && !monitor.isCancelled()) {
                     Instruction instr = instrs.next();
-                    PcodeOp[] ops = instr.getPcode();
-                    for (PcodeOp op : ops) {
+                    PcodeOp[] pops = instr.getPcode();
+                    for (PcodeOp op : pops) {
                         if (opCount >= MAX_PCODE_PER_FUNCTION) {
                             truncated = true;
                             break;
                         }
-                        if (!firstInstr) w.println(",");
-                        firstInstr = false;
-                        String mnem = op.getMnemonic();
-                        Varnode[] ins = op.getInputs();
-                        Varnode out = op.getOutput();
-                        w.print("        {\"addr\": \"" + instr.getAddress() +
-                            "\", \"asm\": \"" + esc(instr.getMnemonicString()) +
-                            "\", \"op\": \"" + esc(mnem) + "\", \"inputs\": [");
-                        for (int i = 0; i < ins.length; i++) {
-                            if (i > 0) w.print(", ");
-                            w.print(varnodeJson(ins[i]));
-                        }
-                        w.print("], \"output\": " + varnodeJson(out) + "}");
+                        ops.add(new OpRec(instr.getAddress(),
+                            instr.getMnemonicString(), op.getMnemonic(),
+                            op.getInputs(), op.getOutput()));
                         opCount++;
-
-                        // ---- MMIO resolver + value export (same op order) ----
-                        if (mnem.equals("COPY") && ins.length == 1) {
-                            if (out != null) {
-                                bvals.put(vkey(out), copyBits(ins[0], mem, bvals));
-                            }
-                        } else if (mnem.equals("INT_AND") || mnem.equals("INT_OR") ||
-                            mnem.equals("INT_XOR")) {
-                            if (ins.length == 2 && out != null) {
-                                Bits a = resolveBits(ins[0], bvals);
-                                Bits bb = resolveBits(ins[1], bvals);
-                                long mask = sizeMask(out.getSize());
-                                Bits r;
-                                if (mnem.equals("INT_AND")) {
-                                    r = new Bits((a.ones & bb.ones) & mask,
-                                        (a.zeroes | bb.zeroes) & mask);
-                                } else if (mnem.equals("INT_OR")) {
-                                    r = new Bits((a.ones | bb.ones) & mask,
-                                        (a.zeroes & bb.zeroes) & mask);
-                                } else {
-                                    r = new Bits(((a.ones & bb.zeroes) |
-                                        (a.zeroes & bb.ones)) & mask,
-                                        ((a.ones & bb.ones) |
-                                        (a.zeroes & bb.zeroes)) & mask);
-                                }
-                                bvals.put(vkey(out), r);
-                            }
-                        } else if (mnem.equals("INT_ADD") || mnem.equals("INT_SUB") ||
-                            mnem.equals("INT_MULT")) {
-                            if (ins.length == 2 && out != null) {
-                                Long a = resolveExact(ins[0], bvals);
-                                Long b = resolveExact(ins[1], bvals);
-                                long mask = sizeMask(out.getSize());
-                                if (a != null && b != null) {
-                                    long r = 0;
-                                    if (mnem.equals("INT_ADD")) r = a + b;
-                                    else if (mnem.equals("INT_SUB")) r = a - b;
-                                    else r = a * b;
-                                    bvals.put(vkey(out), Bits.exact(r, mask));
-                                } else {
-                                    bvals.put(vkey(out), Bits.unknown());
-                                }
-                            }
-                        } else if ((mnem.equals("INT_NOT") || mnem.equals("INT_NEGATE")) &&
-                            ins.length == 1 && out != null) {
-                            // CAREFUL: Ghidra's INT_NEGATE is bitwise NOT (~),
-                            // NOT arithmetic negation. Proof: the ARM sleigh
-                            // defines BIC as "Rd = rn&(~shift1)" and it
-                            // compiles to INT_NEGATE + INT_AND. (Arithmetic
-                            // negation is INT_2COMP.) Getting this wrong
-                            // flips the cleared-bit mask: -0xC00 clears
-                            // 0xBFF, while ~0xC00 clears 0xC00.
-                            Bits a = resolveBits(ins[0], bvals);
-                            long mask = sizeMask(out.getSize());
-                            bvals.put(vkey(out),
-                                new Bits(a.zeroes & mask, a.ones & mask));
-                        } else if (mnem.equals("INT_2COMP") &&
-                            ins.length == 1 && out != null) {
-                            Long a = resolveExact(ins[0], bvals);
-                            long mask = sizeMask(out.getSize());
-                            if (a != null) {
-                                bvals.put(vkey(out), Bits.exact(-a, mask));
-                            } else {
-                                bvals.put(vkey(out), Bits.unknown());
-                            }
-                        } else if ((mnem.equals("INT_LEFT") || mnem.equals("INT_RIGHT")) &&
-                            ins.length == 2 && out != null) {
-                            Bits a = resolveBits(ins[0], bvals);
-                            Long n = resolveExact(ins[1], bvals);
-                            long mask = sizeMask(out.getSize());
-                            int width = out.getSize() * 8;
-                            if (n != null && n.longValue() >= 0) {
-                                int sh = (int) Math.min(n.longValue(), 1000000L);
-                                Bits r;
-                                if (sh >= width) {
-                                    r = new Bits(0, mask);
-                                } else if (mnem.equals("INT_LEFT")) {
-                                    long low = (sh == 0) ? 0 : ((1L << sh) - 1);
-                                    r = new Bits((a.ones << sh) & mask,
-                                        ((a.zeroes << sh) | low) & mask);
-                                } else {
-                                    long high = (sh == 0) ? 0 :
-                                        (~((1L << (width - sh)) - 1) & mask);
-                                    r = new Bits((a.ones >>> sh) & mask,
-                                        ((a.zeroes >>> sh) | high) & mask);
-                                }
-                                bvals.put(vkey(out), r);
-                            } else {
-                                bvals.put(vkey(out), Bits.unknown());
-                            }
-                        } else if (mnem.equals("INT_SRIGHT") && ins.length == 2 && out != null) {
-                            Long a = resolveExact(ins[0], bvals);
-                            Long n = resolveExact(ins[1], bvals);
-                            long mask = sizeMask(out.getSize());
-                            int width = out.getSize() * 8;
-                            if (a != null && n != null && n.longValue() >= 0 &&
-                                n.longValue() < 64) {
-                                long sa = a.longValue();
-                                if ((sa & (1L << (width - 1))) != 0) sa |= ~mask;
-                                bvals.put(vkey(out),
-                                    Bits.exact(sa >> n.intValue(), mask));
-                            } else {
-                                bvals.put(vkey(out), Bits.unknown());
-                            }
-                        } else if (mnem.equals("INT_ZEXT") && ins.length == 1 && out != null) {
-                            Bits a = resolveBits(ins[0], bvals);
-                            long outMask = sizeMask(out.getSize());
-                            long inMask = sizeMask(ins[0].getSize());
-                            bvals.put(vkey(out), new Bits(a.ones & outMask,
-                                (a.zeroes | ~inMask) & outMask));
-                        } else if (mnem.equals("INT_SEXT") && ins.length == 1 && out != null) {
-                            Bits a = resolveBits(ins[0], bvals);
-                            long outMask = sizeMask(out.getSize());
-                            long inMask = sizeMask(ins[0].getSize());
-                            long signBit = 1L << (ins[0].getSize() * 8 - 1);
-                            Bits r;
-                            if ((a.ones & signBit) != 0) {
-                                r = new Bits((a.ones | ~inMask) & outMask, a.zeroes & outMask);
-                            } else if ((a.zeroes & signBit) != 0) {
-                                r = new Bits(a.ones & outMask, (a.zeroes | ~inMask) & outMask);
-                            } else {
-                                r = Bits.unknown();
-                            }
-                            bvals.put(vkey(out), r);
-                        } else if (mnem.equals("SUBPIECE") && ins.length == 2 && out != null) {
-                            Bits a = resolveBits(ins[0], bvals);
-                            Long off = resolveExact(ins[1], bvals);
-                            long mask = sizeMask(out.getSize());
-                            if (off != null && off.longValue() >= 0) {
-                                int sh = off.intValue() * 8;
-                                bvals.put(vkey(out), new Bits((a.ones >>> sh) & mask,
-                                    (a.zeroes >>> sh) & mask));
-                            } else {
-                                bvals.put(vkey(out), Bits.unknown());
-                            }
-                        } else if (mnem.equals("LOAD") || mnem.equals("STORE")) {
-                            Bits valBits = Bits.unknown();
-                            if (mnem.equals("LOAD") && out != null) {
-                                valBits = loadBits(ins, out, bvals, mem);
-                                bvals.put(vkey(out), valBits);
-                            } else if (mnem.equals("STORE") && ins.length >= 3) {
-                                valBits = resolveBits(ins[2], bvals);
-                            }
-                            if (ins.length >= 2) {
-                                Long addr = resolveExact(ins[1], bvals);
-                                if (addr != null && addr >= 0x40000000L &&
-                                    addr < 0x60000000L) {
-                                    int sz = (mnem.equals("STORE") && ins.length >= 3)
-                                        ? ins[2].getSize()
-                                        : (out != null ? out.getSize() : 0);
-                                    Long exact = valBits.exactValue(
-                                        sizeMask(sz == 0 ? 4 : sz));
-                                    mmio.add("{\"instr\": \"" + instr.getAddress() +
-                                        "\", \"op\": \"" + mnem +
-                                        "\", \"address\": \"0x" + Long.toHexString(addr) +
-                                        "\", \"size\": " + sz +
-                                        ", \"value\": " +
-                                        (exact == null ? "null" : exact.toString()) +
-                                        ", \"value_known_ones\": " + valBits.ones +
-                                        ", \"value_known_zeroes\": " + valBits.zeroes + "}");
-                                }
-                            }
-                        } else {
-                            if (out != null) bvals.put(vkey(out), Bits.unknown());
-                        }
                     }
                     if (truncated) break;
                 }
             } catch (Exception e) {
                 // keep JSON valid even if P-Code walk fails for a function
             }
+            FixResult fx;
+            try {
+                fx = runFixpoint(ops, currentProgram.getMemory());
+            } catch (Exception e) {
+                Map<String, Bits>[] empty = new Map[ops.size()];
+                for (int i = 0; i < empty.length; i++) {
+                    empty[i] = new HashMap<String, Bits>();
+                }
+                fx = new FixResult(empty, false);
+            }
+
+            w.println("      \"pcode\": [");
+            boolean firstOp = true;
+            List<String> mmio = new ArrayList<String>();
+            Memory mem = currentProgram.getMemory();
+            for (int i = 0; i < ops.size(); i++) {
+                OpRec op = ops.get(i);
+                if (!firstOp) w.println(",");
+                firstOp = false;
+                w.print("        {\"addr\": \"" + op.instrAddr +
+                    "\", \"asm\": \"" + esc(op.instrAsm) +
+                    "\", \"op\": \"" + esc(op.mnem) + "\", \"inputs\": [");
+                for (int k = 0; k < op.ins.length; k++) {
+                    if (k > 0) w.print(", ");
+                    w.print(varnodeJson(op.ins[k]));
+                }
+                w.print("], \"output\": " + varnodeJson(op.out) + "}");
+
+                // ---- MMIO recording from the FINAL fixpoint state ----
+                if (op.mnem.equals("LOAD") || op.mnem.equals("STORE")) {
+                    Map<String, Bits> bvals = fx.inStates[i];
+                    if (bvals != null && op.ins.length >= 2) {
+                        Bits valBits = Bits.unknown();
+                        if (op.mnem.equals("LOAD") && op.out != null) {
+                            valBits = loadBits(op.ins, op.out, bvals, mem);
+                        } else if (op.mnem.equals("STORE") && op.ins.length >= 3) {
+                            valBits = resolveBits(op.ins[2], bvals);
+                        }
+                        Long addr = resolveExact(op.ins[1], bvals);
+                        if (addr != null && addr >= 0x40000000L &&
+                            addr < 0x60000000L) {
+                            int sz = (op.mnem.equals("STORE") && op.ins.length >= 3)
+                                ? op.ins[2].getSize()
+                                : (op.out != null ? op.out.getSize() : 0);
+                            Long exact = valBits.exactValue(
+                                sizeMask(sz == 0 ? 4 : sz));
+                            mmio.add("{\"instr\": \"" + op.instrAddr +
+                                "\", \"op\": \"" + op.mnem +
+                                "\", \"address\": \"0x" + Long.toHexString(addr) +
+                                "\", \"size\": " + sz +
+                                ", \"value\": " +
+                                (exact == null ? "null" : exact.toString()) +
+                                ", \"value_known_ones\": " + valBits.ones +
+                                ", \"value_known_zeroes\": " + valBits.zeroes + "}");
+                        }
+                    }
+                }
+            }
             w.println();
             w.println("      ],");
             w.println("      \"pcode_op_count\": " + opCount + ",");
             w.println("      \"pcode_truncated\": " + truncated + ",");
+            w.println("      \"fixpoint_converged\": " + fx.converged + ",");
             w.println("      \"mmio_accesses\": [");
             for (int i = 0; i < mmio.size(); i++) {
                 if (i > 0) w.println(",");

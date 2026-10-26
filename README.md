@@ -10,10 +10,13 @@ firmware.elf ──► Ghidra headless + ExtractIR ──► MMIO JSON ──►
 
 ## What it proves today
 
-- **Extraction**: Ghidra P-Code + a linear register-value tracker resolves
-  ARM MMIO addresses that never appear literally in the code (literal-pool
-  load → register → STORE/LOAD). Verified 10/10 on a ground-truth STM32F4
-  blink firmware we built ourselves.
+- **Extraction**: Ghidra P-Code + a CFG fixpoint register tracker (v3.1)
+  resolves ARM MMIO addresses that never appear literally in the code
+  (literal-pool load → register → STORE/LOAD). States flow along CFG edges
+  and merge on conflict (exact values become unknown, bit masks AND-merge),
+  so one branch's value can no longer leak into another branch's access —
+  the v3 linear scan was proven to do exactly that on BMP `renesas_uid`.
+  Verified 10/10 on a ground-truth STM32F4 blink firmware we built ourselves.
 - **Value export (v3)**: every MMIO access carries `value` (exact or null)
   plus `value_known_ones` / `value_known_zeroes` bit masks, so
   read-modify-write stores still yield provable bit effects.
@@ -32,10 +35,11 @@ full pipeline under a 512 MB Ghidra heap:
 
 | Check | Result |
 |---|---|
-| MMIO accesses extracted | 226 (0 truncated at the 5000-op cap) |
-| Driver confinement | **PASS** — jtagtap 38 (GPIO/AFIO only), rcc 45 (RCC only), st_usbfs 26 (USB only), swdptap 37 (GPIOA only), LED 2 (GPIOB only), platform 31 (GPIO/ADC only) |
+| MMIO accesses extracted | 213 (0 truncated at the 5000-op cap, all functions fixpoint-converged) |
+| Driver confinement | **PASS** — jtagtap 56 (GPIO/AFIO only), rcc 28 (RCC only), st_usbfs 24 (USB only), swdptap 37 (GPIOA only), LED 2 (GPIOB only), platform 29 (GPIO/ADC only) |
 | Negative tests | Tampered reports **FAIL** as required (confinement violation, mask overlap) |
-| Register map | [`blackmagic_registermap.md`](blackmagic_registermap.md) — 40 registers, 39 labelled from the public STM32F1 map |
+| Register map | [`blackmagic_registermap.md`](blackmagic_registermap.md) — 32 registers, all labelled from the public STM32F1 map |
+| Local-vs-target classifier | [`classify_mmio.py`](classify_mmio.py) + chip profiles — BMP: 213 known / **0 suspects** (v3 had 1: the `renesas_uid` phantom, now eliminated) |
 
 ## Quickstart (any Linux box)
 
@@ -51,15 +55,22 @@ upload. `FIRMWARE_WORKSPACE` and `GHIDRA_HEADLESS` env vars override paths.
 
 ## Honest limits
 
-- The resolver is a **linear last-definition-wins scan** — fine for `-O0`,
-  may mis-resolve optimized/obfuscated code. Fix planned: High P-Code (SSA).
+- The resolver is a **path-insensitive must-analysis**: where paths disagree
+  on an address, it reports unknown instead of guessing. That costs recall
+  on jump-table dispatch (TBB/BRANCHIND has no CFG successors — `rcc_*`
+  oscillator polling and parts of `remote_packet_process` are missed) and
+  on predicated-move merges. The planned complement is a MAY-analysis
+  (all possible addresses per site) alongside the must-analysis.
 - Checks are **static per-function facts**, not runtime execution order.
-- The extractor does not yet separate **local vs target-side addresses**
-  (e.g. `renesas_uid` passes a Renesas target address through probe code).
+- Local vs target separation is v1: the classifier flags addresses outside
+  the chip's documented peripheral blocks (BMP now 0 suspects), but deciding
+  target-side vs mis-resolution for a flagged address still needs review.
 - No QEMU/angr/HIL in this stage — those belong to the big pipeline.
 
 ## Roadmap
 
 Perfect portfolio (this repo + write-up) → big pipeline: register-map
-export (done for BMP) → P-Code→Lean deepening → typestate Rust + Kani →
-path pruning → HIL (needs physical hardware) → boot shims (last).
+export (done for BMP) → CFG fixpoint resolver (done, v3.1) → local-vs-target
+classifier v1 (done) → MAY-analysis (all possible addresses per site) →
+P-Code→Lean deepening → typestate Rust + Kani → path pruning → HIL (needs
+physical hardware) → boot shims (last).
