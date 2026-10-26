@@ -3,7 +3,12 @@
   Usage: lake exe ingest_check <report.json> [blink|generic|bmp]
   Default mode is blink (the PA5 spec); generic runs only the
   firmware-agnostic invariants (non-empty trace, consistent masks,
-  addresses inside the MMIO window).
+  addresses inside the MMIO bands).
+  Generic-mode bands: the report's top-level "mmio_windows" field
+  (emitted by ExtractIR from the ISA adapter's own constants).
+  Reports without the field (old reports) fall back to the historical
+  ARM window 0x40000000-0x60000000, so old verdicts are unchanged.
+  Bmp mode keeps its own hardcoded ARM window via checkGeneric.
 -/
 
 import Verifier.Common
@@ -21,10 +26,10 @@ def printBlink (trace : List MmioAccess) : IO Bool := do
   IO.println s!"mode clear-then-set before LED: {mode}"
   pure (order && led && clock && mode)
 
-def printGeneric (trace : List MmioAccess) : IO Bool := do
+def printGeneric (windows : List (Nat × Nat)) (trace : List MmioAccess) : IO Bool := do
   let nonempty := !trace.isEmpty
   let masks := checkMasksConsistent trace
-  let window := checkWindow 0x40000000 0x60000000 trace
+  let window := checkWindowBands windows trace
   IO.println s!"trace non-empty: {nonempty}"
   IO.println s!"masks consistent (ones & zeroes == 0): {masks}"
   IO.println s!"all addresses in MMIO window: {window}"
@@ -54,8 +59,11 @@ def main (args : List String) : IO UInt32 := do
       | .error e => IO.println s!"may extract failed: {e}"; pure 1
       | .ok mayTrace => do
         IO.println s!"may trace ops: {mayTrace.length}"
-        let ok ← if mode == "generic" then printGeneric trace
-          else if mode == "bmp" then printBmp trace mayTrace
-          else printBlink trace
-        if ok then IO.println "VERDICT: PASS"; pure 0
-        else IO.println "VERDICT: FAIL"; pure 1
+        match extractMmioWindows j with
+        | .error e => IO.println s!"mmio windows extract failed: {e}"; pure 1
+        | .ok windows => do
+          let ok ← if mode == "generic" then printGeneric windows trace
+            else if mode == "bmp" then printBmp trace mayTrace
+            else printBlink trace
+          if ok then IO.println "VERDICT: PASS"; pure 0
+          else IO.println "VERDICT: FAIL"; pure 1

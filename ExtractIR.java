@@ -228,6 +228,13 @@ public class ExtractIR extends GhidraScript {
         String formatCodeAddress(long addr);
         /** True when an address is in the ISA's peripheral/MMIO window. */
         boolean isMmioAddress(long addr);
+        /** The ISA's peripheral/MMIO bands as [start, end) pairs,
+            in the same order isMmioAddress tests them (ARM: the single
+            Cortex-M window; RISC-V/MIPS: the configured band list).
+            Emitted into the report as "mmio_windows" so the Lean
+            verifier can check the trace against the platform's bands
+            instead of a hardcoded ARM window. */
+        List<long[]> mmioWindows();
         /** Recover jump-table successors for BRANCHINDs (ARM: TBB/TBH). */
         Map<Integer, List<Integer>> recoverJumpTableTargets(
             List<OpRec> ops, Memory mem);
@@ -285,6 +292,11 @@ public class ExtractIR extends GhidraScript {
         public boolean isMmioAddress(long addr) {
             // ARM Cortex-M peripheral region.
             return addr >= 0x40000000L && addr < 0x60000000L;
+        }
+        public List<long[]> mmioWindows() {
+            List<long[]> wins = new ArrayList<long[]>();
+            wins.add(new long[] {0x40000000L, 0x60000000L});
+            return wins;
         }
         public int fallthroughIndex(List<OpRec> ops, int i) {
             return i + 1 < ops.size() ? i + 1 : -1;
@@ -494,6 +506,9 @@ public class ExtractIR extends GhidraScript {
             }
             return false;
         }
+        public List<long[]> mmioWindows() {
+            return mmioWindows;
+        }
         public int fallthroughIndex(List<OpRec> ops, int i) {
             return i + 1 < ops.size() ? i + 1 : -1;
         }
@@ -631,6 +646,9 @@ public class ExtractIR extends GhidraScript {
                 if (addr >= w[0] && addr < w[1]) return true;
             }
             return false;
+        }
+        public List<long[]> mmioWindows() {
+            return mmioWindows;
         }
         public int fallthroughIndex(List<OpRec> ops, int i) {
             // Skip the delay-slot instruction's standalone ops: the
@@ -3062,6 +3080,24 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
         w.println("  \"extractor_version\": \"v3.7-mayfp\",");
+        // Effective MMIO bands, so the Lean verifier can check the
+        // trace against this platform's bands (single source of
+        // truth: the adapter's own constants, not a user-retyped
+        // CLI window). Hex strings, like "address" elsewhere.
+        List<long[]> effWins = isa.mmioWindows();
+        if (effWins == null || effWins.isEmpty()) {
+            println("[!] Adapter returned no MMIO bands; emitting ARM default.");
+            effWins = new ArrayList<long[]>();
+            effWins.add(new long[] {0x40000000L, 0x60000000L});
+        }
+        w.println("  \"mmio_windows\": [");
+        for (int wi = 0; wi < effWins.size(); wi++) {
+            long[] win = effWins.get(wi);
+            w.println("    [\"0x" + Long.toHexString(win[0]) +
+                "\", \"0x" + Long.toHexString(win[1]) + "\"]" +
+                (wi + 1 < effWins.size() ? "," : ""));
+        }
+        w.println("  ],");
         w.println("  \"functions\": [");
 
         FunctionIterator functions = currentProgram.getFunctionManager().getFunctions(true);

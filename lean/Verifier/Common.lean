@@ -146,6 +146,38 @@ def checkMasksConsistent (trace : List MmioAccess) : Bool :=
 def checkWindow (lo hi : Nat) (trace : List MmioAccess) : Bool :=
   trace.all fun a => decide (lo ≤ a.addr) && decide (a.addr < hi)
 
+/-- Window check against a band list: an address passes if it falls in
+    ANY band. The bands come from the report's "mmio_windows" field
+    (the extractor adapter's own constants); see extractMmioWindows. -/
+def checkWindowBands (windows : List (Nat × Nat)) (trace : List MmioAccess) : Bool :=
+  trace.all fun a => windows.any fun w => decide (w.1 ≤ a.addr) && decide (a.addr < w.2)
+
+/-- MMIO bands claimed by the extractor, as [start, end) hex-string pairs
+    in the report's top-level "mmio_windows" field. Absent (old reports)
+    means the historical ARM window, not an error; a present-but-malformed
+    field is an error, not silently ignored (same policy as may_accesses).
+    TRUST NOTE: these bands are extractor-produced facts, same trust level
+    as the trace itself (Lean already trusts extractor JSON). They are
+    static adapter constants, NOT derived from the trace, so a
+    mis-resolved wild address still fails the check. What this does NOT
+    prove: that the bands equal the true platform map — that is the
+    SVD-profile classifier's job, not the window check's. -/
+def extractMmioWindows (j : Json) : Except String (List (Nat × Nat)) := do
+  match j.getObjVal? "mmio_windows" with
+  | .error _ => pure [(0x40000000, 0x60000000)]
+  | .ok v => do
+    let arr ← Json.getArr? v
+    arr.toList.mapM (fun w => do
+      let pair ← Json.getArr? w
+      if pair.size != 2 then throw s!"bad mmio window (need [start, end]): {w}"
+      else do
+        let loS ← Json.getStr? pair[0]!
+        let hiS ← Json.getStr? pair[1]!
+        let lo ← parseHex loS
+        let hi ← parseHex hiS
+        if lo < hi then pure (lo, hi)
+        else throw s!"bad mmio window (start >= end): {w}")
+
 def checkGeneric (trace : List MmioAccess) : Bool :=
   !trace.isEmpty && checkMasksConsistent trace &&
   checkWindow 0x40000000 0x60000000 trace
