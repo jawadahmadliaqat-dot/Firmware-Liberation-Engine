@@ -1,7 +1,7 @@
 {
   "binary_name": "stm32_blink.elf",
   "language": "ARM:LE:32:v8",
-  "extractor_version": "v3.6-tailcall-literals",
+  "extractor_version": "v3.7-mayfp",
   "functions": [
     {
       "name": "delay",

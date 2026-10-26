@@ -153,6 +153,18 @@ import java.util.Set;
  * address and by field offset (dual recording) -- previously a
  * store whose address resolved went only to the exact map, hiding
  * DP init stores from every parameter-based site.
+ * v3.7 (may false-positive fix): may-state values now carry
+ * provenance (the ops that materialized their bits; pure
+ * computation preserves it), and may-access recording drops a
+ * value only when a feasibility-aware taint BFS proves no path
+ * carries it to the use: taint flows where provenance flows
+ * (COPY, value-preserving arithmetic), dies at LOADs, comparison
+ * results and CALL-clobbered registers, and paths requiring the
+ * same branch condition both ways (the correlated if/else-assign
+ * pattern behind the rcc USART1 flag) are pruned. A value copied
+ * to another varnode before its original is redefined survives
+ * (the platform_init GPIOB case). Any doubt keeps the value, so
+ * no true may-address is lost.
  * If the fixpoint does not converge within 100 rounds, every state is
  * reset to fully unknown (sound: fewer accesses recorded, never false
  * ones) and "fixpoint_converged" reports false for that function.
@@ -635,44 +647,59 @@ public class ExtractIR extends GhidraScript {
     // must/may path sets diverge. KEEP IN SYNC.
     private static final int MAX_MAY_SET_SIZE = 16;
 
+    /** v3.7: may-state values carry provenance -- each value maps to
+        the op indices that materialized its bits (COPY from a
+        literal, LOAD from memory; pure computation preserves the
+        inputs' provenance, constants carry the empty set). The
+        recording step uses provenance to drop values whose
+        definition is provably dead at the use (see isKilledDef). */
     private static class MayResult {
-        final Map<String, Set<Long>>[] inStates;
+        final Map<String, Map<Long, Set<Integer>>>[] inStates;
         final boolean converged;
-        MayResult(Map<String, Set<Long>>[] inStates, boolean converged) {
+        MayResult(Map<String, Map<Long, Set<Integer>>>[] inStates,
+            boolean converged) {
             this.inStates = inStates;
             this.converged = converged;
         }
     }
 
-    /** May-resolution: constant -> singleton; otherwise the map entry
-        (missing key = TOP = unconstrained, e.g. a function argument). */
-    private static Set<Long> mayResolve(Varnode v,
-        Map<String, Set<Long>> m) {
+    /** May-resolution: constant -> singleton with empty provenance
+        (a constant is always a possible value); otherwise the map
+        entry (missing key = TOP = unconstrained, e.g. an argument). */
+    private static Map<Long, Set<Integer>> mayResolve(Varnode v,
+        Map<String, Map<Long, Set<Integer>>> m) {
         if (v == null) return null;
         if (v.isConstant()) {
-            Set<Long> s = new HashSet<Long>();
-            s.add(v.getOffset() & sizeMask(v.getSize()));
+            Map<Long, Set<Integer>> s = new HashMap<Long, Set<Integer>>();
+            s.put(v.getOffset() & sizeMask(v.getSize()),
+                new HashSet<Integer>());
             return s;
         }
         return m.get(vkey(v));
     }
 
-    /** COPY source resolution: like mayResolve, but a ram varnode reads
-        the program-memory word (literal pool), mirroring copyBits. */
-    private static Set<Long> mayCopyBits(Varnode v,
-        Map<String, Set<Long>> m, Memory mem) {
+    /** COPY source resolution: like mayResolve, but a const or a ram
+        varnode is materialized by this COPY op (provenance = the
+        COPY itself), mirroring copyBits. */
+    private static Map<Long, Set<Integer>> mayCopyBits(Varnode v,
+        Map<String, Map<Long, Set<Integer>>> m, Memory mem, int curOp) {
         if (v == null) return null;
         if (v.isConstant()) {
-            Set<Long> s = new HashSet<Long>();
-            s.add(v.getOffset() & sizeMask(v.getSize()));
+            Map<Long, Set<Integer>> s = new HashMap<Long, Set<Integer>>();
+            Set<Integer> p = new HashSet<Integer>();
+            p.add(curOp);
+            s.put(v.getOffset() & sizeMask(v.getSize()), p);
             return s;
         }
         if (v.getAddress() != null &&
             "ram".equals(v.getAddress().getAddressSpace().getName())) {
             try {
                 long val = mem.getInt(v.getAddress()) & 0xffffffffL;
-                Set<Long> s = new HashSet<Long>();
-                s.add(val);
+                Map<Long, Set<Integer>> s =
+                    new HashMap<Long, Set<Integer>>();
+                Set<Integer> p = new HashSet<Integer>();
+                p.add(curOp);
+                s.put(val, p);
                 return s;
             } catch (Exception e) {
                 return null;
@@ -681,8 +708,8 @@ public class ExtractIR extends GhidraScript {
         return m.get(vkey(v));
     }
 
-    private static void mayPut(Map<String, Set<Long>> m, String key,
-        Set<Long> s) {
+    private static void mayPut(Map<String, Map<Long, Set<Integer>>> m,
+        String key, Map<Long, Set<Integer>> s) {
         if (s == null || s.size() > MAX_MAY_SET_SIZE) {
             m.remove(key);
         } else {
@@ -690,44 +717,69 @@ public class ExtractIR extends GhidraScript {
         }
     }
 
-    private static Set<Long> mayCombine(Set<Long> a, Set<Long> b,
+    /** Provenance union for one computed value: the union of the
+        inputs' defining ops (empty = pure constant, never killed). */
+    private static Set<Integer> unionProv(Set<Integer> a, Set<Integer> b) {
+        Set<Integer> u = new HashSet<Integer>();
+        if (a != null) u.addAll(a);
+        if (b != null) u.addAll(b);
+        return u;
+    }
+
+    private static Map<Long, Set<Integer>> mayCombine(
+        Map<Long, Set<Integer>> a, Map<Long, Set<Integer>> b,
         java.util.function.BiFunction<Long, Long, Long> f, long mask) {
         if (a == null || b == null) return null;
         if ((long) a.size() * (long) b.size() > MAX_MAY_SET_SIZE) return null;
-        Set<Long> r = new HashSet<Long>();
-        for (long x : a) {
-            for (long y : b) {
-                r.add(f.apply(x, y) & mask);
+        Map<Long, Set<Integer>> r = new HashMap<Long, Set<Integer>>();
+        for (Map.Entry<Long, Set<Integer>> e : a.entrySet()) {
+            for (Map.Entry<Long, Set<Integer>> e2 : b.entrySet()) {
+                long v = f.apply(e.getKey(), e2.getKey()) & mask;
+                Set<Integer> prev = r.get(v);
+                Set<Integer> u = unionProv(e.getValue(), e2.getValue());
+                if (prev == null) r.put(v, u);
+                else prev.addAll(u);
             }
         }
         return r.size() > MAX_MAY_SET_SIZE ? null : r;
     }
 
-    private static Set<Long> mayMap(Set<Long> a,
+    private static Map<Long, Set<Integer>> mayMap(
+        Map<Long, Set<Integer>> a,
         java.util.function.Function<Long, Long> f, long mask) {
         if (a == null) return null;
-        Set<Long> r = new HashSet<Long>();
-        for (long x : a) r.add(f.apply(x) & mask);
+        Map<Long, Set<Integer>> r = new HashMap<Long, Set<Integer>>();
+        for (Map.Entry<Long, Set<Integer>> e : a.entrySet()) {
+            long v = f.apply(e.getKey()) & mask;
+            Set<Integer> prev = r.get(v);
+            Set<Integer> u = unionProv(e.getValue(), null);
+            if (prev == null) r.put(v, u);
+            else prev.addAll(u);
+        }
         return r.size() > MAX_MAY_SET_SIZE ? null : r;
     }
 
-    /** The may transfer function: the v3 op-folding algebra over sets. */
-    private void applyMayTransfer(Map<String, Set<Long>> m, OpRec op,
-        Memory mem) {
+    /** The may transfer function: the v3 op-folding algebra over
+        value->provenance maps. Inner maps are never mutated after
+        creation (mayPut/mayMeet always build fresh ones), so sharing
+        a map between two varnodes (COPY passthrough) is safe. */
+    private void applyMayTransfer(
+        Map<String, Map<Long, Set<Integer>>> m, OpRec op,
+        Memory mem, int curOp) {
         String mnem = op.mnem;
         Varnode[] ins = op.ins;
         Varnode out = op.out;
         if (mnem.equals("COPY") && ins.length == 1) {
             if (out != null) {
-                mayPut(m, vkey(out), mayCopyBits(ins[0], m, mem));
+                mayPut(m, vkey(out), mayCopyBits(ins[0], m, mem, curOp));
             }
         } else if (mnem.equals("INT_AND") || mnem.equals("INT_OR") ||
             mnem.equals("INT_XOR")) {
             if (ins.length == 2 && out != null) {
-                Set<Long> a = mayResolve(ins[0], m);
-                Set<Long> b = mayResolve(ins[1], m);
+                Map<Long, Set<Integer>> a = mayResolve(ins[0], m);
+                Map<Long, Set<Integer>> b = mayResolve(ins[1], m);
                 long mask = sizeMask(out.getSize());
-                Set<Long> r = null;
+                Map<Long, Set<Integer>> r = null;
                 if (mnem.equals("INT_AND")) {
                     r = mayCombine(a, b, (x, y) -> x & y, mask);
                 } else if (mnem.equals("INT_OR")) {
@@ -740,10 +792,10 @@ public class ExtractIR extends GhidraScript {
         } else if (mnem.equals("INT_ADD") || mnem.equals("INT_SUB") ||
             mnem.equals("INT_MULT")) {
             if (ins.length == 2 && out != null) {
-                Set<Long> a = mayResolve(ins[0], m);
-                Set<Long> b = mayResolve(ins[1], m);
+                Map<Long, Set<Integer>> a = mayResolve(ins[0], m);
+                Map<Long, Set<Integer>> b = mayResolve(ins[1], m);
                 long mask = sizeMask(out.getSize());
-                Set<Long> r = null;
+                Map<Long, Set<Integer>> r = null;
                 if (mnem.equals("INT_ADD")) {
                     r = mayCombine(a, b, (x, y) -> x + y, mask);
                 } else if (mnem.equals("INT_SUB")) {
@@ -763,16 +815,18 @@ public class ExtractIR extends GhidraScript {
                 x -> -x, sizeMask(out.getSize())));
         } else if ((mnem.equals("INT_LEFT") || mnem.equals("INT_RIGHT") ||
             mnem.equals("INT_SRIGHT")) && ins.length == 2 && out != null) {
-            Set<Long> a = mayResolve(ins[0], m);
-            Set<Long> n = mayResolve(ins[1], m);
+            Map<Long, Set<Integer>> a = mayResolve(ins[0], m);
+            Map<Long, Set<Integer>> n = mayResolve(ins[1], m);
             long mask = sizeMask(out.getSize());
-            Set<Long> r = null;
+            Map<Long, Set<Integer>> r = null;
             if (a != null && n != null && n.size() == 1) {
-                long sh = n.iterator().next();
+                long sh = n.keySet().iterator().next();
+                Set<Integer> nProv = n.values().iterator().next();
                 if (sh >= 0 && sh < 64) {
-                    r = new HashSet<Long>();
+                    r = new HashMap<Long, Set<Integer>>();
                     int width = out.getSize() * 8;
-                    for (long x : a) {
+                    for (Map.Entry<Long, Set<Integer>> e : a.entrySet()) {
+                        long x = e.getKey();
                         long v;
                         if (mnem.equals("INT_LEFT")) {
                             v = x << sh;
@@ -784,7 +838,11 @@ public class ExtractIR extends GhidraScript {
                                 (sx & (1L << (width - 1))) != 0) sx |= ~mask;
                             v = sx >> sh;
                         }
-                        r.add(v & mask);
+                        long k = v & mask;
+                        Set<Integer> prev = r.get(k);
+                        Set<Integer> u = unionProv(e.getValue(), nProv);
+                        if (prev == null) r.put(k, u);
+                        else prev.addAll(u);
                     }
                     if (r.size() > MAX_MAY_SET_SIZE) r = null;
                 }
@@ -794,43 +852,54 @@ public class ExtractIR extends GhidraScript {
             // Zero-extension keeps the numeric value.
             mayPut(m, vkey(out), mayResolve(ins[0], m));
         } else if (mnem.equals("INT_SEXT") && ins.length == 1 && out != null) {
-            Set<Long> a = mayResolve(ins[0], m);
+            Map<Long, Set<Integer>> a = mayResolve(ins[0], m);
             long outMask = sizeMask(out.getSize());
             long inMask = sizeMask(ins[0].getSize());
             long signBit = 1L << (ins[0].getSize() * 8 - 1);
-            Set<Long> r = null;
+            Map<Long, Set<Integer>> r = null;
             if (a != null) {
-                r = new HashSet<Long>();
-                for (long x : a) {
+                r = new HashMap<Long, Set<Integer>>();
+                for (Map.Entry<Long, Set<Integer>> e : a.entrySet()) {
+                    long x = e.getKey();
                     long v = ((x & signBit) != 0) ? ((x | ~inMask) & outMask)
                         : (x & outMask);
-                    r.add(v);
+                    Set<Integer> prev = r.get(v);
+                    Set<Integer> u = unionProv(e.getValue(), null);
+                    if (prev == null) r.put(v, u);
+                    else prev.addAll(u);
                 }
                 if (r.size() > MAX_MAY_SET_SIZE) r = null;
             }
             mayPut(m, vkey(out), r);
         } else if (mnem.equals("SUBPIECE") && ins.length == 2 && out != null) {
-            Set<Long> a = mayResolve(ins[0], m);
-            Set<Long> off = mayResolve(ins[1], m);
+            Map<Long, Set<Integer>> a = mayResolve(ins[0], m);
+            Map<Long, Set<Integer>> off = mayResolve(ins[1], m);
             long mask = sizeMask(out.getSize());
-            Set<Long> r = null;
+            Map<Long, Set<Integer>> r = null;
             if (a != null && off != null && off.size() == 1) {
-                long sh = off.iterator().next() * 8;
+                long sh = off.keySet().iterator().next() * 8;
+                Set<Integer> offProv = off.values().iterator().next();
                 if (sh >= 0 && sh < 64) {
-                    r = new HashSet<Long>();
-                    for (long x : a) r.add((x >>> sh) & mask);
+                    r = new HashMap<Long, Set<Integer>>();
+                    for (Map.Entry<Long, Set<Integer>> e : a.entrySet()) {
+                        long k = (e.getKey() >>> sh) & mask;
+                        Set<Integer> prev = r.get(k);
+                        Set<Integer> u = unionProv(e.getValue(), offProv);
+                        if (prev == null) r.put(k, u);
+                        else prev.addAll(u);
+                    }
                     if (r.size() > MAX_MAY_SET_SIZE) r = null;
                 }
             }
             mayPut(m, vkey(out), r);
         } else if (mnem.equals("LOAD") && out != null) {
-            Set<Long> r = null;
+            Map<Long, Set<Integer>> r = null;
             if (ins.length >= 2) {
-                Set<Long> addrs = mayResolve(ins[1], m);
+                Map<Long, Set<Integer>> addrs = mayResolve(ins[1], m);
                 if (addrs != null) {
-                    r = new HashSet<Long>();
+                    r = new HashMap<Long, Set<Integer>>();
                     boolean ok = true;
-                    for (long a : addrs) {
+                    for (long a : addrs.keySet()) {
                         try {
                             Address ad = toAddr(a);
                             int sz = out.getSize();
@@ -839,7 +908,11 @@ public class ExtractIR extends GhidraScript {
                             else if (sz == 2) val = mem.getShort(ad) & 0xffffL;
                             else if (sz == 1) val = mem.getByte(ad) & 0xffL;
                             else { ok = false; break; }
-                            r.add(val);
+                            // The loaded value is materialized by
+                            // this LOAD (its origin is memory).
+                            Set<Integer> p = new HashSet<Integer>();
+                            p.add(curOp);
+                            r.put(val, p);
                         } catch (Exception e) {
                             ok = false;
                             break;
@@ -865,39 +938,54 @@ public class ExtractIR extends GhidraScript {
     }
 
     /** May-join: a varnode keeps a finite set only if EVERY incoming
-        path has a finite set for it; the set is the union. A missing
-        key on any path means TOP (unconstrained) on that path, which
-        poisons the join to TOP. */
-    private static Map<String, Set<Long>> mayMeet(
-        Map<String, Set<Long>> a, Map<String, Set<Long>> b) {
+        path has a finite set for it; the set is the union, with
+        provenance unioned per value. A missing key on any path
+        means TOP (unconstrained) on that path, which poisons the
+        join to TOP. */
+    private static Map<String, Map<Long, Set<Integer>>> mayMeet(
+        Map<String, Map<Long, Set<Integer>>> a,
+        Map<String, Map<Long, Set<Integer>>> b) {
         if (a == null) return b;
         if (b == null) return a;
-        Map<String, Set<Long>> r = new HashMap<String, Set<Long>>();
-        for (Map.Entry<String, Set<Long>> e : a.entrySet()) {
-            Set<Long> y = b.get(e.getKey());
+        Map<String, Map<Long, Set<Integer>>> r =
+            new HashMap<String, Map<Long, Set<Integer>>>();
+        for (Map.Entry<String, Map<Long, Set<Integer>>> e : a.entrySet()) {
+            Map<Long, Set<Integer>> y = b.get(e.getKey());
             if (y == null) continue;
-            Set<Long> u = new HashSet<Long>(e.getValue());
-            u.addAll(y);
+            Map<Long, Set<Integer>> u = new HashMap<Long, Set<Integer>>();
+            for (Map.Entry<Long, Set<Integer>> ve : e.getValue().entrySet()) {
+                Set<Integer> s = new HashSet<Integer>(ve.getValue());
+                Set<Integer> yv = y.get(ve.getKey());
+                if (yv != null) s.addAll(yv);
+                u.put(ve.getKey(), s);
+            }
+            for (Map.Entry<Long, Set<Integer>> ve : y.entrySet()) {
+                if (!u.containsKey(ve.getKey())) {
+                    u.put(ve.getKey(), new HashSet<Integer>(ve.getValue()));
+                }
+            }
             if (u.size() <= MAX_MAY_SET_SIZE) r.put(e.getKey(), u);
         }
         return r;
     }
 
-    private static boolean maySameState(Map<String, Set<Long>> a,
-        Map<String, Set<Long>> b) {
+    private static boolean maySameState(
+        Map<String, Map<Long, Set<Integer>>> a,
+        Map<String, Map<Long, Set<Integer>>> b) {
         if (a == null || b == null) return a == b;
         if (a.size() != b.size()) return false;
-        for (Map.Entry<String, Set<Long>> e : a.entrySet()) {
-            Set<Long> o = b.get(e.getKey());
+        for (Map.Entry<String, Map<Long, Set<Integer>>> e : a.entrySet()) {
+            Map<Long, Set<Integer>> o = b.get(e.getKey());
             if (o == null || !o.equals(e.getValue())) return false;
         }
         return true;
     }
 
-    private static Map<String, Set<Long>> stripMayUniques(
-        Map<String, Set<Long>> m) {
-        Map<String, Set<Long>> r = new HashMap<String, Set<Long>>();
-        for (Map.Entry<String, Set<Long>> e : m.entrySet()) {
+    private static Map<String, Map<Long, Set<Integer>>> stripMayUniques(
+        Map<String, Map<Long, Set<Integer>>> m) {
+        Map<String, Map<Long, Set<Integer>>> r =
+            new HashMap<String, Map<Long, Set<Integer>>>();
+        for (Map.Entry<String, Map<Long, Set<Integer>>> e : m.entrySet()) {
             if (!e.getKey().startsWith("unique:")) {
                 r.put(e.getKey(), e.getValue());
             }
@@ -905,15 +993,13 @@ public class ExtractIR extends GhidraScript {
         return r;
     }
 
-    @SuppressWarnings("unchecked")
-    private MayResult runMayFixpoint(List<OpRec> ops, Memory mem,
+    /** CFG successors for one function, shared by the may fixpoint
+        and the recording-time feasibility check (KEEP IN SYNC with
+        runFixpoint's successor rules for BRANCH/CBRANCH/RETURN/
+        BRANCHIND/CALL). */
+    private List<List<Integer>> buildSucc(List<OpRec> ops,
         Map<Integer, List<Integer>> branchTargets) {
         int n = ops.size();
-        Map<String, Set<Long>>[] in = new Map[n];
-        if (n == 0) return new MayResult(in, true);
-        in[0] = new HashMap<String, Set<Long>>();
-
-        // Successors: duplicated from runFixpoint -- KEEP IN SYNC.
         Map<String, Integer> firstAt = new HashMap<String, Integer>();
         for (int i = 0; i < n; i++) {
             String a = ops.get(i).instrAddr.toString();
@@ -949,21 +1035,226 @@ public class ExtractIR extends GhidraScript {
                 if (i + 1 < n) succ.get(i).add(i + 1);
             }
         }
+        return succ;
+    }
+
+    /** Resolve a CBRANCH condition to (root varnode key, takenMeansZero
+        as "1"/"0") by walking the def chain through COPY, BOOL_NEGATE
+        and INT_EQUAL/INT_NOTEQUAL-against-0. Returns null when the
+        chain cannot be resolved (then the edge is unconstrained --
+        conservative). */
+    private String[] resolveCond(Varnode v, List<OpRec> ops, int beforeIdx) {
+        if (v == null || v.isConstant()) return null;
+        Varnode cur = v;
+        Varnode root = null;
+        boolean takenZero = false;
+        int flips = 0;
+        for (int step = 0; step < 8; step++) {
+            int def = findDef(ops, vkey(cur), beforeIdx);
+            if (def < 0) {
+                root = cur;
+                takenZero = (flips % 2 == 1);
+                break;
+            }
+            OpRec dd = ops.get(def);
+            if (dd.mnem.equals("COPY") && dd.ins.length == 1 &&
+                !dd.ins[0].isConstant()) {
+                cur = dd.ins[0];
+                continue;
+            }
+            if (dd.mnem.equals("BOOL_NEGATE") && dd.ins.length == 1) {
+                flips++;
+                cur = dd.ins[0];
+                continue;
+            }
+            if ((dd.mnem.equals("INT_EQUAL") ||
+                dd.mnem.equals("INT_NOTEQUAL")) &&
+                dd.ins.length == 2 && dd.ins[1].isConstant() &&
+                dd.ins[1].getOffset() == 0) {
+                if (dd.ins[0].isConstant()) return null;
+                root = dd.ins[0];
+                takenZero = dd.mnem.equals("INT_EQUAL")
+                    ? (flips % 2 == 0) : (flips % 2 == 1);
+                break;
+            }
+            root = cur;
+            takenZero = (flips % 2 == 1);
+            break;
+        }
+        if (root == null || root.isConstant()) return null;
+        // Full backward search for the root's defining op: two
+        // branches are correlated ONLY if they test the same value,
+        // and a root redefined between branches (the ARM flag temps
+        // 0x60-0x69 are redefined at nearly every instruction) must
+        // never count as the same condition.
+        int rootDef = -1;
+        for (int j = beforeIdx - 1; j >= 0; j--) {
+            Varnode o = ops.get(j).out;
+            if (o != null && vkey(o).equals(vkey(root))) {
+                rootDef = j;
+                break;
+            }
+        }
+        String key = vkey(root) + "@" +
+            (rootDef >= 0 ? Integer.toString(rootDef) : "entry");
+        return new String[]{key, takenZero ? "1" : "0"};
+    }
+
+    /** v3.7: is the value defined by defOp dead at useOp? Dead means
+        no FEASIBLE path carries it to the use varnode. This is a
+        taint BFS, not a redefinition check: a value survives a
+        redefinition of its original varnode if it was copied to
+        another varnode first (the platform_init GPIOB case), and it
+        dies on paths whose branch outcomes contradict each other
+        (the correlated if/else-assign pattern behind the rcc
+        false positive). Taint flows exactly where may-provenance
+        flows (COPY and value-preserving arithmetic); LOAD results,
+        comparison results and CALL-clobbered registers lose it.
+        Any doubt (unresolvable condition, search cap) returns
+        false -- the value is kept. Sound: only provably-dead
+        values are dropped, never true ones. */
+    private boolean isKilledDef(int defOp, int useOp, String useKey,
+        List<OpRec> ops, List<List<Integer>> succ) {
+        if (defOp < 0 || defOp >= ops.size()) return false;
+        OpRec d = ops.get(defOp);
+        if (d.out == null) return false;
+        String defKey = vkey(d.out);
+        Map<String, Integer> firstAt = new HashMap<String, Integer>();
+        for (int i = 0; i < ops.size(); i++) {
+            String a = ops.get(i).instrAddr.toString();
+            if (!firstAt.containsKey(a)) firstAt.put(a, i);
+        }
+        java.util.ArrayDeque<Object[]> q = new java.util.ArrayDeque<Object[]>();
+        java.util.Set<String> seen = new java.util.HashSet<String>();
+        java.util.Set<String> t0 = new java.util.HashSet<String>();
+        t0.add(defKey);
+        for (int s : succ.get(defOp)) {
+            q.add(new Object[]{s, t0, new HashMap<String, Boolean>()});
+        }
+        int steps = 0;
+        while (!q.isEmpty()) {
+            Object[] cur = q.remove();
+            int j = (Integer) cur[0];
+            @SuppressWarnings("unchecked")
+            java.util.Set<String> taint = (java.util.Set<String>) cur[1];
+            @SuppressWarnings("unchecked")
+            Map<String, Boolean> asm = (Map<String, Boolean>) cur[2];
+            if (j == useOp) {
+                if (taint.contains(useKey)) return false;
+                continue;
+            }
+            java.util.List<String> sortedTaint =
+                new java.util.ArrayList<String>(taint);
+            java.util.Collections.sort(sortedTaint);
+            String sig = j + "|" + sortedTaint.toString() + "|" +
+                asm.toString();
+            if (!seen.add(sig)) continue;
+            if (++steps > 20000) return false;
+            OpRec oj = ops.get(j);
+            // Taint transfer for this op.
+            java.util.Set<String> nt = new java.util.HashSet<String>(taint);
+            String mn = oj.mnem;
+            if (mn.equals("COPY") || mn.equals("INT_AND") ||
+                mn.equals("INT_OR") || mn.equals("INT_XOR") ||
+                mn.equals("INT_ADD") || mn.equals("INT_SUB") ||
+                mn.equals("INT_MULT") || mn.equals("INT_NOT") ||
+                mn.equals("INT_NEGATE") || mn.equals("INT_2COMP") ||
+                mn.equals("INT_LEFT") || mn.equals("INT_RIGHT") ||
+                mn.equals("INT_SRIGHT") || mn.equals("INT_ZEXT") ||
+                mn.equals("INT_SEXT") || mn.equals("SUBPIECE")) {
+                boolean anyIn = false;
+                for (Varnode in : oj.ins) {
+                    if (!in.isConstant() && taint.contains(vkey(in))) {
+                        anyIn = true;
+                        break;
+                    }
+                }
+                if (oj.out != null) {
+                    nt.remove(vkey(oj.out));
+                    if (anyIn) nt.add(vkey(oj.out));
+                }
+            } else if (mn.equals("CALL") || mn.equals("CALLIND")) {
+                long[] clobber = {32L, 36L, 40L, 44L, 80L};
+                java.util.Set<String> drop = new java.util.HashSet<String>();
+                for (String k : nt) {
+                    for (long off : clobber) {
+                        if (k.startsWith("register:" + off + ":")) {
+                            drop.add(k);
+                        }
+                    }
+                }
+                nt.removeAll(drop);
+                if (oj.out != null) nt.remove(vkey(oj.out));
+            } else if (oj.out != null) {
+                // LOAD, comparisons, BOOL ops: fresh result, no flow.
+                nt.remove(vkey(oj.out));
+            }
+            if (mn.equals("CBRANCH") && oj.ins.length >= 2) {
+                String[] cond = resolveCond(oj.ins[1], ops, j);
+                Integer targetIdx = null;
+                if (oj.ins.length >= 1) {
+                    long t = oj.ins[0].getOffset();
+                    targetIdx = firstAt.get(String.format("%08x", t));
+                    if (targetIdx == null) {
+                        targetIdx = firstAt.get(
+                            String.format("%08x", t & ~1L));
+                    }
+                }
+                for (int s : succ.get(j)) {
+                    Map<String, Boolean> na =
+                        new HashMap<String, Boolean>(asm);
+                    if (cond != null && targetIdx != null) {
+                        boolean takenZero = cond[1].equals("1");
+                        Boolean req;
+                        if (s == targetIdx.intValue()) {
+                            req = takenZero;
+                        } else if (s == j + 1) {
+                            req = !takenZero;
+                        } else {
+                            req = null;
+                        }
+                        if (req != null) {
+                            Boolean prev = na.get(cond[0]);
+                            if (prev != null && !prev.equals(req)) continue;
+                            na.put(cond[0], req);
+                        }
+                    }
+                    q.add(new Object[]{s, nt, na});
+                }
+            } else {
+                for (int s : succ.get(j)) {
+                    q.add(new Object[]{s, nt, asm});
+                }
+            }
+        }
+        return true;
+    }
+
+    @SuppressWarnings("unchecked")
+    private MayResult runMayFixpoint(List<OpRec> ops, Memory mem,
+        Map<Integer, List<Integer>> branchTargets) {
+        int n = ops.size();
+        Map<String, Map<Long, Set<Integer>>>[] in = new Map[n];
+        if (n == 0) return new MayResult(in, true);
+        in[0] = new HashMap<String, Map<Long, Set<Integer>>>();
+
+        List<List<Integer>> succ = buildSucc(ops, branchTargets);
 
         boolean converged = false;
         for (int round = 0; round < MAX_FIXPOINT_ROUNDS && !converged; round++) {
             boolean changed = false;
             for (int i = 0; i < n; i++) {
                 if (in[i] == null) continue;
-                Map<String, Set<Long>> out =
-                    new HashMap<String, Set<Long>>(in[i]);
-                applyMayTransfer(out, ops.get(i), mem);
+                Map<String, Map<Long, Set<Integer>>> out =
+                    new HashMap<String, Map<Long, Set<Integer>>>(in[i]);
+                applyMayTransfer(out, ops.get(i), mem, i);
                 for (int j : succ.get(i)) {
-                    Map<String, Set<Long>> prop = out;
+                    Map<String, Map<Long, Set<Integer>>> prop = out;
                     if (!ops.get(j).instrAddr.equals(ops.get(i).instrAddr)) {
                         prop = stripMayUniques(out);
                     }
-                    Map<String, Set<Long>> merged = mayMeet(in[j], prop);
+                    Map<String, Map<Long, Set<Integer>>> merged =
+                        mayMeet(in[j], prop);
                     if (!maySameState(in[j], merged)) {
                         in[j] = merged;
                         changed = true;
@@ -975,7 +1266,7 @@ public class ExtractIR extends GhidraScript {
         if (!converged) {
             // Sound fallback: claim nothing rather than a stale set.
             for (int i = 0; i < n; i++) {
-                in[i] = new HashMap<String, Set<Long>>();
+                in[i] = new HashMap<String, Map<Long, Set<Integer>>>();
             }
         }
         return new MayResult(in, converged);
@@ -2011,7 +2302,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.6-tailcall-literals\",");
+        w.println("  \"extractor_version\": \"v3.7-mayfp\",");
         w.println("  \"functions\": [");
 
         FunctionIterator functions = currentProgram.getFunctionManager().getFunctions(true);
@@ -2163,9 +2454,11 @@ public class ExtractIR extends GhidraScript {
                 my = runMayFixpoint(ops, currentProgram.getMemory(),
                     branchTargets);
             } catch (Exception e) {
-                Map<String, Set<Long>>[] emptyMay = new Map[ops.size()];
+                Map<String, Map<Long, Set<Integer>>>[] emptyMay =
+                    new Map[ops.size()];
                 for (int i = 0; i < emptyMay.length; i++) {
-                    emptyMay[i] = new HashMap<String, Set<Long>>();
+                    emptyMay[i] =
+                        new HashMap<String, Map<Long, Set<Integer>>>();
                 }
                 my = new MayResult(emptyMay, false);
             }
@@ -2175,6 +2468,8 @@ public class ExtractIR extends GhidraScript {
             List<String> mmio = new ArrayList<String>();
             List<String> may = new ArrayList<String>();
             Memory mem = currentProgram.getMemory();
+            // Successors for the recording-time feasibility filter.
+            List<List<Integer>> maySucc = buildSucc(ops, branchTargets);
             for (int i = 0; i < ops.size(); i++) {
                 OpRec op = ops.get(i);
                 if (!firstOp) w.println(",");
@@ -2225,11 +2520,40 @@ public class ExtractIR extends GhidraScript {
                 // must-state (a STORE's value does not depend on its
                 // address); MAY-LOAD values are unknown (the must
                 // address is unknown, so no program-memory read applies).
+                // v3.7: values whose every defining op is provably
+                // dead at this use (redefined on every feasible path
+                // -- the correlated if/else-assign false positive) are
+                // dropped before the MMIO filter; anything doubtful
+                // is kept, so no true may-address is ever lost.
                 if ((op.mnem.equals("LOAD") || op.mnem.equals("STORE")) &&
                     !mustRecorded && my.inStates[i] != null &&
                     op.ins.length >= 2) {
-                    Set<Long> addrSet =
-                        mayResolve(op.ins[1], my.inStates[i]);
+                    Set<Long> addrSet = null;
+                    if (op.ins[1].isConstant()) {
+                        addrSet = new HashSet<Long>();
+                        addrSet.add(op.ins[1].getOffset() &
+                            sizeMask(op.ins[1].getSize()));
+                    } else {
+                        Map<Long, Set<Integer>> prov =
+                            my.inStates[i].get(vkey(op.ins[1]));
+                        if (prov != null) {
+                            addrSet = new HashSet<Long>();
+                            for (Map.Entry<Long, Set<Integer>> e :
+                                prov.entrySet()) {
+                                boolean keep = e.getValue().isEmpty();
+                                if (!keep) {
+                                    for (int d : e.getValue()) {
+                                        if (!isKilledDef(d, i, vkey(op.ins[1]),
+                                            ops, maySucc)) {
+                                            keep = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (keep) addrSet.add(e.getKey());
+                            }
+                        }
+                    }
                     if (addrSet != null) {
                         List<Long> win = new ArrayList<Long>();
                         for (long a : addrSet) {
