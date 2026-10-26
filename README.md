@@ -94,6 +94,7 @@ full pipeline under a 512 MB Ghidra heap:
 | Local-vs-target classifier | [`classify_mmio.py`](classify_mmio.py) + chip profiles — BMP: 235 known / **0 suspects**, may addresses 13 known / **0 suspects** |
 | SVD importer | [`svd_import.py`](svd_import.py) — CMSIS-SVD → chip profile JSON (`python3 svd_import.py <device.svd> <profile.json>`). Generated STM32F103 profile reproduces the hand-written verdict on BMP: 235 known / 0 suspects, may 13 / 0. |
 | RISC-V support | `RiscVIsa` (RV32) — auto-selected by Ghidra language. Verified on `targets/riscv_blink` built from source: 18 trace ops, may 0, Lean generic PASS; ARM output unchanged. Test ELFs ship base64-encoded (`.b64`, decode like the blink fixture). |
+| Stripped binaries | No code change needed — the engine uses Ghidra auto-analysis, never debug info. Stripped BMP: 198 vs 235 must (−16%), may 9 vs 13, 0 suspects, Lean generic PASS; stripped blink: zero loss (10/10). **Stripped binaries must use generic mode only** — `bmp` mode passes vacuously on stripped input (`FUN_` names fall through) and proves nothing. Reproduce with [`elf_strip.py`](elf_strip.py) on the official BMP release ELF. |
 
 ## Quickstart (any Linux box)
 
@@ -159,6 +160,7 @@ remote. `--no-upload` skips the report upload. `FIRMWARE_WORKSPACE` and
   flagged load reads RAM globals, not USART1 — so the profile stays
   strict and the question is closed by measurement, not by widening.
 - No QEMU/angr/HIL in this stage — those belong to the big pipeline.
+- Stripped binaries lose names, so driver-family attribution is gone: use generic mode only. `bmp` mode on stripped input passes vacuously (every `FUN_` name falls through the family mapping) — never quote that PASS.
 
 ## Roadmap
 
