@@ -1,7 +1,7 @@
 {
   "binary_name": "stm32_blink.elf",
   "language": "ARM:LE:32:v8",
-  "extractor_version": "v3-value-export",
+  "extractor_version": "v3.1-cfg-fixpoint",
   "functions": [
     {
       "name": "delay",
@@ -68,6 +68,7 @@
       ],
       "pcode_op_count": 54,
       "pcode_truncated": false,
+      "fixpoint_converged": true,
       "mmio_accesses": [
 
       ],
@@ -170,6 +171,7 @@
       ],
       "pcode_op_count": 86,
       "pcode_truncated": false,
+      "fixpoint_converged": true,
       "mmio_accesses": [
         {"instr": "08000026", "op": "LOAD", "address": "0x40023830", "size": 4, "value": null, "value_known_ones": 0, "value_known_zeroes": 0},
         {"instr": "0800002e", "op": "STORE", "address": "0x40023830", "size": 4, "value": null, "value_known_ones": 1, "value_known_zeroes": 0},
