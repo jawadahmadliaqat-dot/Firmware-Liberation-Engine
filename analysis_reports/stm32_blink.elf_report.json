@@ -1,7 +1,7 @@
 {
   "binary_name": "stm32_blink.elf",
   "language": "ARM:LE:32:v8",
-  "extractor_version": "v3.4-callgraph",
+  "extractor_version": "v3.5-pointsto",
   "functions": [
     {
       "name": "delay",
@@ -83,7 +83,13 @@
       ],
       "indirect_call_count": 0,
       "indirect_call_edges": 0,
-      "indirect_successor_count": 0
+      "indirect_successor_count": 0,
+      "may_call_edges": [
+
+      ],
+      "may_call_site_count": 0,
+      "may_call_target_count": 0,
+      "unresolved_indirect_count": 0
     },
     {
       "name": "main",
@@ -206,7 +212,13 @@
       ],
       "indirect_call_count": 0,
       "indirect_call_edges": 0,
-      "indirect_successor_count": 0
+      "indirect_successor_count": 0,
+      "may_call_edges": [
+
+      ],
+      "may_call_site_count": 0,
+      "may_call_target_count": 0,
+      "unresolved_indirect_count": 0
     }
   ],
   "strings": [
@@ -250,5 +262,8 @@
   "mmio_access_total": 10,
   "may_access_total": 0,
   "indirect_call_edges_total": 0,
-  "indirect_successor_total": 0
+  "indirect_successor_total": 0,
+  "may_call_site_total": 0,
+  "may_call_target_total": 0,
+  "unresolved_indirect_total": 0
 }

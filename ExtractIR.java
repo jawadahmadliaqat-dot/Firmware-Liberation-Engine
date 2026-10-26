@@ -103,6 +103,25 @@ import java.util.Set;
  * are real instruction starts in the same function now become CFG
  * successors (BRANCHIND only), while function-entry entries become
  * call-graph edges.
+ *
+ * v3.5 adds points-to recovery for the CALLINDs v3.4 could not
+ * resolve (BMP: 161 of 178 are LOAD [struct + const offset] --
+ * vtable-style dispatch). Each CALLIND's pointer load is resolved
+ * through its backward def chain (COPY / INT_ADD / LOAD of a
+ * resolvable address, depth 4), where a varnode in a memory space
+ * reads as the word at that address (ARM literal-pool pattern).
+ * A chain ending in flash yields the static word; a chain ending
+ * in RAM (BMP's probe structs live in .bss, filled at runtime)
+ * is matched against the whole-program store map, which records
+ * every runtime store of a resolvable function address keyed by
+ * exact address or field offset. When the chain does not resolve,
+ * the fallbacks are a scaled call-table read and the offset map.
+ * Only single-constant destinations stay CERTAIN (indirect_calls,
+ * with the Thumb-AND unwrap v3.4 missed -- which in BMP resolves
+ * to const 0x16, not a function, so certain stays 0).
+ * Parameter-passed struct pointers (no def in the 40-op window),
+ * [reg + reg] indexing, and longer chains stay unresolved and
+ * are counted, never guessed.
  * If the fixpoint does not converge within 100 rounds, every state is
  * reset to fully unknown (sound: fewer accesses recorded, never false
  * ones) and "fixpoint_converged" reports false for that function.
@@ -1063,11 +1082,14 @@ public class ExtractIR extends GhidraScript {
         final List<String> sites;
         final int edges;
         final Map<Integer, List<Integer>> successors;
+        final Set<Integer> certainCalls;
         IndirectResult(List<String> sites, int edges,
-            Map<Integer, List<Integer>> successors) {
+            Map<Integer, List<Integer>> successors,
+            Set<Integer> certainCalls) {
             this.sites = sites;
             this.edges = edges;
             this.successors = successors;
+            this.certainCalls = certainCalls;
         }
     }
 
@@ -1150,13 +1172,14 @@ public class ExtractIR extends GhidraScript {
             call); the read stops at the first entry that is neither,
             or an unreadable address, capped at 64.
         Argument-dependent dispatch (vtable via object pointer) has no
-        constant base and is left for points-to analysis. Every
+        constant base and is handled by v3.5's may-analysis below. Every
         reported edge target is a real function entry by construction. */
     private IndirectResult recoverIndirect(List<OpRec> ops, Memory mem,
         FunctionManager fm, Set<Integer> tbbBranchInds) {
         List<String> out = new ArrayList<String>();
         Map<Integer, List<Integer>> succ =
             new HashMap<Integer, List<Integer>>();
+        Set<Integer> certainCalls = new HashSet<Integer>();
         int edges = 0;
         Map<String, Integer> firstAt = new HashMap<String, Integer>();
         for (int i = 0; i < ops.size(); i++) {
@@ -1175,6 +1198,23 @@ public class ExtractIR extends GhidraScript {
             int def = findDef(ops, vkey(call.ins[0]), i);
             if (def >= 0) {
                 OpRec dd = ops.get(def);
+                // v3.5: CALLIND destinations go through a Thumb-bit
+                // AND (all 178 BMP CALLINDs do) -- unwrap it before
+                // looking for a constant destination.
+                if (dd.mnem.equals("INT_AND") && dd.ins.length == 2) {
+                    for (int s = 0; s < 2; s++) {
+                        Varnode vv = dd.ins[s];
+                        if (vv.isConstant() &&
+                            (vv.getOffset() & 0xFFFFFFFFL) == 0xFFFFFFFEL) {
+                            int du = findDef(ops, vkey(dd.ins[1 - s]), def);
+                            if (du >= 0) {
+                                def = du;
+                                dd = ops.get(def);
+                            }
+                            break;
+                        }
+                    }
+                }
                 if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
                     Long c = null;
                     if (dd.ins[0].isConstant()) {
@@ -1250,10 +1290,356 @@ public class ExtractIR extends GhidraScript {
                     "\", \"op\": \"" + call.mnem +
                     "\", \"targets\": [" + tb.toString() + "]}");
                 edges += targets.size();
+                if (call.mnem.equals("CALLIND")) certainCalls.add(i);
             }
             if (!mySucc.isEmpty()) succ.put(i, mySucc);
         }
-        return new IndirectResult(out, edges, succ);
+        return new IndirectResult(out, edges, succ, certainCalls);
+    }
+
+    private static class OpsResult {
+        final List<OpRec> ops;
+        final boolean truncated;
+        OpsResult(List<OpRec> ops, boolean truncated) {
+            this.ops = ops;
+            this.truncated = truncated;
+        }
+    }
+
+    /** Shared P-Code walk for one function (capped, best-effort). */
+    private OpsResult buildOps(Function f) {
+        List<OpRec> ops = new ArrayList<OpRec>();
+        int opCount = 0;
+        boolean truncated = false;
+        try {
+            InstructionIterator instrs =
+                currentProgram.getListing().getInstructions(f.getBody(), true);
+            while (instrs.hasNext() && !monitor.isCancelled()) {
+                Instruction instr = instrs.next();
+                PcodeOp[] pops = instr.getPcode();
+                for (PcodeOp op : pops) {
+                    if (opCount >= MAX_PCODE_PER_FUNCTION) {
+                        truncated = true;
+                        break;
+                    }
+                    ops.add(new OpRec(instr.getAddress(),
+                        instr.getMnemonicString(), op.getMnemonic(),
+                        op.getInputs(), op.getOutput()));
+                    opCount++;
+                }
+                if (truncated) break;
+            }
+        } catch (Exception e) {
+            // keep JSON valid even if P-Code walk fails for a function
+        }
+        return new OpsResult(ops, truncated);
+    }
+
+    private static void putStore(Map<Long, Set<String>> m, long key,
+        String name) {
+        Set<String> s = m.get(key);
+        if (s == null) {
+            s = new HashSet<String>();
+            m.put(key, s);
+        }
+        s.add(name);
+    }
+
+    /** v3.5 pass 1: collect every runtime store of a function address,
+        keyed by destination -- a resolved address, a constant
+        address, or a [reg + const offset] field offset. The offset
+        key deliberately merges different structs sharing one offset:
+        the resulting may-set is a superset (safe for "could call"),
+        never a claim of certainty. */
+    private void collectFuncPtrStores(List<OpRec> ops, Memory mem,
+        FunctionManager fm, Map<Long, Set<String>> byOffset,
+        Map<Long, Set<String>> byAddr) {
+        for (int i = 0; i < ops.size(); i++) {
+            OpRec op = ops.get(i);
+            if (!op.mnem.equals("STORE") || op.ins.length < 3) continue;
+            // Value: any chain that resolves to a function entry
+            // (const, COPY, LOAD from a flash table, ...).
+            Long val = resolveValue(op.ins[2], ops, mem, i, 4);
+            if (val == null) continue;
+            long funcAddr = val.longValue() & ~1L;
+            String funcName = null;
+            try {
+                Function fn = fm.getFunctionAt(toAddr(funcAddr));
+                if (fn != null) funcName = fn.getName();
+            } catch (Exception e) {
+                continue;
+            }
+            if (funcName == null) continue;
+            Varnode a = op.ins[1];
+            if (a.isConstant()) {
+                putStore(byAddr, a.getOffset(), funcName);
+            } else {
+                Long av = resolveValue(a, ops, mem, i, 4);
+                if (av != null) {
+                    // Guard against null-base artifacts (a base
+                    // that resolved to ~0 plus a field offset).
+                    if (av.longValue() >= 0x1000L) {
+                        putStore(byAddr, av.longValue(), funcName);
+                    }
+                } else {
+                    int da = findDef(ops, vkey(a), i);
+                    if (da >= 0) {
+                        OpRec ad = ops.get(da);
+                        if (ad.mnem.equals("INT_ADD") &&
+                            ad.ins.length == 2) {
+                            for (int s = 0; s < 2; s++) {
+                                if (ad.ins[s].isConstant()) {
+                                    putStore(byOffset,
+                                        ad.ins[s].getOffset(), funcName);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static class PointsToResult {
+        final List<String> maySites;
+        final int mayTargets;
+        final int unresolved;
+        PointsToResult(List<String> maySites, int mayTargets,
+            int unresolved) {
+            this.maySites = maySites;
+            this.mayTargets = mayTargets;
+            this.unresolved = unresolved;
+        }
+    }
+
+    /** Resolve a varnode to a concrete address/value through its
+        backward def chain (COPY, INT_ADD of resolvable sides, LOAD
+        of a resolvable address read from program memory), capped
+        at depth hops. Returns null for parameters, long chains,
+        arithmetic that does not resolve, and unreadable memory --
+        the caller counts those as unresolved, never guesses. */
+    private Long resolveValue(Varnode v, List<OpRec> ops, Memory mem,
+        int pos, int depth) {
+        if (v.isConstant()) return v.getOffset();
+        // A varnode in a memory space (e.g. "ram") is a memory
+        // cell, not a computed value: its value is the word at
+        // that address. This is the ARM literal-pool pattern
+        // (ldr r3, [pc, #x] loads a global pointer from a pool
+        // entry in flash). Register/unique/const spaces are
+        // excluded: they are values, not cells.
+        String spName = v.getAddress().getAddressSpace().getName();
+        if (!spName.equals("register") && !spName.equals("unique") &&
+            !spName.equals("const")) {
+            try {
+                return mem.getInt(v.getAddress()) & 0xffffffffL;
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        if (depth <= 0) return null;
+        int d = findDef(ops, vkey(v), pos);
+        if (d < 0) return null;
+        OpRec dd = ops.get(d);
+        if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
+            return resolveValue(dd.ins[0], ops, mem, d, depth - 1);
+        }
+        if (dd.mnem.equals("INT_ADD") && dd.ins.length == 2) {
+            Long a = resolveValue(dd.ins[0], ops, mem, d, depth - 1);
+            Long b = resolveValue(dd.ins[1], ops, mem, d, depth - 1);
+            if (a != null && b != null) {
+                return a.longValue() + b.longValue();
+            }
+            return null;
+        }
+        if (dd.mnem.equals("LOAD") && dd.ins.length >= 2) {
+            Long a = resolveValue(dd.ins[1], ops, mem, d, depth - 1);
+            if (a == null) return null;
+            try {
+                return mem.getInt(toAddr(a.longValue())) & 0xffffffffL;
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /** v3.5 pass 2: resolve CALLINDs to may-call-edges. CALLINDs
+        already certain via recoverIndirect are skipped (they are not
+        unresolved). Tiers for the rest, all labelled MAY:
+          - LOAD whose address chain resolves to a concrete field
+            address: the static word there (flash) plus every
+            runtime store recorded for exactly that address (RAM
+            structs filled at init).
+          - LOAD whose chain does not resolve: stores at the field
+            offset anywhere in the program (superset across structs
+            sharing one offset), plus call-table entries for scaled
+            indices.
+        Anything else (parameter callbacks, [reg + reg] indexing, chains
+        longer than the 40-op window or depth 4) counts as unresolved. */
+    private PointsToResult recoverPointsTo(List<OpRec> ops, Memory mem,
+        FunctionManager fm, Map<Long, Set<String>> byOffset,
+        Map<Long, Set<String>> byAddr, Set<Integer> certainCalls) {
+        List<String> out = new ArrayList<String>();
+        int targets = 0;
+        int unresolved = 0;
+        for (int i = 0; i < ops.size(); i++) {
+            OpRec call = ops.get(i);
+            if (!call.mnem.equals("CALLIND") || call.ins.length < 1) continue;
+            if (certainCalls.contains(i)) continue;
+            int def = findDef(ops, vkey(call.ins[0]), i);
+            if (def >= 0) {
+                OpRec dd = ops.get(def);
+                if (dd.mnem.equals("INT_AND") && dd.ins.length == 2) {
+                    for (int s = 0; s < 2; s++) {
+                        Varnode vv = dd.ins[s];
+                        if (vv.isConstant() &&
+                            (vv.getOffset() & 0xFFFFFFFFL) == 0xFFFFFFFEL) {
+                            int du = findDef(ops, vkey(dd.ins[1 - s]), def);
+                            if (du >= 0) {
+                                def = du;
+                                dd = ops.get(def);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            Set<String> tset = new HashSet<String>();
+            if (def >= 0) {
+                OpRec d = ops.get(def);
+                if (d.mnem.equals("LOAD") && d.ins.length >= 2 &&
+                    d.out != null && d.out.getSize() == 4) {
+                    Varnode addrV = d.ins[1];
+                    if (addrV.isConstant()) {
+                        addMemFunc(mem, fm, addrV.getOffset(), tset);
+                        Set<String> st = byAddr.get(addrV.getOffset());
+                        if (st != null) tset.addAll(st);
+                    } else {
+                        // General case: resolve the address
+                        // computation to a concrete address when
+                        // the chain is static (global pointers,
+                        // struct bases, constant offsets). A
+                        // parameter base, or a chain longer than
+                        // the window, returns null -> unresolved.
+                        Long a = resolveValue(addrV, ops, mem,
+                            def, 4);
+                        if (a != null) {
+                            addMemFunc(mem, fm, a.longValue(), tset);
+                            // Runtime stores to exactly this field
+                            // (RAM structs filled at init).
+                            Set<String> st = byAddr.get(a.longValue());
+                            if (st != null) tset.addAll(st);
+                        } else {
+                            // Fallbacks for unresolvable bases:
+                            // scaled call-table read, and stores
+                            // at the field offset (runtime
+                            // registration superset).
+                            int da = findDef(ops, vkey(addrV), def);
+                            if (da >= 0) {
+                                OpRec ad = ops.get(da);
+                                if (ad.mnem.equals("INT_ADD") &&
+                                    ad.ins.length == 2) {
+                                    int constSide = -1;
+                                    int regSide = -1;
+                                    for (int s = 0; s < 2; s++) {
+                                        if (ad.ins[s].isConstant()) {
+                                            constSide = s;
+                                        } else {
+                                            regSide = s;
+                                        }
+                                    }
+                                    if (constSide >= 0 &&
+                                        regSide >= 0) {
+                                        long cval = ad.ins[constSide]
+                                            .getOffset();
+                                        int dr = findDef(ops,
+                                            vkey(ad.ins[regSide]), da);
+                                        boolean scaled = false;
+                                        if (dr >= 0) {
+                                            OpRec rd = ops.get(dr);
+                                            if (rd.mnem.equals(
+                                                "INT_LEFT") &&
+                                                rd.ins.length == 2 &&
+                                                rd.ins[1].isConstant() &&
+                                                rd.ins[1].getOffset()
+                                                    == 2L) {
+                                                scaled = true;
+                                            } else if (rd.mnem.equals(
+                                                "INT_MULT") &&
+                                                rd.ins.length == 2) {
+                                                for (int t = 0; t < 2; t++) {
+                                                    if (rd.ins[t].isConstant() &&
+                                                        rd.ins[t].getOffset()
+                                                            == 4L) {
+                                                        scaled = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (scaled) {
+                                            for (int k = 0; k < 64; k++) {
+                                                long ea = cval + 4L * k;
+                                                try {
+                                                    long ptr = mem.getInt(
+                                                        toAddr(ea))
+                                                        & 0xffffffffL;
+                                                    Function fn =
+                                                        fm.getFunctionAt(
+                                                            toAddr(
+                                                                ptr & ~1L));
+                                                    if (fn == null) break;
+                                                    tset.add(fn.getName());
+                                                } catch (Exception e) {
+                                                    break;
+                                                }
+                                            }
+                                        } else {
+                                            Set<String> st =
+                                                byOffset.get(cval);
+                                            if (st != null) {
+                                                tset.addAll(st);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (tset.isEmpty()) {
+                unresolved++;
+            } else {
+                List<String> sorted = new ArrayList<String>(tset);
+                java.util.Collections.sort(sorted);
+                StringBuilder tb = new StringBuilder();
+                for (int k = 0; k < sorted.size(); k++) {
+                    if (k > 0) tb.append(", ");
+                    tb.append("\"").append(esc(sorted.get(k)))
+                        .append("\"");
+                }
+                out.add("{\"instr\": \"" + ops.get(i).instrAddr +
+                    "\", \"op\": \"CALLIND\"" +
+                    ", \"targets\": [" + tb.toString() + "]}");
+                targets += sorted.size();
+            }
+        }
+        return new PointsToResult(out, targets, unresolved);
+    }
+
+    /** Add the function entry stored at a program-memory address, if
+        the word there is one. Best-effort: unreadable or non-function
+        words add nothing. */
+    private void addMemFunc(Memory mem, FunctionManager fm,
+        long addr, Set<String> tset) {
+        try {
+            long ptr = mem.getInt(toAddr(addr)) & 0xffffffffL;
+            Function fn = fm.getFunctionAt(toAddr(ptr & ~1L));
+            if (fn != null) tset.add(fn.getName());
+        } catch (Exception e) {
+            // Ignore unreadable or non-function words.
+        }
     }
 
     @Override
@@ -1269,7 +1655,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.4-callgraph\",");
+        w.println("  \"extractor_version\": \"v3.5-pointsto\",");
         w.println("  \"functions\": [");
 
         FunctionIterator functions = currentProgram.getFunctionManager().getFunctions(true);
@@ -1279,6 +1665,35 @@ public class ExtractIR extends GhidraScript {
         int totalMay = 0;
         int totalIndirect = 0;
         int totalIndSucc = 0;
+        int totalMayCallSites = 0;
+        int totalMayCallTargets = 0;
+        int totalUnresolved = 0;
+        // v3.5 pass 1: function-pointer store map for the whole
+        // program, before any function is printed (may-edges need
+        // cross-function stores). Best-effort: a failure here only
+        // shrinks may-sets, never breaks the report.
+        Map<Long, Set<String>> funcPtrByOffset =
+            new HashMap<Long, Set<String>>();
+        Map<Long, Set<String>> funcPtrByAddr =
+            new HashMap<Long, Set<String>>();
+        try {
+            FunctionIterator allFns =
+                currentProgram.getFunctionManager().getFunctions(true);
+            while (allFns.hasNext() && !monitor.isCancelled()) {
+                Function pf = allFns.next();
+                try {
+                    OpsResult por = buildOps(pf);
+                    collectFuncPtrStores(por.ops,
+                        currentProgram.getMemory(),
+                        currentProgram.getFunctionManager(),
+                        funcPtrByOffset, funcPtrByAddr);
+                } catch (Exception e) {
+                    // best-effort; continue with the next function
+                }
+            }
+        } catch (Exception e) {
+            // best-effort; may-sets degrade to empty
+        }
         while (functions.hasNext() && !monitor.isCancelled()) {
             Function f = functions.next();
             if (!firstFn) w.println(",");
@@ -1323,30 +1738,10 @@ public class ExtractIR extends GhidraScript {
             // unique-strip at instruction boundaries, CALL clobber).
             // Phase 3: stream the P-Code JSON and record MMIO accesses
             // from the FINAL states -- never from a running linear scan.
-            List<OpRec> ops = new ArrayList<OpRec>();
-            int opCount = 0;
-            boolean truncated = false;
-            try {
-                InstructionIterator instrs =
-                    currentProgram.getListing().getInstructions(f.getBody(), true);
-                while (instrs.hasNext() && !monitor.isCancelled()) {
-                    Instruction instr = instrs.next();
-                    PcodeOp[] pops = instr.getPcode();
-                    for (PcodeOp op : pops) {
-                        if (opCount >= MAX_PCODE_PER_FUNCTION) {
-                            truncated = true;
-                            break;
-                        }
-                        ops.add(new OpRec(instr.getAddress(),
-                            instr.getMnemonicString(), op.getMnemonic(),
-                            op.getInputs(), op.getOutput()));
-                        opCount++;
-                    }
-                    if (truncated) break;
-                }
-            } catch (Exception e) {
-                // keep JSON valid even if P-Code walk fails for a function
-            }
+            OpsResult or = buildOps(f);
+            List<OpRec> ops = or.ops;
+            boolean truncated = or.truncated;
+            int opCount = ops.size();
             // v3.3: TBB/TBH jump-table targets, shared by both fixpoints.
             // On any recovery failure, fall back to no targets (same
             // behaviour as before v3.3 -- sound, just less recall).
@@ -1367,7 +1762,8 @@ public class ExtractIR extends GhidraScript {
                     branchTargets.keySet());
             } catch (Exception e) {
                 ind = new IndirectResult(new ArrayList<String>(), 0,
-                    new HashMap<Integer, List<Integer>>());
+                    new HashMap<Integer, List<Integer>>(),
+                    new HashSet<Integer>());
             }
             for (Map.Entry<Integer, List<Integer>> e :
                 ind.successors.entrySet()) {
@@ -1531,11 +1927,32 @@ public class ExtractIR extends GhidraScript {
             for (List<Integer> s : ind.successors.values()) {
                 indSucc += s.size();
             }
+            PointsToResult pt;
+            try {
+                pt = recoverPointsTo(ops, currentProgram.getMemory(),
+                    currentProgram.getFunctionManager(), funcPtrByOffset,
+                    funcPtrByAddr, ind.certainCalls);
+            } catch (Exception e) {
+                pt = new PointsToResult(new ArrayList<String>(), 0, 0);
+            }
             w.println("      \"indirect_call_count\": " + ind.sites.size() + ",");
             w.println("      \"indirect_call_edges\": " + ind.edges + ",");
-            w.println("      \"indirect_successor_count\": " + indSucc);
+            w.println("      \"indirect_successor_count\": " + indSucc + ",");
+            w.println("      \"may_call_edges\": [");
+            for (int i = 0; i < pt.maySites.size(); i++) {
+                if (i > 0) w.println(",");
+                w.print("        " + pt.maySites.get(i));
+            }
+            w.println();
+            w.println("      ],");
+            w.println("      \"may_call_site_count\": " + pt.maySites.size() + ",");
+            w.println("      \"may_call_target_count\": " + pt.mayTargets + ",");
+            w.println("      \"unresolved_indirect_count\": " + pt.unresolved);
             totalIndirect += ind.edges;
             totalIndSucc += indSucc;
+            totalMayCallSites += pt.maySites.size();
+            totalMayCallTargets += pt.mayTargets;
+            totalUnresolved += pt.unresolved;
             totalMmio += mmio.size();
             totalMay += may.size();
             w.print("    }");
@@ -1626,7 +2043,10 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"mmio_access_total\": " + totalMmio + ",");
         w.println("  \"may_access_total\": " + totalMay + ",");
         w.println("  \"indirect_call_edges_total\": " + totalIndirect + ",");
-        w.println("  \"indirect_successor_total\": " + totalIndSucc);
+        w.println("  \"indirect_successor_total\": " + totalIndSucc + ",");
+        w.println("  \"may_call_site_total\": " + totalMayCallSites + ",");
+        w.println("  \"may_call_target_total\": " + totalMayCallTargets + ",");
+        w.println("  \"unresolved_indirect_total\": " + totalUnresolved);
         w.println("}");
         w.close();
         println("[+] JSON Export Complete: " + outputJson +

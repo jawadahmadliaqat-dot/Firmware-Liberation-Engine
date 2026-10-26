@@ -45,6 +45,24 @@ firmware.elf ──► Ghidra headless + ExtractIR ──► MMIO JSON ──►
   analysis), while its tables are all intra-function gotos. Must 235 /
   may 8 are unchanged (the newly reached blocks hold no MMIO), but the
   CFG is now complete across computed jumps too.
+- **Points-to recovery (v3.5)**: the CALLINDs v3.4 could not resolve
+  (BMP: 161 of 178 are `LOAD [struct + const offset]` — vtable-style
+  dispatch) are resolved to **may-call-edges**. Each pointer load is
+  followed through its backward def chain (COPY / INT_ADD / LOAD of a
+  resolvable address, depth 4), where a varnode in a memory space reads
+  as the word at that address (ARM literal-pool pattern). A chain ending
+  in flash yields the static word; a chain ending in RAM (BMP's probe
+  structs live in `.bss`, filled at runtime) is matched against a
+  whole-program store map of every runtime store of a resolvable
+  function address, keyed by exact address or field offset. On BMP:
+  **159 of 178 CALLINDs resolved** (1216 may-targets, avg 7.6/site —
+  44 sites exact with a single target, e.g. `cmd_tdi_low_reset` →
+  `jtagtap_next`; the wide sets are one ops-table field shared by a
+  whole driver family, e.g. all 20 `*_attach` functions, which is sound
+  but coarse — struct-type sensitivity is the known refinement);
+  **19 unresolved** (parameter-passed struct pointers, `[reg + reg]`
+  indexing, longer chains), counted, never guessed. Must 235 / may 8
+  unchanged — points-to touches no fixpoint.
 - **Value export (v3)**: every MMIO access carries `value` (exact or null)
   plus `value_known_ones` / `value_known_zeroes` bit masks, so
   read-modify-write stores still yield provable bit effects.
@@ -67,6 +85,7 @@ full pipeline under a 512 MB Ghidra heap:
 | Driver confinement | **PASS** — jtagtap 56+ (GPIO/AFIO only), rcc 28+ (RCC only), st_usbfs 24 (USB only), swdptap 37 (GPIOA only), LED 2 (GPIOB only), platform 29 (GPIO/ADC only); recovered TBB cases stay within their families |
 | MAY-accesses (possible, not certain) | 8 sites, 14 addresses — see the MAY section in the register map |
 | MAY confinement (every possible address within its family) | **FLAGS one case**: `rcc_get_usart_clk_freq` may read USART1_CR1 (0x40013800) on one path (the other path reads RAM) — a genuine may-finding, not a must-violation; the profile question (allow it with justification, or keep it flagged) is open |
+| Indirect-call resolution (points-to, v3.5) | **159/178 CALLINDs resolved as may-sets** (1216 targets; 44 exact singletons, e.g. `cmd_tdi_low_reset` → `jtagtap_next`; wide sets = one ops-table field shared by a driver family); 19 unresolved, counted; certain edges 0 (the one single-const case resolves to 0x16, not a function) |
 | Negative tests | Tampered reports **FAIL** as required (confinement violation, mask overlap) |
 | Register map | [`blackmagic_registermap.md`](blackmagic_registermap.md) — 35 registers, all labelled from the public STM32F1 map |
 | Local-vs-target classifier | [`classify_mmio.py`](classify_mmio.py) + chip profiles — BMP: 235 known / **0 suspects**, may addresses 14 known / **0 suspects** |
@@ -88,10 +107,13 @@ upload. `FIRMWARE_WORKSPACE` and `GHIDRA_HEADLESS` env vars override paths.
 - The resolver is a **path-insensitive must-analysis**: where paths disagree
   on an address, it reports unknown instead of guessing. The v3.2
   MAY-analysis recovers the predicated/branch-merge cases as
-  possible-address sets, and v3.3 recovers TBB/TBH jump-table blocks as
-  CFG successors. Still missing: pointer-table dispatch (targets are
-  other functions — call-graph recovery, not CFG successors) and
-  argument-dependent addresses (TOP in both analyses).
+  possible-address sets, v3.3 recovers TBB/TBH jump-table blocks as
+  CFG successors, v3.4 recovers pointer-table call-graph edges, and v3.5
+  resolves 159/178 indirect calls as may-sets. Still missing: the 19
+  unresolved CALLINDs (parameter-passed struct pointers need
+  inter-procedural argument tracking), struct-type sensitivity to narrow
+  the wide offset-shared may-sets, and argument-dependent addresses
+  (TOP in both analyses).
 - Checks are **static per-function facts**, not runtime execution order.
 - Local vs target separation is v1: the classifier flags addresses outside
   the chip's documented peripheral blocks (BMP now 0 suspects), but deciding
@@ -109,6 +131,8 @@ Perfect portfolio (this repo + write-up) → big pipeline: register-map
 export (done for BMP) → CFG fixpoint resolver (done, v3.1) → local-vs-target
 classifier v1 (done) → MAY-analysis (done, v3.2) → jump-table recovery
 (done, v3.3) → call-graph recovery (done, v3.4: 10 pointer-table sites,
-57 successors, 0 function-entry edges) →
+57 successors, 0 function-entry edges) → points-to analysis (done, v3.5:
+159/178 CALLINDs as may-sets, 19 unresolved) → BMP source cross-check
+(precision measurement vs the v2.0.0 source) →
 P-Code→Lean deepening → typestate Rust + Kani → path pruning → HIL (needs
 physical hardware) → boot shims (last).
