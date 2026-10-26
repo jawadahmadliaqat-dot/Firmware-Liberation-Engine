@@ -22,8 +22,8 @@ firmware.elf ──► Ghidra headless + ExtractIR ──► MMIO JSON ──►
   TOP and claimed nowhere). A LOAD/STORE the must-analysis drops because
   its address is path-dependent is recorded as a MAY-access with the full
   set of possible MMIO addresses — an audit must know what a driver
-  COULD touch, not only what it must touch. On BMP it recovers 8 sites
-  (14 addresses), including `aux_serial_init`'s true pair
+  COULD touch, not only what it must touch. On BMP it recovers 7 sites
+  (13 addresses), including `aux_serial_init`'s true pair
   {USART1_CR1, USART2_CR1} (v3 claimed USART1 alone) and the
   `platform_nrst_get_val` pair {GPIOA_IDR, GPIOC_IDR}.
 - **Jump-table recovery (v3.3)**: Ghidra's ARM TBB/TBH P-Code shape
@@ -83,27 +83,48 @@ full pipeline under a 512 MB Ghidra heap:
 |---|---|
 | MMIO accesses extracted | 235 (0 truncated at the 5000-op cap, all functions fixpoint-converged) |
 | Driver confinement | **PASS** — jtagtap 56+ (GPIO/AFIO only), rcc 28+ (RCC only), st_usbfs 24 (USB only), swdptap 37 (GPIOA only), LED 2 (GPIOB only), platform 29 (GPIO/ADC only); recovered TBB cases stay within their families |
-| MAY-accesses (possible, not certain) | 8 sites, 14 addresses — see the MAY section in the register map |
-| MAY confinement (every possible address within its family) | **FLAGS one case**: `rcc_get_usart_clk_freq` may read USART1_CR1 (0x40013800) — source cross-check (Oct 26, 2026) verified this as a **false positive**: the flagged `LOAD` reads RAM globals (`0x20001108`/`0x2000110c`, the `rcc_apbX_frequency` variables), not USART1. The profile stays strict; no adjudication needed |
+| MAY-accesses (possible, not certain) | 7 sites, 13 addresses — see the MAY section in the register map |
+| MAY confinement (every possible address within its family) | **PASS** (v3.7). The one case v3.5 flagged (`rcc_get_usart_clk_freq` may read USART1_CR1) was verified by the source cross-check as a **false positive** — the flagged `LOAD` reads RAM globals (`0x20001108`/`0x2000110c`, the `rcc_apbX_frequency` variables), not USART1 — and the v3.7 provenance + taint filter removed it. The profile stays strict; no adjudication needed |
 | Indirect-call resolution (points-to, v3.5) | **159/178 CALLINDs resolved as may-sets** (1216 targets; 44 exact singletons, e.g. `cmd_tdi_low_reset` → `jtagtap_next`; wide sets = one ops-table field shared by a driver family); 19 unresolved, counted; certain edges 0 (the one single-const case resolves to 0x16, not a function) |
 | Source cross-check (v3.5 vs BMP v2.0.0 source) | **Singletons 44/44 exact, 0 mismatches; field truth 99/116 (85%) covered.** 17 misses in three explained classes: tail calls (6 — reset/halt dispatch compiles to `BRANCHIND`, not `CALLIND`), store-visibility gap (11 — function-pointer literals present in the image but no `LOAD` of them in any function pcode), the no-op stub (1). The 19 unresolved are classified (libc/stdio, parameter callbacks, vector table) — none are BMP driver ops. Full report: [`bmp_source_crosscheck.md`](bmp_source_crosscheck.md) |
 | Tail-call recovery + literal scan (v3.6) | **Field truth now 116/116 (100%).** 43 tail-call sites / 399 targets recovered (`target_reset` → `cortexm_reset` + `samd_reset`, halt family exact); whole-image literal scan (157 stored pointers, name-attributed) + dual store recording (exact address AND field offset) closed the remaining 11 store-visibility misses. CALLIND may-sets: 159 sites, 1930 targets (v3.5: 1216), zero v3.5 targets lost. Unresolved tail calls: 4 (USB/parameter callbacks). Lean BMP still FAILs only on the known rcc may-FP (fix is next, not v3.6). |
 | May false-positive fix (v3.7) | **Lean BMP now PASSES fully (must + may confinement).** May-state values carry provenance; recording drops a value only when a feasibility-aware taint BFS proves no path carries it to the use. The rcc USART1 flag is gone (may sites 8→7, addresses 14→13); the first filter draft wrongly dropped two TRUE values (`aux_serial_init` USART1, `platform_init` GPIOB) and was caught by source verification before shipping — the shipped taint version keeps both. Must 235, CALLIND 159/1930, tail 43/399 all unchanged. |
 | Negative tests | Tampered reports **FAIL** as required (confinement violation, mask overlap) |
 | Register map | [`blackmagic_registermap.md`](blackmagic_registermap.md) — 35 registers, all labelled from the public STM32F1 map |
-| Local-vs-target classifier | [`classify_mmio.py`](classify_mmio.py) + chip profiles — BMP: 235 known / **0 suspects**, may addresses 14 known / **0 suspects** |
+| Local-vs-target classifier | [`classify_mmio.py`](classify_mmio.py) + chip profiles — BMP: 235 known / **0 suspects**, may addresses 13 known / **0 suspects** |
 
 ## Quickstart (any Linux box)
 
 ```bash
-./setup.sh                                   # JDK + Ghidra + Lean
-python3 ingest_and_analyze.py targets/stm32_blink/stm32_blink.elf --no-upload
-cd lean && lake exe ingest_check ../analysis_reports/stm32_blink.elf_report.json
+bash setup.sh                                   # JDK + Ghidra + Lean (asks for your sudo password)
+export FIRMWARE_WORKSPACE="$PWD"               # required: the built-in default is the dev VM's path
+export PATH="$HOME/.elan/bin:$PATH"            # Lean tools live here; repeat in every new shell
+
+# Blink test (small STM32 firmware, built by us — ships base64-encoded, decode first):
+base64 -d targets/stm32_blink/stm32_blink.elf.b64 > stm32_blink.elf
+python3 ingest_and_analyze.py stm32_blink.elf --no-upload
+cd lean && lake exe ingest_check ../analysis_reports/stm32_blink.elf_report.json blink
+# expect: trace ops 10, may trace ops 0, VERDICT: PASS (first Lean build takes 2-5 min)
+
+# Big test (real firmware, Black Magic Probe v2.0.0):
+cd ..
+python3 ingest_and_analyze.py <path/to/blackmagic-native-v2_0_0.elf> --no-upload
+python3 classify_mmio.py analysis_reports/blackmagic-native-v2_0_0.elf_report.json stm32f1_profile.json
+# expect: 235 known / 0 suspects, may 13 known / 0 suspects
+cd lean && lake exe ingest_check ../analysis_reports/blackmagic-native-v2_0_0.elf_report.json bmp
+# expect: trace ops 235, may trace ops 13, VERDICT: PASS
 ```
 
-Drive mode (optional): pass a binary *name* instead of a path and it syncs
-via `rclone` (`gdrive:Firmware_DataLake/...`); `--no-upload` skips the
-upload. `FIRMWARE_WORKSPACE` and `GHIDRA_HEADLESS` env vars override paths.
+Note: the blink `.elf` ships in this repo as a base64 test fixture
+(`targets/stm32_blink/stm32_blink.elf.b64`, built from the `.c` source
+next to it — the push tooling here is text-only, so the binary itself
+is encoded; decode it with the `base64 -d` step above). The BMP `.elf`
+does not ship — download `blackmagic-native-v2_0_0.elf` from the
+official Black Magic Probe v2.0.0 release for the big test. A binary
+passed as a path is used directly (no Drive needed); a bare name syncs
+via `rclone` (`gdrive:Firmware_DataLake/...`) and needs a configured
+remote. `--no-upload` skips the report upload. `FIRMWARE_WORKSPACE` and
+`GHIDRA_HEADLESS` env vars override paths.
 
 ## Honest limits
 
