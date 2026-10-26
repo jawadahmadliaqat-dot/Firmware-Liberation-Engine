@@ -84,8 +84,9 @@ full pipeline under a 512 MB Ghidra heap:
 | MMIO accesses extracted | 235 (0 truncated at the 5000-op cap, all functions fixpoint-converged) |
 | Driver confinement | **PASS** — jtagtap 56+ (GPIO/AFIO only), rcc 28+ (RCC only), st_usbfs 24 (USB only), swdptap 37 (GPIOA only), LED 2 (GPIOB only), platform 29 (GPIO/ADC only); recovered TBB cases stay within their families |
 | MAY-accesses (possible, not certain) | 8 sites, 14 addresses — see the MAY section in the register map |
-| MAY confinement (every possible address within its family) | **FLAGS one case**: `rcc_get_usart_clk_freq` may read USART1_CR1 (0x40013800) on one path (the other path reads RAM) — a genuine may-finding, not a must-violation; the profile question (allow it with justification, or keep it flagged) is open |
+| MAY confinement (every possible address within its family) | **FLAGS one case**: `rcc_get_usart_clk_freq` may read USART1_CR1 (0x40013800) — source cross-check (Oct 26, 2026) verified this as a **false positive**: the flagged `LOAD` reads RAM globals (`0x20001108`/`0x2000110c`, the `rcc_apbX_frequency` variables), not USART1. The profile stays strict; no adjudication needed |
 | Indirect-call resolution (points-to, v3.5) | **159/178 CALLINDs resolved as may-sets** (1216 targets; 44 exact singletons, e.g. `cmd_tdi_low_reset` → `jtagtap_next`; wide sets = one ops-table field shared by a driver family); 19 unresolved, counted; certain edges 0 (the one single-const case resolves to 0x16, not a function) |
+| Source cross-check (v3.5 vs BMP v2.0.0 source) | **Singletons 44/44 exact, 0 mismatches; field truth 99/116 (85%) covered.** 17 misses in three explained classes: tail calls (6 — reset/halt dispatch compiles to `BRANCHIND`, not `CALLIND`), store-visibility gap (11 — function-pointer literals present in the image but no `LOAD` of them in any function pcode), the no-op stub (1). The 19 unresolved are classified (libc/stdio, parameter callbacks, vector table) — none are BMP driver ops. Full report: [`bmp_source_crosscheck.md`](bmp_source_crosscheck.md) |
 | Negative tests | Tampered reports **FAIL** as required (confinement violation, mask overlap) |
 | Register map | [`blackmagic_registermap.md`](blackmagic_registermap.md) — 35 registers, all labelled from the public STM32F1 map |
 | Local-vs-target classifier | [`classify_mmio.py`](classify_mmio.py) + chip profiles — BMP: 235 known / **0 suspects**, may addresses 14 known / **0 suspects** |
@@ -112,17 +113,22 @@ upload. `FIRMWARE_WORKSPACE` and `GHIDRA_HEADLESS` env vars override paths.
   resolves 159/178 indirect calls as may-sets. Still missing: the 19
   unresolved CALLINDs (parameter-passed struct pointers need
   inter-procedural argument tracking), struct-type sensitivity to narrow
-  the wide offset-shared may-sets, and argument-dependent addresses
-  (TOP in both analyses).
+  the wide offset-shared may-sets, argument-dependent addresses
+  (TOP in both analyses), and **tail-call dispatch** — the reset/halt
+  family compiles to `BRANCHIND`, not `CALLIND`, so v3.5 cannot see it
+  (source cross-check, Oct 26, 2026). Some stores are also invisible
+  because their code falls outside Ghidra's recognized function pcodes
+  (literals present in the image, no `LOAD` of them anywhere).
 - Checks are **static per-function facts**, not runtime execution order.
 - Local vs target separation is v1: the classifier flags addresses outside
   the chip's documented peripheral blocks (BMP now 0 suspects), but deciding
   target-side vs mis-resolution for a flagged address still needs review.
 - The confinement profile is **family-observed, not vendor-blessed**: it was
-  derived from the must-trace, so a may-finding outside it (currently
-  `rcc_get_usart_clk_freq` → USART1) is a question to adjudicate, not an
-  automatic bug — widening the profile to silence it without justification
-  would be cooking the books.
+  derived from the must-trace. The one may-finding outside it
+  (`rcc_get_usart_clk_freq` → USART1) was verified by the source
+  cross-check (Oct 26, 2026) to be a may-analysis false positive — the
+  flagged load reads RAM globals, not USART1 — so the profile stays
+  strict and the question is closed by measurement, not by widening.
 - No QEMU/angr/HIL in this stage — those belong to the big pipeline.
 
 ## Roadmap
@@ -133,6 +139,8 @@ classifier v1 (done) → MAY-analysis (done, v3.2) → jump-table recovery
 (done, v3.3) → call-graph recovery (done, v3.4: 10 pointer-table sites,
 57 successors, 0 function-entry edges) → points-to analysis (done, v3.5:
 159/178 CALLINDs as may-sets, 19 unresolved) → BMP source cross-check
-(precision measurement vs the v2.0.0 source) →
+(done, Oct 26, 2026: singletons 44/44 exact, field truth 99/116;
+rcc may-flag proven a false positive) → v3.6 tail-call recovery +
+whole-image literal scan (evidence-backed next step) →
 P-Code→Lean deepening → typestate Rust + Kani → path pruning → HIL (needs
 physical hardware) → boot shims (last).
