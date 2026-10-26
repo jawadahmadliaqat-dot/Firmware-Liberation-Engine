@@ -175,12 +175,218 @@ import java.util.Set;
  * indirect branches (BRANCHIND) have recovered TBB/TBH successors
  * (v3.3); other indirect branches still have no successors (sound
  * under-approximation: paths through them may be missed).
+ *
+ * Step 1 (ISA abstraction, behavior unchanged): all ARM-specific
+ * knowledge now lives behind the IsaAdapter interface (ArmIsa):
+ * caller-saved clobber set, register offsets (incl. lr), Thumb-bit
+ * tagging, pointer size and pointer reads, jump-table recovery
+ * (TBB/TBH), code-address formatting, and the MMIO window. The
+ * fixpoints, may-analysis, points-to and tail-call logic operate
+ * on P-Code through the interface only, so a future RiscVIsa can
+ * plug in without touching them. The interface deliberately avoids
+ * ARM-only concepts as requirements: no condition flags, no fixed
+ * instruction size, no literal pools -- a RISC-V adapter returns
+ * identity for the tag helpers and its own jump-table recovery.
  */
 public class ExtractIR extends GhidraScript {
 
     private static final int MAX_PCODE_PER_FUNCTION = 5000;
     private static final int MAX_STRINGS = 10000;
     private static final int MAX_FIXPOINT_ROUNDS = 100;
+
+    // ---------------- Step 1: ISA abstraction ----------------
+    // All ISA-specific knowledge lives behind IsaAdapter; the rest
+    // of ExtractIR operates on P-Code through this interface only.
+    // A future RiscVIsa plugs in here: it returns identity for the
+    // tag helpers (no Thumb bit), its own caller-saved set and
+    // return register (ra), its pointer size, and its own
+    // jump-table recovery (auipc+addi+jalr chains). Nothing in this
+    // interface requires condition flags, a fixed instruction size,
+    // or literal pools.
+    private interface IsaAdapter {
+        /** Short name, e.g. "ARM". */
+        String name();
+        /** Ghidra register-space name ("register" on ARM). */
+        String registerSpaceName();
+        /** Register offsets clobbered by CALL/CALLIND (caller-saved). */
+        long[] callerSavedRegisterOffsets();
+        /** Offset of the return-address register (ARM lr). */
+        long returnAddressRegisterOffset();
+        /** True when this varnode is the return-address register. */
+        boolean isReturnAddressRegister(Varnode v);
+        /** Strip instruction-address tagging (ARM Thumb bit). */
+        long stripInstructionTag(long addr);
+        /** True when a constant masks off instruction tagging (ARM &~1). */
+        boolean isInstructionTagMask(long constValue);
+        /** Size of a code/data pointer in bytes (ARM: 4). */
+        int pointerSize();
+        /** Shift for pointer-index scaling (ARM: 2, since 2^2 == 4). */
+        int pointerIndexShift();
+        /** Read one pointer-sized word from program memory. */
+        long readPointer(Memory mem, Address addr) throws Exception;
+        /** Format a code address the way instruction addresses print. */
+        String formatCodeAddress(long addr);
+        /** True when an address is in the ISA's peripheral/MMIO window. */
+        boolean isMmioAddress(long addr);
+        /** Recover jump-table successors for BRANCHINDs (ARM: TBB/TBH). */
+        Map<Integer, List<Integer>> recoverJumpTableTargets(
+            List<OpRec> ops, Memory mem);
+    }
+
+    private final IsaAdapter isa = new ArmIsa();
+
+    /** ARM (Cortex-M, Thumb) adapter: holds every ARM-specific fact. */
+    private class ArmIsa implements IsaAdapter {
+        public String name() { return "ARM"; }
+        public String registerSpaceName() { return "register"; }
+        public long[] callerSavedRegisterOffsets() {
+            // AAPCS caller-saved registers. Ghidra ARM offsets
+            // (rN = 0x20 + 4N): r0=32, r1=36, r2=40, r3=44, r12=80.
+            // Callee-saved r4-r11 and sp are preserved; lr is NOT
+            // clobbered: Ghidra's own P-Code models it.
+            return new long[] {32L, 36L, 40L, 44L, 80L};
+        }
+        public long returnAddressRegisterOffset() { return 0x58L; }
+        public boolean isReturnAddressRegister(Varnode v) {
+            return v != null && v.getAddress() != null &&
+                registerSpaceName().equals(
+                    v.getAddress().getAddressSpace().getName()) &&
+                v.getOffset() == returnAddressRegisterOffset();
+        }
+        public long stripInstructionTag(long addr) { return addr & ~1L; }
+        public boolean isInstructionTagMask(long constValue) {
+            return (constValue & 0xFFFFFFFFL) == 0xFFFFFFFEL;
+        }
+        public int pointerSize() { return 4; }
+        public int pointerIndexShift() { return 2; }
+        public long readPointer(Memory mem, Address addr) throws Exception {
+            return mem.getInt(addr) & 0xffffffffL;
+        }
+        public String formatCodeAddress(long addr) {
+            return String.format("%08x", addr);
+        }
+        public boolean isMmioAddress(long addr) {
+            // ARM Cortex-M peripheral region.
+            return addr >= 0x40000000L && addr < 0x60000000L;
+        }
+        /** ARM TBB/TBH jump-table recovery (v3.3), implementing
+        IsaAdapter.recoverJumpTableTargets.
+            Pattern (Ghidra ARM P-Code, verified on BMP):
+              COPY index -> U1
+              INT_ADD [const BASE, U1] -> U1
+              LOAD [ram, U1] -> U2            (output size 1 = TBB, 2 = TBH)
+              INT_ZEXT [U2] -> U1
+              INT_MULT [U1, const 2] -> U3
+              INT_ADD [const BASE, U3] -> pc
+              BRANCHIND [pc]
+            Targets = BASE + 2*entry for each table entry. Returns a map
+            from BRANCHIND op index to successor op indices (empty for
+            non-matching BRANCHINDs). */
+        public Map<Integer, List<Integer>> recoverJumpTableTargets(
+            List<OpRec> ops, Memory mem) {
+            Map<Integer, List<Integer>> result =
+                new HashMap<Integer, List<Integer>>();
+            if (ops.isEmpty()) return result;
+            Map<String, Integer> firstAt = new HashMap<String, Integer>();
+            long maxAddr = 0;
+            for (int i = 0; i < ops.size(); i++) {
+                String a = ops.get(i).instrAddr.toString();
+                if (!firstAt.containsKey(a)) firstAt.put(a, i);
+                try {
+                    long v = Long.parseLong(a, 16);
+                    if (v > maxAddr) maxAddr = v;
+                } catch (Exception e) {
+                    // Ignore unparseable addresses.
+                }
+            }
+            for (int i = 0; i < ops.size(); i++) {
+                OpRec br = ops.get(i);
+                if (!br.mnem.equals("BRANCHIND") || br.ins.length < 1) continue;
+                int defPc = findDef(ops, vkey(br.ins[0]), i);
+                if (defPc < 0) continue;
+                OpRec addFinal = ops.get(defPc);
+                if (!addFinal.mnem.equals("INT_ADD") ||
+                    addFinal.ins.length != 2) continue;
+                Long base = null;
+                String prodKey = null;
+                for (int s = 0; s < 2; s++) {
+                    Varnode v = addFinal.ins[s];
+                    if (v.isConstant()) {
+                        base = v.getOffset();
+                    } else {
+                        prodKey = vkey(v);
+                    }
+                }
+                if (base == null || prodKey == null) continue;
+                int defProd = findDef(ops, prodKey, defPc);
+                if (defProd < 0) continue;
+                OpRec mult = ops.get(defProd);
+                if (!mult.mnem.equals("INT_MULT") || mult.ins.length != 2) continue;
+                String entryKey = null;
+                boolean timesTwo = false;
+                for (int s = 0; s < 2; s++) {
+                    Varnode v = mult.ins[s];
+                    if (v.isConstant() && v.getOffset() == 2L) {
+                        timesTwo = true;
+                    } else {
+                        entryKey = vkey(v);
+                    }
+                }
+                if (!timesTwo || entryKey == null) continue;
+                int defEntry = findDef(ops, entryKey, defProd);
+                if (defEntry < 0) continue;
+                OpRec zext = ops.get(defEntry);
+                if (!zext.mnem.equals("INT_ZEXT") || zext.ins.length != 1) continue;
+                int defLoad = findDef(ops, vkey(zext.ins[0]), defEntry);
+                if (defLoad < 0) continue;
+                OpRec load = ops.get(defLoad);
+                if (!load.mnem.equals("LOAD") || load.ins.length < 2 ||
+                    load.out == null) continue;
+                int entrySize = load.out.getSize();
+                if (entrySize != 1 && entrySize != 2) continue;
+                int defLoadAddr = findDef(ops, vkey(load.ins[1]), defLoad);
+                if (defLoadAddr < 0) continue;
+                OpRec addLoad = ops.get(defLoadAddr);
+                if (!addLoad.mnem.equals("INT_ADD") ||
+                    addLoad.ins.length != 2) continue;
+                Long base2 = null;
+                for (int s = 0; s < 2; s++) {
+                    Varnode v = addLoad.ins[s];
+                    if (v.isConstant()) base2 = v.getOffset();
+                }
+                if (base2 == null ||
+                    base2.longValue() != base.longValue()) continue;
+                // Pattern matched: read the table.
+                List<Integer> targets = new ArrayList<Integer>();
+                long minTarget = Long.MAX_VALUE;
+                for (int k = 0; k < 64; k++) {
+                    long entryAddr = base.longValue() + (long) k * entrySize;
+                    if (k > 0 && entryAddr >= minTarget) break;
+                    if (entryAddr > maxAddr) break;
+                    long entry;
+                    try {
+                        Address ad = toAddr(entryAddr);
+                        if (entrySize == 1) {
+                            entry = mem.getByte(ad) & 0xffL;
+                        } else {
+                            entry = mem.getShort(ad) & 0xffffL;
+                        }
+                    } catch (Exception e) {
+                        break;
+                    }
+                    long target = base.longValue() + 2L * entry;
+                    if (target < minTarget) minTarget = target;
+                    Integer j = firstAt.get(formatCodeAddress(target));
+                    if (j == null) {
+                        j = firstAt.get(formatCodeAddress(stripInstructionTag(target)));
+                    }
+                    if (j != null && !targets.contains(j)) targets.add(j);
+                }
+                if (!targets.isEmpty()) result.put(i, targets);
+            }
+            return result;
+        }
+    }
 
     private static String esc(String s) {
         if (s == null) return "";
@@ -260,14 +466,15 @@ public class ExtractIR extends GhidraScript {
         return b.exactValue(sizeMask(v.getSize()));
     }
 
-    private static Bits copyBits(Varnode in, Memory mem, Map<String, Bits> bvals) {
+    private static Bits copyBits(Varnode in, Memory mem, Map<String, Bits> bvals,
+        IsaAdapter isa) {
         if (in.isConstant()) {
             return Bits.exact(in.getOffset(), sizeMask(in.getSize()));
         }
         if (in.getAddress() != null &&
             "ram".equals(in.getAddress().getAddressSpace().getName())) {
             try {
-                long val = mem.getInt(in.getAddress()) & 0xffffffffL;
+                long val = isa.readPointer(mem, in.getAddress());
                 return Bits.exact(val, sizeMask(in.getSize()));
             } catch (Exception e) {
                 return Bits.unknown();
@@ -345,7 +552,7 @@ public class ExtractIR extends GhidraScript {
         Varnode out = op.out;
         if (mnem.equals("COPY") && ins.length == 1) {
             if (out != null) {
-                putKnown(bvals, vkey(out), copyBits(ins[0], mem, bvals));
+                putKnown(bvals, vkey(out), copyBits(ins[0], mem, bvals, isa));
             }
         } else if (mnem.equals("INT_AND") || mnem.equals("INT_OR") ||
             mnem.equals("INT_XOR")) {
@@ -477,15 +684,13 @@ public class ExtractIR extends GhidraScript {
         } else if (mnem.equals("LOAD") && out != null) {
             putKnown(bvals, vkey(out), loadBits(ins, out, bvals, mem));
         } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
-            // AAPCS caller-saved registers are dead after the call.
-            // Ghidra ARM offsets (rN = 0x20 + 4N): r0=32, r1=36, r2=40,
-            // r3=44, r12=80. Callee-saved r4-r11 and sp are preserved;
-            // lr is NOT clobbered: Ghidra's own P-Code models it.
-            long[] clobber = {32L, 36L, 40L, 44L, 80L};
+            // Caller-saved registers are dead after the call (the set
+            // comes from the ISA adapter; ARM: AAPCS r0-r3, r12).
+            long[] clobber = isa.callerSavedRegisterOffsets();
             Set<String> drop = new HashSet<String>();
             for (String k : bvals.keySet()) {
                 for (long off : clobber) {
-                    if (k.startsWith("register:" + off + ":")) {
+                    if (k.startsWith(isa.registerSpaceName() + ":" + off + ":")) {
                         drop.add(k);
                     }
                 }
@@ -569,9 +774,9 @@ public class ExtractIR extends GhidraScript {
             if (mnem.equals("BRANCH") || mnem.equals("CBRANCH")) {
                 if (op.ins.length >= 1) {
                     long t = op.ins[0].getOffset();
-                    Integer j = firstAt.get(String.format("%08x", t));
+                    Integer j = firstAt.get(isa.formatCodeAddress(t));
                     if (j == null) {
-                        j = firstAt.get(String.format("%08x", t & ~1L));
+                        j = firstAt.get(isa.formatCodeAddress(isa.stripInstructionTag(t)));
                     }
                     if (j != null) succ.get(i).add(j);
                 }
@@ -589,7 +794,7 @@ public class ExtractIR extends GhidraScript {
             } else if (mnem.equals("RETURN")) {
                 // No successors: RETURN ends the function.
             } else if (mnem.equals("BRANCHIND")) {
-                // v3.3: recovered TBB/TBH targets; anything else
+                // Jump-table targets recovered by the ISA adapter; anything else
                 // (pointer tables, bx reg) keeps no successors.
                 List<Integer> bt = branchTargets.get(i);
                 if (bt != null) succ.get(i).addAll(bt);
@@ -682,7 +887,8 @@ public class ExtractIR extends GhidraScript {
         varnode is materialized by this COPY op (provenance = the
         COPY itself), mirroring copyBits. */
     private static Map<Long, Set<Integer>> mayCopyBits(Varnode v,
-        Map<String, Map<Long, Set<Integer>>> m, Memory mem, int curOp) {
+        Map<String, Map<Long, Set<Integer>>> m, Memory mem, int curOp,
+        IsaAdapter isa) {
         if (v == null) return null;
         if (v.isConstant()) {
             Map<Long, Set<Integer>> s = new HashMap<Long, Set<Integer>>();
@@ -694,7 +900,7 @@ public class ExtractIR extends GhidraScript {
         if (v.getAddress() != null &&
             "ram".equals(v.getAddress().getAddressSpace().getName())) {
             try {
-                long val = mem.getInt(v.getAddress()) & 0xffffffffL;
+                long val = isa.readPointer(mem, v.getAddress());
                 Map<Long, Set<Integer>> s =
                     new HashMap<Long, Set<Integer>>();
                 Set<Integer> p = new HashSet<Integer>();
@@ -771,7 +977,7 @@ public class ExtractIR extends GhidraScript {
         Varnode out = op.out;
         if (mnem.equals("COPY") && ins.length == 1) {
             if (out != null) {
-                mayPut(m, vkey(out), mayCopyBits(ins[0], m, mem, curOp));
+                mayPut(m, vkey(out), mayCopyBits(ins[0], m, mem, curOp, isa));
             }
         } else if (mnem.equals("INT_AND") || mnem.equals("INT_OR") ||
             mnem.equals("INT_XOR")) {
@@ -923,11 +1129,11 @@ public class ExtractIR extends GhidraScript {
             }
             mayPut(m, vkey(out), r);
         } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
-            long[] clobber = {32L, 36L, 40L, 44L, 80L};
+            long[] clobber = isa.callerSavedRegisterOffsets();
             Set<String> drop = new HashSet<String>();
             for (String k : m.keySet()) {
                 for (long off : clobber) {
-                    if (k.startsWith("register:" + off + ":")) drop.add(k);
+                    if (k.startsWith(isa.registerSpaceName() + ":" + off + ":")) drop.add(k);
                 }
             }
             for (String k : drop) m.remove(k);
@@ -1013,9 +1219,9 @@ public class ExtractIR extends GhidraScript {
             if (mnem.equals("BRANCH") || mnem.equals("CBRANCH")) {
                 if (op.ins.length >= 1) {
                     long t = op.ins[0].getOffset();
-                    Integer j = firstAt.get(String.format("%08x", t));
+                    Integer j = firstAt.get(isa.formatCodeAddress(t));
                     if (j == null) {
-                        j = firstAt.get(String.format("%08x", t & ~1L));
+                        j = firstAt.get(isa.formatCodeAddress(isa.stripInstructionTag(t)));
                     }
                     if (j != null) succ.get(i).add(j);
                 }
@@ -1025,7 +1231,7 @@ public class ExtractIR extends GhidraScript {
             } else if (mnem.equals("RETURN")) {
                 // No successors: RETURN ends the function.
             } else if (mnem.equals("BRANCHIND")) {
-                // v3.3: recovered TBB/TBH targets; anything else
+                // Jump-table targets recovered by the ISA adapter; anything else
                 // (pointer tables, bx reg) keeps no successors.
                 List<Integer> bt = branchTargets.get(i);
                 if (bt != null) succ.get(i).addAll(bt);
@@ -1174,11 +1380,11 @@ public class ExtractIR extends GhidraScript {
                     if (anyIn) nt.add(vkey(oj.out));
                 }
             } else if (mn.equals("CALL") || mn.equals("CALLIND")) {
-                long[] clobber = {32L, 36L, 40L, 44L, 80L};
+                long[] clobber = isa.callerSavedRegisterOffsets();
                 java.util.Set<String> drop = new java.util.HashSet<String>();
                 for (String k : nt) {
                     for (long off : clobber) {
-                        if (k.startsWith("register:" + off + ":")) {
+                        if (k.startsWith(isa.registerSpaceName() + ":" + off + ":")) {
                             drop.add(k);
                         }
                     }
@@ -1194,10 +1400,10 @@ public class ExtractIR extends GhidraScript {
                 Integer targetIdx = null;
                 if (oj.ins.length >= 1) {
                     long t = oj.ins[0].getOffset();
-                    targetIdx = firstAt.get(String.format("%08x", t));
+                    targetIdx = firstAt.get(isa.formatCodeAddress(t));
                     if (targetIdx == null) {
                         targetIdx = firstAt.get(
-                            String.format("%08x", t & ~1L));
+                            isa.formatCodeAddress(isa.stripInstructionTag(t)));
                     }
                 }
                 for (int s : succ.get(j)) {
@@ -1283,123 +1489,6 @@ public class ExtractIR extends GhidraScript {
         return -1;
     }
 
-    /** v3.3: recover TBB/TBH jump-table targets as CFG successors.
-        Pattern (Ghidra ARM P-Code, verified on BMP):
-          COPY index -> U1
-          INT_ADD [const BASE, U1] -> U1
-          LOAD [ram, U1] -> U2            (output size 1 = TBB, 2 = TBH)
-          INT_ZEXT [U2] -> U1
-          INT_MULT [U1, const 2] -> U3
-          INT_ADD [const BASE, U3] -> pc
-          BRANCHIND [pc]
-        Targets = BASE + 2*entry for each table entry. Returns a map
-        from BRANCHIND op index to successor op indices (empty for
-        non-matching BRANCHINDs). */
-    private Map<Integer, List<Integer>> recoverTbbTargets(
-        List<OpRec> ops, Memory mem) {
-        Map<Integer, List<Integer>> result =
-            new HashMap<Integer, List<Integer>>();
-        if (ops.isEmpty()) return result;
-        Map<String, Integer> firstAt = new HashMap<String, Integer>();
-        long maxAddr = 0;
-        for (int i = 0; i < ops.size(); i++) {
-            String a = ops.get(i).instrAddr.toString();
-            if (!firstAt.containsKey(a)) firstAt.put(a, i);
-            try {
-                long v = Long.parseLong(a, 16);
-                if (v > maxAddr) maxAddr = v;
-            } catch (Exception e) {
-                // Ignore unparseable addresses.
-            }
-        }
-        for (int i = 0; i < ops.size(); i++) {
-            OpRec br = ops.get(i);
-            if (!br.mnem.equals("BRANCHIND") || br.ins.length < 1) continue;
-            int defPc = findDef(ops, vkey(br.ins[0]), i);
-            if (defPc < 0) continue;
-            OpRec addFinal = ops.get(defPc);
-            if (!addFinal.mnem.equals("INT_ADD") ||
-                addFinal.ins.length != 2) continue;
-            Long base = null;
-            String prodKey = null;
-            for (int s = 0; s < 2; s++) {
-                Varnode v = addFinal.ins[s];
-                if (v.isConstant()) {
-                    base = v.getOffset();
-                } else {
-                    prodKey = vkey(v);
-                }
-            }
-            if (base == null || prodKey == null) continue;
-            int defProd = findDef(ops, prodKey, defPc);
-            if (defProd < 0) continue;
-            OpRec mult = ops.get(defProd);
-            if (!mult.mnem.equals("INT_MULT") || mult.ins.length != 2) continue;
-            String entryKey = null;
-            boolean timesTwo = false;
-            for (int s = 0; s < 2; s++) {
-                Varnode v = mult.ins[s];
-                if (v.isConstant() && v.getOffset() == 2L) {
-                    timesTwo = true;
-                } else {
-                    entryKey = vkey(v);
-                }
-            }
-            if (!timesTwo || entryKey == null) continue;
-            int defEntry = findDef(ops, entryKey, defProd);
-            if (defEntry < 0) continue;
-            OpRec zext = ops.get(defEntry);
-            if (!zext.mnem.equals("INT_ZEXT") || zext.ins.length != 1) continue;
-            int defLoad = findDef(ops, vkey(zext.ins[0]), defEntry);
-            if (defLoad < 0) continue;
-            OpRec load = ops.get(defLoad);
-            if (!load.mnem.equals("LOAD") || load.ins.length < 2 ||
-                load.out == null) continue;
-            int entrySize = load.out.getSize();
-            if (entrySize != 1 && entrySize != 2) continue;
-            int defLoadAddr = findDef(ops, vkey(load.ins[1]), defLoad);
-            if (defLoadAddr < 0) continue;
-            OpRec addLoad = ops.get(defLoadAddr);
-            if (!addLoad.mnem.equals("INT_ADD") ||
-                addLoad.ins.length != 2) continue;
-            Long base2 = null;
-            for (int s = 0; s < 2; s++) {
-                Varnode v = addLoad.ins[s];
-                if (v.isConstant()) base2 = v.getOffset();
-            }
-            if (base2 == null ||
-                base2.longValue() != base.longValue()) continue;
-            // Pattern matched: read the table.
-            List<Integer> targets = new ArrayList<Integer>();
-            long minTarget = Long.MAX_VALUE;
-            for (int k = 0; k < 64; k++) {
-                long entryAddr = base.longValue() + (long) k * entrySize;
-                if (k > 0 && entryAddr >= minTarget) break;
-                if (entryAddr > maxAddr) break;
-                long entry;
-                try {
-                    Address ad = toAddr(entryAddr);
-                    if (entrySize == 1) {
-                        entry = mem.getByte(ad) & 0xffL;
-                    } else {
-                        entry = mem.getShort(ad) & 0xffffL;
-                    }
-                } catch (Exception e) {
-                    break;
-                }
-                long target = base.longValue() + 2L * entry;
-                if (target < minTarget) minTarget = target;
-                Integer j = firstAt.get(String.format("%08x", target));
-                if (j == null) {
-                    j = firstAt.get(String.format("%08x", target & ~1L));
-                }
-                if (j != null && !targets.contains(j)) targets.add(j);
-            }
-            if (!targets.isEmpty()) result.put(i, targets);
-        }
-        return result;
-    }
-
     private static class IndirectResult {
         final List<String> sites;
         final int edges;
@@ -1428,7 +1517,7 @@ public class ExtractIR extends GhidraScript {
         4-byte LOAD, and return the table base if the LOAD address is
         INT_ADD [base, index*4] where base is a constant or a COPY of
         a constant (one hop, e.g. via `adr`). Null if no match. */
-    private static Long findPtrTableBase(List<OpRec> ops, int brIdx) {
+    private Long findPtrTableBase(List<OpRec> ops, int brIdx) {
         OpRec br = ops.get(brIdx);
         if (br.ins.length < 1) return null;
         int cur = findDef(ops, vkey(br.ins[0]), brIdx);
@@ -1439,7 +1528,7 @@ public class ExtractIR extends GhidraScript {
             for (int s = 0; s < 2; s++) {
                 Varnode v = d.ins[s];
                 if (v.isConstant() &&
-                    (v.getOffset() & 0xFFFFFFFFL) == 0xFFFFFFFEL) {
+                    isa.isInstructionTagMask(v.getOffset())) {
                     cur = findDef(ops, vkey(d.ins[1 - s]), cur);
                     unwrapped = true;
                     break;
@@ -1449,7 +1538,7 @@ public class ExtractIR extends GhidraScript {
             d = ops.get(cur);
         }
         if (!d.mnem.equals("LOAD") || d.ins.length < 2 ||
-            d.out == null || d.out.getSize() != 4) return null;
+            d.out == null || d.out.getSize() != isa.pointerSize()) return null;
         int defAddr = findDef(ops, vkey(d.ins[1]), cur);
         if (defAddr < 0) return null;
         OpRec add = ops.get(defAddr);
@@ -1476,12 +1565,12 @@ public class ExtractIR extends GhidraScript {
             boolean scaled = false;
             if (sc.mnem.equals("INT_LEFT") && sc.ins.length == 2 &&
                 sc.ins[1].isConstant() &&
-                sc.ins[1].getOffset() == 2L) {
+                sc.ins[1].getOffset() == (long) isa.pointerIndexShift()) {
                 scaled = true;
             } else if (sc.mnem.equals("INT_MULT") && sc.ins.length == 2) {
                 for (int t = 0; t < 2; t++) {
                     if (sc.ins[t].isConstant() &&
-                        sc.ins[t].getOffset() == 4L) {
+                        sc.ins[t].getOffset() == (long) isa.pointerSize()) {
                         scaled = true;
                     }
                 }
@@ -1493,7 +1582,7 @@ public class ExtractIR extends GhidraScript {
 
     /** v3.4 (fixed): recover call-graph edges AND intra-function
         pointer-table successors. For each CALLIND/BRANCHIND (skipping
-        TBB/TBH ones, which are already CFG successors):
+        jump-table ones, which are already CFG successors):
           - single constant destination -> function-entry edge;
           - pointer table (see findPtrTableBase): each entry (& ~1)
             that is a function entry becomes an edge; each entry that
@@ -1505,7 +1594,7 @@ public class ExtractIR extends GhidraScript {
         constant base and is handled by v3.5's may-analysis below. Every
         reported edge target is a real function entry by construction. */
     private IndirectResult recoverIndirect(List<OpRec> ops, Memory mem,
-        FunctionManager fm, Set<Integer> tbbBranchInds) {
+        FunctionManager fm, Set<Integer> jumpTableBranchInds) {
         List<String> out = new ArrayList<String>();
         Map<Integer, List<Integer>> succ =
             new HashMap<Integer, List<Integer>>();
@@ -1522,7 +1611,7 @@ public class ExtractIR extends GhidraScript {
             if (!call.mnem.equals("CALLIND") &&
                 !call.mnem.equals("BRANCHIND")) continue;
             if (call.mnem.equals("BRANCHIND") &&
-                tbbBranchInds.contains(i)) continue;
+                jumpTableBranchInds.contains(i)) continue;
             if (call.ins.length < 1) continue;
             List<String> targets = new ArrayList<String>();
             List<Integer> mySucc = new ArrayList<Integer>();
@@ -1536,7 +1625,7 @@ public class ExtractIR extends GhidraScript {
                     for (int s = 0; s < 2; s++) {
                         Varnode vv = dd.ins[s];
                         if (vv.isConstant() &&
-                            (vv.getOffset() & 0xFFFFFFFFL) == 0xFFFFFFFEL) {
+                            isa.isInstructionTagMask(vv.getOffset())) {
                             int du = findDef(ops, vkey(dd.ins[1 - s]), def);
                             if (du >= 0) {
                                 def = du;
@@ -1562,7 +1651,7 @@ public class ExtractIR extends GhidraScript {
                     }
                     if (c != null) {
                         try {
-                            Function fn = fm.getFunctionAt(toAddr(c & ~1L));
+                            Function fn = fm.getFunctionAt(toAddr(isa.stripInstructionTag(c)));
                             if (fn != null) targets.add(fn.getName());
                         } catch (Exception e) {
                             // Ignore unresolvable targets.
@@ -1574,14 +1663,14 @@ public class ExtractIR extends GhidraScript {
                 Long base = findPtrTableBase(ops, i);
                 if (base != null) {
                     for (int k = 0; k < 64; k++) {
-                        long entryAddr = base.longValue() + 4L * k;
+                        long entryAddr = base.longValue() + (long) isa.pointerSize() * k;
                         long ptr;
                         try {
-                            ptr = mem.getInt(toAddr(entryAddr)) & 0xffffffffL;
+                            ptr = isa.readPointer(mem, toAddr(entryAddr));
                         } catch (Exception e) {
                             break;
                         }
-                        long t = ptr & ~1L;
+                        long t = isa.stripInstructionTag(ptr);
                         Function fn = null;
                         try {
                             fn = fm.getFunctionAt(toAddr(t));
@@ -1595,10 +1684,10 @@ public class ExtractIR extends GhidraScript {
                         }
                         if (call.mnem.equals("BRANCHIND")) {
                             Integer j = firstAt.get(
-                                String.format("%08x", t));
+                                isa.formatCodeAddress(t));
                             if (j == null) {
                                 j = firstAt.get(
-                                    String.format("%08x", t & ~1L));
+                                    isa.formatCodeAddress(isa.stripInstructionTag(t)));
                             }
                             if (j != null) {
                                 if (!mySucc.contains(j)) {
@@ -1696,7 +1785,7 @@ public class ExtractIR extends GhidraScript {
             // (const, COPY, LOAD from a flash table, ...).
             Long val = resolveValue(op.ins[2], ops, mem, i, 4);
             if (val == null) continue;
-            long funcAddr = val.longValue() & ~1L;
+            long funcAddr = isa.stripInstructionTag(val.longValue());
             String funcName = null;
             try {
                 Function fn = fm.getFunctionAt(toAddr(funcAddr));
@@ -1774,7 +1863,7 @@ public class ExtractIR extends GhidraScript {
         if (!spName.equals("register") && !spName.equals("unique") &&
             !spName.equals("const")) {
             try {
-                return mem.getInt(v.getAddress()) & 0xffffffffL;
+                return isa.readPointer(mem, v.getAddress());
             } catch (Exception e) {
                 return null;
             }
@@ -1798,7 +1887,7 @@ public class ExtractIR extends GhidraScript {
             Long a = resolveValue(dd.ins[1], ops, mem, d, depth - 1);
             if (a == null) return null;
             try {
-                return mem.getInt(toAddr(a.longValue())) & 0xffffffffL;
+                return isa.readPointer(mem, toAddr(a.longValue()));
             } catch (Exception e) {
                 return null;
             }
@@ -1828,7 +1917,7 @@ public class ExtractIR extends GhidraScript {
                 for (int s = 0; s < 2; s++) {
                     Varnode vv = dd.ins[s];
                     if (vv.isConstant() &&
-                        (vv.getOffset() & 0xFFFFFFFFL) == 0xFFFFFFFEL) {
+                        isa.isInstructionTagMask(vv.getOffset())) {
                         int du = findDef(ops, vkey(dd.ins[1 - s]), def);
                         if (du >= 0) {
                             def = du;
@@ -1852,7 +1941,7 @@ public class ExtractIR extends GhidraScript {
         if (def < 0) return tset;
         OpRec d = ops.get(def);
         if (!d.mnem.equals("LOAD") || d.ins.length < 2 ||
-            d.out == null || d.out.getSize() != 4) {
+            d.out == null || d.out.getSize() != isa.pointerSize()) {
             return tset;
         }
         Varnode addrV = d.ins[1];
@@ -1891,14 +1980,13 @@ public class ExtractIR extends GhidraScript {
                                 if (rd.mnem.equals("INT_LEFT") &&
                                     rd.ins.length == 2 &&
                                     rd.ins[1].isConstant() &&
-                                    rd.ins[1].getOffset() == 2L) {
+                                    rd.ins[1].getOffset() == (long) isa.pointerIndexShift()) {
                                     scaled = true;
                                 } else if (rd.mnem.equals("INT_MULT") &&
                                     rd.ins.length == 2) {
                                     for (int t = 0; t < 2; t++) {
                                         if (rd.ins[t].isConstant() &&
-                                            rd.ins[t].getOffset()
-                                                == 4L) {
+                                            rd.ins[t].getOffset() == (long) isa.pointerSize()) {
                                             scaled = true;
                                         }
                                     }
@@ -1906,15 +1994,13 @@ public class ExtractIR extends GhidraScript {
                             }
                             if (scaled) {
                                 for (int k = 0; k < 64; k++) {
-                                    long ea = cval + 4L * k;
+                                    long ea = cval + (long) isa.pointerSize() * k;
                                     try {
-                                        long ptr = mem.getInt(
-                                            toAddr(ea))
-                                            & 0xffffffffL;
+                                        long ptr = isa.readPointer(mem, toAddr(ea));
                                         Function fn =
                                             fm.getFunctionAt(
                                                 toAddr(
-                                                    ptr & ~1L));
+                                                    isa.stripInstructionTag(ptr)));
                                         if (fn == null) break;
                                         tset.add(fn.getName());
                                     } catch (Exception e) {
@@ -1985,7 +2071,7 @@ public class ExtractIR extends GhidraScript {
     }
 
     /** v3.6: resolve BRANCHIND tail calls. Skips BRANCHINDs already
-        resolved by v3.4 (constant destinations) and TBB/TBH
+        resolved by v3.4 (constant destinations) and jump-table
         successors (computed gotos). LOAD destinations run the same
         tiers as CALLINDs (with COPY unwrap). A constant destination
         inside this function is a goto (skipped, not unresolved); a
@@ -1995,7 +2081,7 @@ public class ExtractIR extends GhidraScript {
     private TailCallResult recoverTailCalls(List<OpRec> ops, Memory mem,
         FunctionManager fm, Map<Long, Set<String>> byOffset,
         Map<Long, Set<String>> byAddr, Set<Integer> resolvedBranchInds,
-        Set<Integer> tbbBranchInds, long funcStart, long funcEnd) {
+        Set<Integer> jumpTableBranchInds, long funcStart, long funcEnd) {
         List<String> out = new ArrayList<String>();
         int targets = 0;
         int unresolved = 0;
@@ -2004,7 +2090,7 @@ public class ExtractIR extends GhidraScript {
             if (!call.mnem.equals("BRANCHIND") ||
                 call.ins.length < 1) continue;
             if (resolvedBranchInds.contains(i)) continue;
-            if (tbbBranchInds.contains(i)) continue;
+            if (jumpTableBranchInds.contains(i)) continue;
             Set<String> tset = resolveIndirectSet(ops, mem, fm,
                 byOffset, byAddr, i, true);
             if (!tset.isEmpty()) {
@@ -2031,7 +2117,7 @@ public class ExtractIR extends GhidraScript {
                     for (int s = 0; s < 2; s++) {
                         Varnode vv = dd.ins[s];
                         if (vv.isConstant() &&
-                            (vv.getOffset() & 0xFFFFFFFFL) == 0xFFFFFFFEL) {
+                            isa.isInstructionTagMask(vv.getOffset())) {
                             int du = findDef(ops, vkey(dd.ins[1 - s]), def);
                             if (du >= 0) {
                                 def = du;
@@ -2062,17 +2148,13 @@ public class ExtractIR extends GhidraScript {
             // lr (ARM register offset 0x58) as the destination
             // varnode, directly or through the unwrapped chain.
             boolean isReturn = false;
-            if (dest.getAddress().getAddressSpace().getName()
-                    .equals("register") &&
-                dest.getOffset() == 0x58L) {
+            if (isa.isReturnAddressRegister(dest)) {
                 isReturn = true;
             } else if (def >= 0) {
                 OpRec dd = ops.get(def);
                 if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
                     Varnode v = dd.ins[0];
-                    if (v.getAddress().getAddressSpace().getName()
-                            .equals("register") &&
-                        v.getOffset() == 0x58L) {
+                    if (isa.isReturnAddressRegister(v)) {
                         isReturn = true;
                     }
                 }
@@ -2080,7 +2162,7 @@ public class ExtractIR extends GhidraScript {
             if (isReturn) continue;
             Long c = resolveValue(dest, ops, mem, i, 4);
             if (c != null) {
-                long t = c.longValue() & ~1L;
+                long t = isa.stripInstructionTag(c.longValue());
                 try {
                     Function fn = fm.getFunctionAt(toAddr(t));
                     if (fn != null && (t < funcStart || t >= funcEnd)) {
@@ -2202,16 +2284,16 @@ public class ExtractIR extends GhidraScript {
                 long start = block.getStart().getOffset();
                 long end = block.getEnd().getOffset();
                 if (end - start > 64L * 1024L * 1024L) continue;
-                for (long a = start; a + 4L <= end; a += 4L) {
+                for (long a = start; a + (long) isa.pointerSize() <= end; a += (long) isa.pointerSize()) {
                     long w;
                     try {
-                        w = mem.getInt(toAddr(a)) & 0xffffffffL;
+                        w = isa.readPointer(mem, toAddr(a));
                     } catch (Exception e) {
                         continue;
                     }
                     Function fn;
                     try {
-                        fn = fm.getFunctionAt(toAddr(w & ~1L));
+                        fn = fm.getFunctionAt(toAddr(isa.stripInstructionTag(w)));
                     } catch (Exception e) {
                         continue;
                     }
@@ -2281,8 +2363,8 @@ public class ExtractIR extends GhidraScript {
     private void addMemFunc(Memory mem, FunctionManager fm,
         long addr, Set<String> tset) {
         try {
-            long ptr = mem.getInt(toAddr(addr)) & 0xffffffffL;
-            Function fn = fm.getFunctionAt(toAddr(ptr & ~1L));
+            long ptr = isa.readPointer(mem, toAddr(addr));
+            Function fn = fm.getFunctionAt(toAddr(isa.stripInstructionTag(ptr)));
             if (fn != null) tset.add(fn.getName());
         } catch (Exception e) {
             // Ignore unreadable or non-function words.
@@ -2404,12 +2486,12 @@ public class ExtractIR extends GhidraScript {
             List<OpRec> ops = or.ops;
             boolean truncated = or.truncated;
             int opCount = ops.size();
-            // v3.3: TBB/TBH jump-table targets, shared by both fixpoints.
+            // Jump-table targets (ARM: TBB/TBH) via the ISA adapter, shared by both fixpoints.
             // On any recovery failure, fall back to no targets (same
             // behaviour as before v3.3 -- sound, just less recall).
             Map<Integer, List<Integer>> branchTargets;
             try {
-                branchTargets = recoverTbbTargets(ops,
+                branchTargets = isa.recoverJumpTableTargets(ops,
                     currentProgram.getMemory());
             } catch (Exception e) {
                 branchTargets = new HashMap<Integer, List<Integer>>();
@@ -2495,8 +2577,7 @@ public class ExtractIR extends GhidraScript {
                             valBits = resolveBits(op.ins[2], bvals);
                         }
                         Long addr = resolveExact(op.ins[1], bvals);
-                        if (addr != null && addr >= 0x40000000L &&
-                            addr < 0x60000000L) {
+                        if (addr != null && isa.isMmioAddress(addr)) {
                             int sz = (op.mnem.equals("STORE") && op.ins.length >= 3)
                                 ? op.ins[2].getSize()
                                 : (op.out != null ? op.out.getSize() : 0);
@@ -2557,7 +2638,7 @@ public class ExtractIR extends GhidraScript {
                     if (addrSet != null) {
                         List<Long> win = new ArrayList<Long>();
                         for (long a : addrSet) {
-                            if (a >= 0x40000000L && a < 0x60000000L) win.add(a);
+                            if (isa.isMmioAddress(a)) win.add(a);
                         }
                         if (!win.isEmpty()) {
                             java.util.Collections.sort(win);
