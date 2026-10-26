@@ -60,3 +60,24 @@ Register names come from the public STM32F1 reference map (RM0008).
 | CRC | CR | 0x40023008 | 1 | 1 | stm32_crc32(2) | - |
 
 Total: 32 distinct registers, 213 accesses.
+
+## MAY-accesses (v3.2): possible, not certain
+
+Sites the must-analysis drops (path-dependent address) with a finite set
+of possible MMIO addresses. The other path in each case reads RAM or
+another listed address; jump-table (BRANCHIND) sites are NOT recovered
+here. Verified against the ELF literal-pool words.
+
+| Function | Instr | Op | Possible addresses |
+|---|---|---|---|
+| platform_nrst_get_val | 08015aca | LOAD | GPIOA IDR 0x40010808, GPIOC IDR 0x40011008 |
+| platform_target_get_power | 08015b02 | LOAD | GPIOB IDR 0x40010c08 (other path: RAM) |
+| exti15_10_isr | 08015e34 | LOAD | GPIOA IDR 0x40010808, GPIOB IDR 0x40010c08 |
+| platform_init | 08016082 | STORE | GPIOA BSRR 0x40010810, GPIOB BSRR 0x40010c10 |
+| platform_init | 080160d0 | STORE | GPIOA BSRR 0x40010810, GPIOC BRR 0x40011010 |
+| aux_serial_init | 08016388 | LOAD | USART2 CR1 0x4000440c, USART1 CR1 0x4001380c |
+| aux_serial_init | 08016396 | STORE | USART2 CR1 0x4000440c, USART1 CR1 0x4001380c |
+| rcc_get_usart_clk_freq | 08018456 | LOAD | USART1 CR1 0x40013800 (other path: RAM) |
+
+Note: `rcc_get_usart_clk_freq` → USART1 is the single may-confinement
+flag (the rcc_ family is profiled RCC-only); adjudication open.

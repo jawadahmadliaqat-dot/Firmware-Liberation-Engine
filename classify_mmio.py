@@ -52,7 +52,22 @@ def main():
     print(f"SUSPECT accesses (outside every known block): {len(suspects)}")
     for fn_name, instr, op, addr in suspects:
         print(f"  SUSPECT {op} {addr} in {fn_name} @ {instr}")
-    return 1 if suspects else 0
+    may_known = 0
+    may_suspects = []
+    for fn in report.get("functions", []):
+        for a in fn.get("may_accesses", []):
+            for addr_s in a.get("addresses", []):
+                addr = int(addr_s, 16)
+                if classify(addr):
+                    may_known += 1
+                else:
+                    may_suspects.append((fn["name"], a.get("instr", "?"),
+                                         a["op"], addr_s))
+    print(f"may known addresses: {may_known}")
+    print(f"may SUSPECT addresses (outside every known block): {len(may_suspects)}")
+    for fn_name, instr, op, addr in may_suspects:
+        print(f"  MAY-SUSPECT {op} {addr} in {fn_name} @ {instr}")
+    return 1 if (suspects or may_suspects) else 0
 
 
 if __name__ == "__main__":

@@ -71,6 +71,29 @@ def extractTrace (j : Json) : Except String (List MmioAccess) := do
     let accs ← arr.toList.mapM (extractAccess name)
     pure (acc ++ accs)) []
 
+/-- All MAY-accesses, expanded: one MmioAccess per possible address.
+Absent "may_accesses" (old reports) means no may data, not an error;
+a present-but-malformed field is an error, not silently ignored. -/
+def extractMayTrace (j : Json) : Except String (List MmioAccess) := do
+  let fns ← j.getObjVal? "functions" >>= Json.getArr?
+  fns.toList.foldlM (fun acc fn => do
+    let name ← fn.getObjVal? "name" >>= Json.getStr?
+    let arr ← match fn.getObjVal? "may_accesses" with
+      | .ok v => Json.getArr? v
+      | .error _ => pure #[]
+    let accs ← arr.toList.foldlM (fun a2 m => do
+      let op ← m.getObjVal? "op" >>= Json.getStr?
+      let addrs ← m.getObjVal? "addresses" >>= Json.getArr?
+      let ones ← m.getObjVal? "value_known_ones" >>= Json.getNat?
+      let zeroes ← m.getObjVal? "value_known_zeroes" >>= Json.getNat?
+      let expanded ← addrs.toList.mapM (fun aJson => do
+        let addrS ← Json.getStr? aJson
+        let addr ← parseHex addrS
+        pure { isStore := op == "STORE", func := name, addr := addr,
+               ones := ones, zeroes := zeroes })
+      pure (a2 ++ expanded)) []
+    pure (acc ++ accs)) []
+
 /-- Check 1: clock + mode STOREs precede every LED STORE. -/
 def goOrder (spec : Spec) : List MmioAccess → Bool → Bool → Bool
   | [], _, _ => true

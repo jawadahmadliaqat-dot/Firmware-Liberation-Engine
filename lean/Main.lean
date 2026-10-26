@@ -30,12 +30,14 @@ def printGeneric (trace : List MmioAccess) : IO Bool := do
   IO.println s!"all addresses in MMIO window: {window}"
   pure (nonempty && masks && window)
 
-def printBmp (trace : List MmioAccess) : IO Bool := do
+def printBmp (trace : List MmioAccess) (mayTrace : List MmioAccess) : IO Bool := do
   let generic := checkGeneric trace
   let confined := checkBmpConfinement trace
+  let mayConfined := checkBmpConfinement mayTrace
   IO.println s!"generic invariants: {generic}"
   IO.println s!"driver confinement (each family touches only its own peripherals): {confined}"
-  pure (generic && confined)
+  IO.println s!"may confinement (every possible address within its family): {mayConfined}"
+  pure (generic && confined && mayConfined)
 
 def main (args : List String) : IO UInt32 := do
   let path := (args.head?).getD "report.json"
@@ -48,8 +50,12 @@ def main (args : List String) : IO UInt32 := do
     | .error e => IO.println s!"extract failed: {e}"; pure 1
     | .ok trace => do
       IO.println s!"trace ops: {trace.length}"
-      let ok ← if mode == "generic" then printGeneric trace
-        else if mode == "bmp" then printBmp trace
-        else printBlink trace
-      if ok then IO.println "VERDICT: PASS"; pure 0
-      else IO.println "VERDICT: FAIL"; pure 1
+      match extractMayTrace j with
+      | .error e => IO.println s!"may extract failed: {e}"; pure 1
+      | .ok mayTrace => do
+        IO.println s!"may trace ops: {mayTrace.length}"
+        let ok ← if mode == "generic" then printGeneric trace
+          else if mode == "bmp" then printBmp trace mayTrace
+          else printBlink trace
+        if ok then IO.println "VERDICT: PASS"; pure 0
+        else IO.println "VERDICT: FAIL"; pure 1

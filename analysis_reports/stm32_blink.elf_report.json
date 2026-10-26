@@ -1,7 +1,7 @@
 {
   "binary_name": "stm32_blink.elf",
   "language": "ARM:LE:32:v8",
-  "extractor_version": "v3.1-cfg-fixpoint",
+  "extractor_version": "v3.2-may-analysis",
   "functions": [
     {
       "name": "delay",
@@ -72,7 +72,12 @@
       "mmio_accesses": [
 
       ],
-      "mmio_access_count": 0
+      "mmio_access_count": 0,
+      "may_accesses": [
+
+      ],
+      "may_access_count": 0,
+      "may_fixpoint_converged": true
     },
     {
       "name": "main",
@@ -184,7 +189,12 @@
         {"instr": "0800005c", "op": "LOAD", "address": "0x40020014", "size": 4, "value": null, "value_known_ones": 0, "value_known_zeroes": 0},
         {"instr": "08000064", "op": "STORE", "address": "0x40020014", "size": 4, "value": null, "value_known_ones": 0, "value_known_zeroes": 32}
       ],
-      "mmio_access_count": 10
+      "mmio_access_count": 10,
+      "may_accesses": [
+
+      ],
+      "may_access_count": 0,
+      "may_fixpoint_converged": true
     }
   ],
   "strings": [
@@ -225,5 +235,6 @@
 
   ],
   "function_count": 2,
-  "mmio_access_total": 10
+  "mmio_access_total": 10,
+  "may_access_total": 0
 }
