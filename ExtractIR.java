@@ -231,10 +231,25 @@ public class ExtractIR extends GhidraScript {
         /** Recover jump-table successors for BRANCHINDs (ARM: TBB/TBH). */
         Map<Integer, List<Integer>> recoverJumpTableTargets(
             List<OpRec> ops, Memory mem);
+        /** Fallthrough successor op index for a CBRANCH/CALL op
+            (default: the next op). MIPS overrides this to skip the
+            delay-slot instruction's standalone ops: Ghidra embeds the
+            delay slot's P-Code in the branch/call P-Code already, so
+            the standalone copy must not be re-executed on the
+            fallthrough path (it would double-apply delay-slot writes
+            and resurrect caller-saved registers after calls). Returns
+            -1 when there is no fallthrough successor. */
+        int fallthroughIndex(List<OpRec> ops, int i);
+        /** Unwrap ISA-specific wrappers around an indirect-branch
+            target before def-chain walks (MIPS: the pc COPY +
+            AND-~1 from jr/jalr P-Code). ARM/RISC-V return the input
+            def unchanged. Never returns -1 for a valid input def. */
+        int unwrapIndirectDef(List<OpRec> ops, int brIdx, int cur);
     }
 
     // Selected in run() from the program's processor (default ARM:
-    // the pre-step-1 behaviour). RISC-V programs get a RiscVIsa.
+    // the pre-step-1 behaviour). RISC-V programs get a RiscVIsa,
+    // MIPS programs a MipsIsa.
     private IsaAdapter isa = new ArmIsa();
 
     /** ARM (Cortex-M, Thumb) adapter: holds every ARM-specific fact. */
@@ -270,6 +285,12 @@ public class ExtractIR extends GhidraScript {
         public boolean isMmioAddress(long addr) {
             // ARM Cortex-M peripheral region.
             return addr >= 0x40000000L && addr < 0x60000000L;
+        }
+        public int fallthroughIndex(List<OpRec> ops, int i) {
+            return i + 1 < ops.size() ? i + 1 : -1;
+        }
+        public int unwrapIndirectDef(List<OpRec> ops, int brIdx, int cur) {
+            return cur;
         }
         /** ARM TBB/TBH jump-table recovery (v3.3), implementing
         IsaAdapter.recoverJumpTableTargets.
@@ -473,6 +494,12 @@ public class ExtractIR extends GhidraScript {
             }
             return false;
         }
+        public int fallthroughIndex(List<OpRec> ops, int i) {
+            return i + 1 < ops.size() ? i + 1 : -1;
+        }
+        public int unwrapIndirectDef(List<OpRec> ops, int brIdx, int cur) {
+            return cur;
+        }
         public Map<Integer, List<Integer>> recoverJumpTableTargets(
             List<OpRec> ops, Memory mem) {
             Map<Integer, List<Integer>> result =
@@ -488,6 +515,246 @@ public class ExtractIR extends GhidraScript {
                 if (!br.mnem.equals("BRANCHIND") || br.ins.length < 1) continue;
                 TableMatch m = matchBranchTable(ops, i, ptrSize, ptrShift,
                     addrMask);
+                if (m == null) continue;
+                List<Integer> targets = new ArrayList<Integer>();
+                for (int k = 0; k < 64; k++) {
+                    long entryAddr = m.base + (long) ptrSize * k;
+                    long entry;
+                    try {
+                        entry = readPointer(mem, toAddr(entryAddr));
+                    } catch (Exception e) {
+                        break;
+                    }
+                    long t;
+                    if (m.offset) {
+                        t = (m.base + (int) entry) & addrMask;
+                    } else {
+                        t = stripInstructionTag(entry);
+                    }
+                    Integer j = firstAt.get(formatCodeAddress(t));
+                    if (j == null) break;
+                    if (!targets.contains(j)) targets.add(j);
+                }
+                if (!targets.isEmpty()) result.put(i, targets);
+            }
+            return result;
+        }
+    }
+
+    /** MIPS32 adapter (MIPS64 structural via the width flag, untested).
+        All facts are EMPIRICAL (Ghidra 11.4.2 MIPS sleigh + probe runs
+        on a real MIPS32BE binary), not from memory:
+        - Language auto-detected on import: MIPS:BE:32:default.
+        - Register space "register", $n at 4n: $zero 0x0, $at 0x4,
+          $v0-$v1 0x8-0xc, $a0-$a3 0x10-0x1c, $t0-$t7 0x20-0x3c,
+          $s0-$s7 0x40-0x5c, $t8-$t9 0x60-0x64, $k0-$k1 0x68-0x6c,
+          $gp 0x70, $sp 0x74, $s8/$fp 0x78, $ra 0x7c, $pc 0x80.
+        - Caller-saved per the o32 ABI: $at, $v0-$v1, $a0-$a3,
+          $t0-$t7, $t8-$t9. $ra is EXCLUDED: Ghidra's jal/jalr P-Code
+          COPYs the return address into ra before the CALL/CALLIND op
+          (verified in the probe dump), exactly like ARM/RISC-V.
+          $zero is never clobbered (constant 0); $s0-$s7, $gp, $sp,
+          $fp, $k0-$k1 are callee-saved / reserved.
+        - No instruction-address tagging (no Thumb bit); the bit-0
+          clearing in jr/jalr P-Code (INT_2COMP(2) AND) is unwrapped
+          in table matching, not a tag on addresses.
+        - Constant materialization: lui = INT_LEFT [imm, 16],
+          addiu/ori = INT_ADD/INT_OR. All constant-foldable.
+        - DELAY SLOTS (the subtle part): Ghidra embeds the delay-slot
+          instruction's P-Code in the branch/call instruction's P-Code
+          AND lists the delay slot as its own instruction. The
+          standalone copy must NOT be re-executed: fallthroughIndex
+          skips it (CBRANCH/CALL fallthrough goes to the instruction
+          after the delay slot). Unconditional BRANCH/BRANCHIND keep
+          their current successors (the embedded copy already carries
+          the delay-slot effects). See fallthroughIndex.
+        - Jump tables hold ABSOLUTE pointers (non-PIC: lui + addiu
+          base, sll index, addu, lw, jr). The BRANCHIND input chain
+          runs through a pc COPY + AND-~1 (jr bit-0 clear), which is
+          unwrapped before table matching. */
+    private class MipsIsa implements IsaAdapter {
+        private final int stride;       // 4 (MIPS32) or 8 (MIPS64)
+        private final int ptrSize;      // 4 or 8
+        private final int ptrShift;     // 2 or 3
+        private final long addrMask;    // 0xffffffffL or -1L
+        private final List<long[]> mmioWindows;
+
+        MipsIsa(boolean is64, List<long[]> windows) {
+            stride = is64 ? 8 : 4;
+            ptrSize = is64 ? 8 : 4;
+            ptrShift = is64 ? 3 : 2;
+            addrMask = is64 ? -1L : 0xffffffffL;
+            mmioWindows = windows;
+        }
+
+        private long reg(int n) { return (long) stride * n; }
+
+        public String name() { return "MIPS"; }
+        public String registerSpaceName() { return "register"; }
+        public long[] callerSavedRegisterOffsets() {
+            // $at(1), $v0-$v1(2-3), $a0-$a3(4-7), $t0-$t7(8-15),
+            // $t8-$t9(24-25). $ra(31) excluded (see class comment).
+            int[] nums = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                14, 15, 24, 25};
+            long[] offs = new long[nums.length];
+            for (int i = 0; i < nums.length; i++) offs[i] = reg(nums[i]);
+            return offs;
+        }
+        public long returnAddressRegisterOffset() { return reg(31); }
+        public boolean isReturnAddressRegister(Varnode v) {
+            return v != null && v.getAddress() != null &&
+                registerSpaceName().equals(
+                    v.getAddress().getAddressSpace().getName()) &&
+                v.getOffset() == returnAddressRegisterOffset();
+        }
+        public long stripInstructionTag(long addr) { return addr; }
+        public boolean isInstructionTagMask(long constValue) {
+            return (constValue & 0xFFFFFFFFL) == 0xFFFFFFFEL;
+        }
+        public int pointerSize() { return ptrSize; }
+        public int pointerIndexShift() { return ptrShift; }
+        public long readPointer(Memory mem, Address addr) throws Exception {
+            if (ptrSize == 8) return mem.getLong(addr);
+            return mem.getInt(addr) & 0xffffffffL;
+        }
+        public String formatCodeAddress(long addr) {
+            return String.format("%08x", addr);
+        }
+        public boolean isMmioAddress(long addr) {
+            // MIPS has no fixed peripheral window (unlike ARM
+            // Cortex-M): the map is platform-specific. These default
+            // bands cover the common firmware families (see
+            // defaultMipsMmioWindows); a caller may override them with
+            // the mmio= script argument, and the SVD-profile classifier
+            // remains the authority on known-vs-suspect peripherals.
+            for (long[] w : mmioWindows) {
+                if (addr >= w[0] && addr < w[1]) return true;
+            }
+            return false;
+        }
+        public int fallthroughIndex(List<OpRec> ops, int i) {
+            // Skip the delay-slot instruction's standalone ops: the
+            // branch/call instruction's own P-Code already embeds
+            // them (verified in the probe dump), so falling through
+            // to them would double-apply delay-slot writes and
+            // resurrect caller-saved registers after calls. MIPS32
+            // instructions are 4 bytes, so the delay slot sits at
+            // branchAddr + 4; a nop delay slot has no ops, in which
+            // case the next op already is next-after-delay.
+            int n = ops.size();
+            if (i + 1 >= n) return -1;
+            long b;
+            try {
+                b = Long.parseLong(ops.get(i).instrAddr.toString(), 16);
+            } catch (Exception e) {
+                return i + 1;
+            }
+            int j = i + 1;
+            while (j < n &&
+                ops.get(j).instrAddr.toString().equals(
+                    ops.get(i).instrAddr.toString())) j++;
+            if (j >= n) return -1;
+            long d;
+            try {
+                d = Long.parseLong(ops.get(j).instrAddr.toString(), 16);
+            } catch (Exception e) {
+                return j;
+            }
+            if (d != b + 4L) return j; // nop delay slot: j is next-after-delay
+            int k = j;
+            while (k < n) {
+                long a;
+                try {
+                    a = Long.parseLong(ops.get(k).instrAddr.toString(), 16);
+                } catch (Exception e) {
+                    break;
+                }
+                if (a != d) break;
+                k++;
+            }
+            return k < n ? k : -1;
+        }
+        /** Fold a varnode to a constant, including INT_2COMP /
+            INT_NEGATE of a constant (constFold does not handle those;
+            the jr/jalr bit-0 clear is INT_2COMP(2) AND). Null when
+            the value is not a known constant. */
+        private Long maskConst(List<OpRec> ops, Varnode v, int beforeIdx) {
+            Long c = constFold(ops, vkey(v), beforeIdx, 16, addrMask);
+            if (c != null) return c;
+            int def = findDef(ops, vkey(v), beforeIdx);
+            if (def < 0) return null;
+            OpRec d = ops.get(def);
+            if (d.ins.length == 1 && d.ins[0].isConstant()) {
+                if (d.mnem.equals("INT_2COMP")) {
+                    return (-d.ins[0].getOffset()) & addrMask;
+                }
+                if (d.mnem.equals("INT_NEGATE")) {
+                    return (~d.ins[0].getOffset()) & addrMask;
+                }
+            }
+            return null;
+        }
+        /** Unwrap the jr/jalr input chain (pc COPY + INT_AND(~1,
+            value)) to the def index of the unwrapped value. Returns
+            the input def when the chain does not match, and never
+            -1 for a valid input def. Shared by table matching and
+            unwrapIndirectDef. */
+        private int unwrapJrChain(List<OpRec> ops, int brIdx, int cur) {
+            for (int hop = 0; hop < 6; hop++) {
+                if (cur < 0) break;
+                OpRec d = ops.get(cur);
+                if (d.mnem.equals("COPY") && d.ins.length == 1 &&
+                    !d.ins[0].isConstant()) {
+                    int nxt = findDef(ops, vkey(d.ins[0]), cur);
+                    if (nxt < 0) break;
+                    cur = nxt;
+                    continue;
+                }
+                if (d.mnem.equals("INT_AND") && d.ins.length == 2) {
+                    boolean unwrapped = false;
+                    for (int s = 0; s < 2; s++) {
+                        Long mv = maskConst(ops, d.ins[s], cur);
+                        if (mv != null &&
+                            mv.longValue() == 0xFFFFFFFEL) {
+                            int nxt = findDef(ops, vkey(d.ins[1 - s]),
+                                cur);
+                            if (nxt >= 0) {
+                                cur = nxt;
+                                unwrapped = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (unwrapped) continue;
+                }
+                break;
+            }
+            return cur;
+        }
+        public int unwrapIndirectDef(List<OpRec> ops, int brIdx, int cur) {
+            return unwrapJrChain(ops, brIdx, cur);
+        }
+        public Map<Integer, List<Integer>> recoverJumpTableTargets(
+            List<OpRec> ops, Memory mem) {
+            Map<Integer, List<Integer>> result =
+                new HashMap<Integer, List<Integer>>();
+            if (ops.isEmpty()) return result;
+            Map<String, Integer> firstAt = new HashMap<String, Integer>();
+            for (int i = 0; i < ops.size(); i++) {
+                String a = ops.get(i).instrAddr.toString();
+                if (!firstAt.containsKey(a)) firstAt.put(a, i);
+            }
+            for (int i = 0; i < ops.size(); i++) {
+                OpRec br = ops.get(i);
+                if (!br.mnem.equals("BRANCHIND") || br.ins.length < 1) continue;
+                // Unwrap the jr chain: BRANCHIND <- pc COPY <-
+                // INT_AND(~1, value) <- value. The AND's mask side is
+                // INT_2COMP(2), not a direct constant.
+                int cur = unwrapJrChain(ops, i,
+                    findDef(ops, vkey(br.ins[0]), i));
+                if (cur < 0) continue;
+                TableMatch m = matchBranchTableFrom(ops, i, cur,
+                    ptrSize, ptrShift, addrMask);
                 if (m == null) continue;
                 List<Integer> targets = new ArrayList<Integer>();
                 for (int k = 0; k < 64; k++) {
@@ -915,7 +1182,12 @@ public class ExtractIR extends GhidraScript {
                     // ops unreachable (caught Oct 26: jtagtap_tdi_seq got
                     // a phantom exact 0xFFFF because its predicated
                     // mov.gt/mov.le copies were skipped).
-                    if (i + 1 < n) succ.get(i).add(i + 1);
+                    // Fallthrough goes through the ISA adapter: MIPS
+                    // skips the delay-slot instruction's standalone ops
+                    // (their effects are already embedded in the branch
+                    // P-Code by Ghidra); ARM/RISC-V return i+1 unchanged.
+                    int f = isa.fallthroughIndex(ops, i);
+                    if (f >= 0) succ.get(i).add(f);
                 }
             } else if (mnem.equals("RETURN")) {
                 // No successors: RETURN ends the function.
@@ -925,7 +1197,10 @@ public class ExtractIR extends GhidraScript {
                 List<Integer> bt = branchTargets.get(i);
                 if (bt != null) succ.get(i).addAll(bt);
             } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
-                if (i + 1 < n) succ.get(i).add(i + 1);
+                // Fallthrough goes through the ISA adapter (MIPS skips
+                // the delay-slot instruction's standalone ops).
+                int f = isa.fallthroughIndex(ops, i);
+                if (f >= 0) succ.get(i).add(f);
             } else {
                 if (i + 1 < n) succ.get(i).add(i + 1);
             }
@@ -1352,7 +1627,11 @@ public class ExtractIR extends GhidraScript {
                     if (j != null) succ.get(i).add(j);
                 }
                 if (mnem.equals("CBRANCH")) {
-                    if (i + 1 < n) succ.get(i).add(i + 1);
+                    // Fallthrough goes through the ISA adapter (see
+                    // runFixpoint: MIPS skips the delay-slot
+                    // instruction's standalone ops).
+                    int f = isa.fallthroughIndex(ops, i);
+                    if (f >= 0) succ.get(i).add(f);
                 }
             } else if (mnem.equals("RETURN")) {
                 // No successors: RETURN ends the function.
@@ -1362,7 +1641,10 @@ public class ExtractIR extends GhidraScript {
                 List<Integer> bt = branchTargets.get(i);
                 if (bt != null) succ.get(i).addAll(bt);
             } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
-                if (i + 1 < n) succ.get(i).add(i + 1);
+                // Fallthrough goes through the ISA adapter (MIPS skips
+                // the delay-slot instruction's standalone ops).
+                int f = isa.fallthroughIndex(ops, i);
+                if (f >= 0) succ.get(i).add(f);
             } else {
                 if (i + 1 < n) succ.get(i).add(i + 1);
             }
@@ -1775,6 +2057,17 @@ public class ExtractIR extends GhidraScript {
         if (br.ins.length < 1) return null;
         int cur = findDef(ops, vkey(br.ins[0]), brIdx);
         if (cur < 0) return null;
+        return matchBranchTableFrom(ops, brIdx, cur,
+            pointerSize, pointerShift, mask);
+    }
+
+    /** Table-match core, starting from an already-resolved def index
+        (MIPS unwraps the pc COPY + AND-~1 chain first, then calls
+        this; RISC-V calls matchBranchTable, which resolves cur the
+        same way as before, so RISC-V behaviour is unchanged). */
+    private static TableMatch matchBranchTableFrom(List<OpRec> ops,
+        int brIdx, int cur, int pointerSize, int pointerShift,
+        long mask) {
         OpRec d = ops.get(cur);
         if (d.mnem.equals("INT_ADD") && d.ins.length == 2) {
             // Offset table: one side loads the entry, the other side
@@ -1814,6 +2107,8 @@ public class ExtractIR extends GhidraScript {
         OpRec br = ops.get(brIdx);
         if (br.ins.length < 1) return null;
         int cur = findDef(ops, vkey(br.ins[0]), brIdx);
+        if (cur < 0) return null;
+        cur = isa.unwrapIndirectDef(ops, brIdx, cur);
         if (cur < 0) return null;
         OpRec d = ops.get(cur);
         if (d.mnem.equals("INT_AND") && d.ins.length == 2) {
@@ -1873,6 +2168,9 @@ public class ExtractIR extends GhidraScript {
             List<String> targets = new ArrayList<String>();
             List<Integer> mySucc = new ArrayList<Integer>();
             int def = findDef(ops, vkey(call.ins[0]), i);
+            if (def >= 0) {
+                def = isa.unwrapIndirectDef(ops, i, def);
+            }
             if (def >= 0) {
                 OpRec dd = ops.get(def);
                 // v3.5: CALLIND destinations go through a Thumb-bit
@@ -2168,6 +2466,9 @@ public class ExtractIR extends GhidraScript {
         OpRec call = ops.get(i);
         if (call.ins.length < 1) return tset;
         int def = findDef(ops, vkey(call.ins[0]), i);
+        if (def >= 0) {
+            def = isa.unwrapIndirectDef(ops, i, def);
+        }
         if (def >= 0) {
             OpRec dd = ops.get(def);
             if (dd.mnem.equals("INT_AND") && dd.ins.length == 2) {
@@ -2648,6 +2949,25 @@ public class ExtractIR extends GhidraScript {
         return w;
     }
 
+    /** Default MIPS peripheral bands (see MipsIsa.isMmioAddress).
+        MIPS has no fixed window: these bands cover the common
+        firmware families without overlapping their RAM or text
+        (text typically lives at 0x80000000+, KSEG0/KSEG1 RAM mirrors
+        at 0x80000000-0x9FFFFFFF / 0xA0000000-0xBFFFFFFF). A caller may
+        override them with the mmio= script argument; the SVD-profile
+        classifier remains the authority. Known caveat: Malta's
+        0x1F000000 peripheral region is deliberately EXCLUDED because
+        it collides with the Atheros SPI-flash window; Malta users
+        should pass mmio= explicitly. */
+    private static List<long[]> defaultMipsMmioWindows() {
+        List<long[]> w = new ArrayList<long[]>();
+        w.add(new long[] {0x10000000L, 0x10100000L}); // MediaTek/Ralink
+        w.add(new long[] {0x18000000L, 0x1C000000L}); // Atheros/Broadcom
+        w.add(new long[] {0x1F800000L, 0x1FC00000L}); // PIC32 physical
+        w.add(new long[] {0xBF800000L, 0xBFC00000L}); // PIC32 KSEG1
+        return w;
+    }
+
     /** Parse "start-end,start-end,..." (hex, optional 0x) into
         windows. Null on any parse failure. */
     private static List<long[]> parseMmioWindows(String spec) {
@@ -2708,6 +3028,31 @@ public class ExtractIR extends GhidraScript {
             }
             isa = new RiscVIsa(is64, windows);
             println("[*] ISA adapter: RISCV (" + (is64 ? "RV64" : "RV32") +
+                ")");
+        } else if ("MIPS".equals(proc)) {
+            boolean is64 = false;
+            try {
+                String langId = currentProgram.getLanguage()
+                    .getLanguageID().getIdAsString();
+                String[] parts = langId.split(":");
+                is64 = parts.length >= 3 && "64".equals(parts[2]);
+            } catch (Exception e) {
+                // Fall through to MIPS32.
+            }
+            List<long[]> windows = defaultMipsMmioWindows();
+            if (getScriptArgs().length >= 2 &&
+                getScriptArgs()[1].startsWith("mmio=")) {
+                List<long[]> parsed = parseMmioWindows(
+                    getScriptArgs()[1].substring(5));
+                if (parsed != null && !parsed.isEmpty()) {
+                    windows = parsed;
+                } else {
+                    println("[!] Bad mmio= window spec, using " +
+                        "MIPS defaults.");
+                }
+            }
+            isa = new MipsIsa(is64, windows);
+            println("[*] ISA adapter: MIPS (" + (is64 ? "MIPS64" : "MIPS32") +
                 ")");
         }
         PrintWriter w = new PrintWriter(new FileWriter(outputJson));
