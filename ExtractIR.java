@@ -335,6 +335,27 @@ public class ExtractIR extends GhidraScript {
     private Map<Long, Prov> provSummaries =
         new HashMap<Long, Prov>();
 
+    /** v9 struct: field summaries by callee entry key (dual-keyed
+        like retSummaries). Each value maps "delta:size" -> Bits:
+        the field values the callee stored into the object it
+        returns, agreed on ALL its RETURN ops (see
+        extractStructSummaries). Empty outside Phase S; set by
+        Phase S before Phase M, so Phase M's re-runs apply the
+        final summaries automatically (same instance field) and
+        the callers' field loads resolve. */
+    private Map<Long, Map<String, Bits>> structSummaries =
+        new HashMap<Long, Map<String, Bits>>();
+
+    /** v9 struct (Prov): struct-layout summaries by callee entry
+        key (dual-keyed like provSummaries). Each value is the
+        STRUCT provenance the callee returns, agreed on ALL its
+        RETURN ops (see extractStructProvSummaries). Empty outside
+        Phase S-Prov; set by Phase S-Prov before emission, so
+        member-call resolution in callers sees interfaces stored
+        into fields of structs returned by helpers. */
+    private Map<Long, Prov> structProvSummaries =
+        new HashMap<Long, Prov>();
+
     /** Caller-saved set for a CALL/CALLIND op: for direct CALLs
         to a known function, the per-callee Ghidra convention
         (signature-driven, x86); otherwise the conservative union
@@ -1295,6 +1316,53 @@ public class ExtractIR extends GhidraScript {
             return kind + ":" + p[1] + ":" + p[2] + ":" + p[3] + ":" +
                 p[4] + ":" + (p[5] + delta);
         }
+        // v9 struct: abstract-object symbols. "OBJ:<callAddr>:<delta>"
+        // denotes a pointer value produced by the call at program
+        // address callAddr, plus delta bytes (pointer arithmetic
+        // folds into delta, exactly like BAR offsets). The call
+        // address is program-unique, so it identifies the object:
+        // two different call sites never share an id, and one call
+        // site denotes one abstract object -- EXCEPT a call site
+        // inside a CFG loop, which may produce many objects (the
+        // transfer never creates an OBJ symbol there; see the CALL
+        // branch). Like every symbol, an OBJ symbol has ones == 0
+        // && zeroes == 0, so exactValue() is null and it can never
+        // masquerade as a constant or an MMIO address. It is also
+        // disjoint from every real address by construction: field
+        // cells keyed by it never overlap mem:/gmem: cells.
+        static String objSym(long callAddr, long delta) {
+            return "OBJ:" + callAddr + ":" + delta;
+        }
+        // Parses an OBJ symbol. Returns [callAddr, delta], or null.
+        static long[] parseObjSym(String sym) {
+            if (sym == null) return null;
+            String[] p = sym.split(":");
+            if (p.length != 3 || !p[0].equals("OBJ")) return null;
+            try {
+                return new long[] { Long.parseLong(p[1]),
+                    Long.parseLong(p[2]) };
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        // Same OBJ symbol with its delta shifted, or null.
+        static String adjustObjSym(String sym, long delta) {
+            long[] p = parseObjSym(sym);
+            if (p == null) return null;
+            return objSym(p[0], p[1] + delta);
+        }
+        // Symbol adjustment for any symbol kind (BAR/BASE/OBJ), or
+        // null when the symbol is of no adjustable kind.
+        static String adjustSym(String sym, long delta) {
+            if (sym == null) return null;
+            if (sym.startsWith("BAR:") || sym.startsWith("BASE:")) {
+                return adjustBarSym(sym, delta);
+            }
+            if (sym.startsWith("OBJ:")) {
+                return adjustObjSym(sym, delta);
+            }
+            return null;
+        }
         static Bits unknown() {
             return new Bits(0, 0);
         }
@@ -1436,6 +1504,19 @@ public class ExtractIR extends GhidraScript {
     private Bits loadBits(Varnode[] ins, Varnode out, Map<String, Bits> bvals,
         Memory mem) {
         if (ins.length < 2 || out == null) return Bits.unknown();
+        // v9 struct: a load through an abstract object reads the
+        // object's field cells, never image bytes (an abstract
+        // object has no image address). No covering cell -> unknown
+        // (exactly today's behaviour for an unknown address).
+        Bits ab = resolveBits(ins[1], bvals);
+        if (ab.sym != null &&
+            Bits.parseObjSym(ab.sym) != null) {
+            // fldLookup returns null for "no covering cell";
+            // loadBits never returns null (the LOAD branch
+            // passes the result straight to putKnown).
+            Bits r = fldLookup(bvals, ab.sym, out.getSize());
+            return r != null ? r : Bits.unknown();
+        }
         Long addr = resolveExact(ins[1], bvals);
         if (addr == null) return Bits.unknown();
         // Memory propagation: a memState entry covering the load
@@ -1452,7 +1533,8 @@ public class ExtractIR extends GhidraScript {
             Address a = toAddr(addr.longValue());
             int sz = out.getSize();
             long val;
-            if (sz == 4) val = mem.getInt(a) & 0xffffffffL;
+            if (sz == 8) val = mem.getLong(a);
+            else if (sz == 4) val = mem.getInt(a) & 0xffffffffL;
             else if (sz == 2) val = mem.getShort(a) & 0xffffL;
             else if (sz == 1) val = mem.getByte(a) & 0xffL;
             else return Bits.unknown();
@@ -1509,7 +1591,8 @@ public class ExtractIR extends GhidraScript {
     /** The transfer function: the v3 op-folding algebra, applied to a
         COPY of the incoming state. No MMIO recording here -- that happens
         once, after convergence, from the final states. */
-    private void applyTransfer(Map<String, Bits> bvals, OpRec op, Memory mem) {
+    private void applyTransfer(Map<String, Bits> bvals, OpRec op, Memory mem,
+        int opIdx, Set<Integer> loopCallOps) {
         String mnem = op.mnem;
         Varnode[] ins = op.ins;
         Varnode out = op.out;
@@ -1643,17 +1726,20 @@ public class ExtractIR extends GhidraScript {
                     // offset (either operand order for ADD; only the
                     // minuend for SUB). Symbol + non-exact, or
                     // constant - symbol, or any MULT, is unknown.
+                    // v9 struct: the same rule carries OBJ deltas
+                    // (a field address is the object symbol plus
+                    // its field offset).
                     Bits s0 = resolveBits(ins[0], bvals);
                     Bits s1 = resolveBits(ins[1], bvals);
                     Long e0 = resolveExact(ins[0], bvals);
                     Long e1 = resolveExact(ins[1], bvals);
                     String adj = null;
                     if (s0.sym != null && e1 != null) {
-                        adj = Bits.adjustBarSym(s0.sym, mnem.equals("INT_ADD")
+                        adj = Bits.adjustSym(s0.sym, mnem.equals("INT_ADD")
                             ? e1 : -e1);
                     } else if (mnem.equals("INT_ADD") &&
                         s1.sym != null && e0 != null) {
-                        adj = Bits.adjustBarSym(s1.sym, e0);
+                        adj = Bits.adjustSym(s1.sym, e0);
                     }
                     if (adj != null) {
                         putKnown(bvals, vkey(out),
@@ -1765,6 +1851,24 @@ public class ExtractIR extends GhidraScript {
         } else if (mnem.equals("LOAD") && out != null) {
             putKnown(bvals, vkey(out), loadBits(ins, out, bvals, mem));
         } else if (mnem.equals("STORE") && ins.length >= 3) {
+            // v9 struct: a store through an abstract object writes
+            // the object's field cell (full Bits, symbols included:
+            // a BAR base stored into a field must survive as a
+            // symbol, unlike memState which strips symbols). The
+            // store ALSO clears memState, exactly as today's
+            // unknown-address store does: the object is abstract,
+            // so memState behaviour is preserved bit-for-bit and
+            // no existing memState result can change. Stack stores
+            // never carry OBJ symbols (stack addresses are
+            // SP/FP-derived, never call-produced), so the stack
+            // gate below is unaffected.
+            Bits ab0 = resolveBits(ins[1], bvals);
+            if (ab0.sym != null &&
+                Bits.parseObjSym(ab0.sym) != null) {
+                Bits vb0 = resolveBits(ins[2], bvals);
+                fldStore(bvals, ab0.sym, ins[2].getSize(), vb0);
+                dropAllMem(bvals);
+            } else
             // Memory propagation, stage 1 (intra-procedural):
             // a store to a known non-MMIO address records the
             // value in memState ("mem:" keys in this same map, so
@@ -1840,6 +1944,7 @@ public class ExtractIR extends GhidraScript {
             // valid at every direct site. CALLIND gets nothing (the
             // clobber above already killed the register); the
             // summary is applied AFTER the clobber, never before.
+            boolean scalarApplied = false;
             if (mnem.equals("CALL") && op.ins.length >= 1) {
                 Varnode t = op.ins[0];
                 if (t != null && t.getAddress() != null &&
@@ -1854,6 +1959,79 @@ public class ExtractIR extends GhidraScript {
                         putKnown(bvals, isa.registerSpaceName() +
                             ":" + isa.returnRegisterOffset() + ":" +
                             isa.pointerSize(), sum);
+                        scalarApplied = true;
+                    }
+                }
+            }
+            // v9 struct: the value returned by this call is a fresh
+            // abstract object, identified by this call site -- UNLESS
+            // a scalar summary already claimed the register (a
+            // scalar return is not a pointer), or this call site
+            // lies in a CFG loop (one site, many objects: no sound
+            // single identity exists, so the value stays unknown,
+            // exactly as before). A direct CALL to a struct-
+            // summarized callee additionally installs the callee's
+            // field cells under this call site's id, so later field
+            // loads through the returned pointer resolve. CALLIND
+            // gets a fresh object but never a summary (no static
+            // callee). Field cells survive later CALLs (a callee
+            // cannot touch this object: it never receives the
+            // pointer -- object ids do not cross function
+            // boundaries except through these summaries).
+            // DOCUMENTED RESIDUAL (same honesty policy as v2 item
+            // #2's address-taken hole): if a callee actually
+            // returns a global address that is not exact in its own
+            // fixpoint, the caller models it as a fresh object; an
+            // intervening call mutating that global's field through
+            // its real address would leave a stale field cell. Exact
+            // returns take the scalar path above, so the hole needs
+            // a computed (non-exact) global address plus a
+            // cross-path mutation to bite.
+            if (!scalarApplied && (mnem.equals("CALL") ||
+                mnem.equals("CALLIND"))) {
+                boolean inLoop = loopCallOps != null &&
+                    loopCallOps.contains(opIdx);
+                if (!inLoop) {
+                    String oid = Bits.objSym(
+                        op.instrAddr.getOffset(), 0);
+                    putKnown(bvals, isa.registerSpaceName() +
+                        ":" + isa.returnRegisterOffset() + ":" +
+                        isa.pointerSize(),
+                        Bits.symBits(oid, isa.pointerSize()));
+                    if (mnem.equals("CALL") && op.ins.length >= 1) {
+                        Varnode t = op.ins[0];
+                        if (t != null && t.getAddress() != null &&
+                            "ram".equals(t.getAddress().getAddressSpace()
+                                .getName())) {
+                            Map<String, Bits> fields =
+                                structSummaries.get(t.getOffset());
+                            if (fields == null) {
+                                fields = structSummaries.get(
+                                    isa.stripInstructionTag(
+                                        t.getOffset()));
+                            }
+                            if (fields != null) {
+                                for (Map.Entry<String, Bits> fe :
+                                    fields.entrySet()) {
+                                    String[] fp =
+                                        fe.getKey().split(":");
+                                    if (fp.length != 2) continue;
+                                    try {
+                                        long fo = Long.parseLong(fp[0]);
+                                        int fs = Integer.parseInt(fp[1]);
+                                        bvals.put("fld:" +
+                                            Bits.objSym(
+                                                op.instrAddr.getOffset(),
+                                                fo) + ":" + fs,
+                                            fe.getValue());
+                                    } catch (Exception ex) {
+                                        // Malformed summary key:
+                                        // skip that field, never
+                                        // trust it.
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2058,7 +2236,7 @@ public class ExtractIR extends GhidraScript {
     @SuppressWarnings("unchecked")
     private FixResult runFixpoint(List<OpRec> ops, Memory mem,
         Map<Integer, List<Integer>> branchTargets,
-        Map<String, Bits> entry) {
+        Map<String, Bits> entry, Set<Integer> loopCallOps) {
         int n = ops.size();
         Map<String, Bits>[] in = new Map[n];
         if (n == 0) return new FixResult(in, true);
@@ -2149,7 +2327,7 @@ public class ExtractIR extends GhidraScript {
             for (int i = 0; i < n; i++) {
                 if (in[i] == null) continue;
                 Map<String, Bits> out = new HashMap<String, Bits>(in[i]);
-                applyTransfer(out, ops.get(i), mem);
+                applyTransfer(out, ops.get(i), mem, i, loopCallOps);
                 for (int j : succ.get(i)) {
                     Map<String, Bits> prop = out;
                     if (!ops.get(j).instrAddr.equals(ops.get(i).instrAddr)) {
@@ -2625,6 +2803,41 @@ public class ExtractIR extends GhidraScript {
             }
         }
         return succ;
+    }
+
+    /** v9 struct: the set of CALL/CALLIND op indices that lie on a
+        CFG cycle (the op can reach itself through successors, so
+        the site may execute more than once per function
+        invocation). Computed from buildSucc, which shares
+        runFixpoint's successor rules exactly (KEEP IN SYNC).
+        Cost is one DFS per call op; call ops are few per
+        function. A missed cycle would be unsound (two objects
+        sharing one id), so the check is reachability, not a
+        syntactic loop heuristic. */
+    private Set<Integer> loopCallOpsFor(List<OpRec> ops,
+        Map<Integer, List<Integer>> branchTargets) {
+        Set<Integer> out = new HashSet<Integer>();
+        List<List<Integer>> succ = buildSucc(ops, branchTargets);
+        for (int i = 0; i < ops.size(); i++) {
+            String m = ops.get(i).mnem;
+            if (!m.equals("CALL") && !m.equals("CALLIND")) continue;
+            java.util.ArrayDeque<Integer> stack =
+                new java.util.ArrayDeque<Integer>();
+            Set<Integer> seen = new HashSet<Integer>();
+            for (int s : succ.get(i)) stack.push(s);
+            boolean back = false;
+            while (!stack.isEmpty()) {
+                int j = stack.pop();
+                if (j == i) {
+                    back = true;
+                    break;
+                }
+                if (!seen.add(j)) continue;
+                for (int s : succ.get(j)) stack.push(s);
+            }
+            if (back) out.add(i);
+        }
+        return out;
     }
 
     /** Resolve a CBRANCH condition to (root varnode key, takenMeansZero
@@ -4993,6 +5206,51 @@ public class ExtractIR extends GhidraScript {
                     }
                 }
             }
+            // v9 struct (Prov): the value returned by this call is
+            // a struct whose fields the caller may fill and read --
+            // or, for a direct CALL to a struct-summarized callee,
+            // the callee's layout. An IFACE summary above wins (a
+            // callee returns either an interface or a struct, never
+            // both); otherwise the return register becomes STRUCT:
+            // the callee's summary layout, or an empty layout for
+            // an untracked call (empty layouts resolve nothing --
+            // INT_ADD on them yields null, exactly like unknown --
+            // but field stores through the pointer accumulate a
+            // layout via the existing STORE/structFieldOf rules, so
+            // the callee's own summary can form). CALLIND gets an
+            // empty struct too (AllocatePool is a CALLIND: this is
+            // what lets UEFI callers track interface fields of
+            // heap-allocated device structs). Layouts are
+            // per-varnode snapshots, so loop-carried call sites
+            // need no special case here (unlike Bits field cells,
+            // which are shared keys): a saved copy keeps the
+            // layout from its copy time, and meetProv intersects
+            // layouts at joins.
+            {
+                Varnode rr = regVarnode(
+                    isa.returnRegisterOffset(), isa.pointerSize());
+                if (rr != null && getProv(st, rr) == null) {
+                    Prov sp = null;
+                    if (mnem.equals("CALL") && op.ins.length >= 1) {
+                        Varnode t = op.ins[0];
+                        if (t != null && t.getAddress() != null &&
+                            "ram".equals(t.getAddress().getAddressSpace()
+                                .getName())) {
+                            sp = structProvSummaries.get(t.getOffset());
+                            if (sp == null) {
+                                sp = structProvSummaries.get(
+                                    isa.stripInstructionTag(
+                                        t.getOffset()));
+                            }
+                        }
+                    }
+                    if (sp == null) {
+                        sp = Prov.struct(
+                            new HashMap<Long, ProtoField>());
+                    }
+                    setProv(st, rr, sp);
+                }
+            }
             // Post-call bindings (memory effects of the call).
             if (acqGuid != null && acqOut != null) {
                 bindAcquisition(acqOut, acqGuid, ops, idx, st, ctx);
@@ -5728,6 +5986,12 @@ public class ExtractIR extends GhidraScript {
         TailCallResult tc;
         /** Canonical entry key: the function's raw entry offset. */
         long entryKey;
+        /** v9 struct: op indices of CALL/CALLIND ops that can reach
+            themselves through the CFG (loop-carried call sites).
+            Computed once per function; the transfer never creates
+            an OBJ symbol there, because one site may produce many
+            distinct objects. */
+        Set<Integer> loopCallOps;
         /** Final must-fixpoint (Phase B), never null after Phase B. */
         FixResult fx;
         /** Final provenance fixpoint (Phase P, v2 item #3); null
@@ -5872,6 +6136,66 @@ public class ExtractIR extends GhidraScript {
         return out;
     }
 
+    /** v9 struct (Prov): extract one struct-layout summary per
+        callee from the current provenance fixpoints. The summary
+        is the return register's STRUCT provenance agreed on ALL
+        RETURN ops, with a non-empty layout (an empty layout
+        resolves nothing, so it is not stored -- the CALL branch
+        falls back to an empty struct anyway). Any RETURN with a
+        null inState, a non-STRUCT provenance, or a disagreeing
+        layout blocks the summary. Argument dependence needs no
+        separate check: the fixpoint ran under the provEntries
+        meet, so a layout depending on a non-agreed argument is
+        unknown here. Dual-keyed like provSummaries. */
+    private Map<Long, Prov> extractStructProvSummaries(
+        List<FuncRec> funcRecs) {
+        Map<Long, Prov> out = new HashMap<Long, Prov>();
+        String retKey = isa.registerSpaceName() + ":" +
+            isa.returnRegisterOffset() + ":" + isa.pointerSize();
+        for (FuncRec rec : funcRecs) {
+            if (rec.pv == null || !rec.pv.converged ||
+                rec.pv.inStates == null) continue;
+            Prov agree = null;
+            boolean seen = false;
+            boolean bad = false;
+            List<OpRec> pops = rec.or.ops;
+            for (int i = 0; i < pops.size(); i++) {
+                if (!pops.get(i).mnem.equals("RETURN")) continue;
+                if (i >= rec.pv.inStates.length) {
+                    bad = true;
+                    break;
+                }
+                ProvState st = rec.pv.inStates[i];
+                if (st == null) {
+                    bad = true;
+                    break;
+                }
+                Prov p = st.varProv.get(retKey);
+                if (p == null || p.kind != Prov.STRUCT ||
+                    p.layout == null || p.layout.isEmpty()) {
+                    bad = true;
+                    break;
+                }
+                if (!seen) {
+                    agree = p;
+                    seen = true;
+                } else if (!agree.equals(p)) {
+                    bad = true;
+                    break;
+                }
+            }
+            if (seen && !bad) {
+                out.put(rec.entryKey, agree);
+                long stripped =
+                    isa.stripInstructionTag(rec.entryKey);
+                if (stripped != rec.entryKey) {
+                    out.put(stripped, agree);
+                }
+            }
+        }
+        return out;
+    }
+
     /** v8 retprop: extract one return summary per callee from the
         current must-fixpoints. The summary is the return-register
         value agreed on ALL RETURN ops: the same exact constant, or
@@ -5945,6 +6269,138 @@ public class ExtractIR extends GhidraScript {
             }
         }
         return out;
+    }
+
+    /** v9 struct: extract one field summary per callee from the
+        current must-fixpoints. The summary exists only when the
+        return register holds the SAME abstract object (same OBJ
+        symbol, delta 0) on ALL RETURN ops: the object the callee
+        returns. Its fields are the field cells for that object
+        agreed on ALL RETURN ops (same key, sameBits-equal value
+        everywhere; a field missing from any RETURN, or disagreeing,
+        is excluded -- unknown, never a guess). A field stored on
+        only one path is already dropped by the must-meet before
+        it reaches any RETURN, so path coverage needs no separate
+        check. The creating call site must not be loop-carried
+        (the transfer never creates an OBJ symbol there, so such a
+        summary cannot form -- this check is belt-and-braces).
+        Dual-keyed like retSummaries. A callee with no RETURN ops,
+        or whose return is not an object, has no summary. */
+    private Map<Long, Map<String, Bits>> extractStructSummaries(
+        List<FuncRec> funcRecs) {
+        Map<Long, Map<String, Bits>> out =
+            new HashMap<Long, Map<String, Bits>>();
+        String retKey = isa.registerSpaceName() + ":" +
+            isa.returnRegisterOffset() + ":" + isa.pointerSize();
+        for (FuncRec rec : funcRecs) {
+            if (rec.fx == null || !rec.fx.converged ||
+                rec.fx.inStates == null) continue;
+            List<OpRec> pops = rec.or.ops;
+            String objId = null;
+            boolean seen = false;
+            boolean bad = false;
+            for (int i = 0; i < pops.size(); i++) {
+                if (!pops.get(i).mnem.equals("RETURN")) continue;
+                if (i >= rec.fx.inStates.length) {
+                    bad = true;
+                    break;
+                }
+                Map<String, Bits> st = rec.fx.inStates[i];
+                if (st == null) {
+                    bad = true;
+                    break;
+                }
+                Bits b = st.get(retKey);
+                if (b == null || b.sym == null) {
+                    bad = true;
+                    break;
+                }
+                long[] o = Bits.parseObjSym(b.sym);
+                if (o == null || o[1] != 0) {
+                    bad = true;
+                    break;
+                }
+                String id = Bits.objSym(o[0], 0);
+                if (!seen) {
+                    objId = id;
+                    seen = true;
+                } else if (!objId.equals(id)) {
+                    bad = true;
+                    break;
+                }
+            }
+            if (!seen || bad || objId == null) continue;
+            long[] oid = Bits.parseObjSym(objId);
+            boolean looped = false;
+            if (rec.loopCallOps != null && oid != null) {
+                for (int i = 0; i < pops.size(); i++) {
+                    if (pops.get(i).instrAddr.getOffset() == oid[0] &&
+                        rec.loopCallOps.contains(i)) {
+                        looped = true;
+                        break;
+                    }
+                }
+            }
+            if (looped) continue;
+            Map<String, Bits> fields = null;
+            boolean first = true;
+            for (int i = 0; i < pops.size(); i++) {
+                if (!pops.get(i).mnem.equals("RETURN")) continue;
+                Map<String, Bits> st = rec.fx.inStates[i];
+                Map<String, Bits> mine = new HashMap<String, Bits>();
+                for (Map.Entry<String, Bits> e : st.entrySet()) {
+                    long[] f = parseFldKey(e.getKey());
+                    if (f == null || f[0] != oid[0]) continue;
+                    mine.put(f[1] + ":" + f[2], e.getValue());
+                }
+                if (first) {
+                    fields = mine;
+                    first = false;
+                } else {
+                    Map<String, Bits> inter =
+                        new HashMap<String, Bits>();
+                    for (Map.Entry<String, Bits> e :
+                        fields.entrySet()) {
+                        Bits o2 = mine.get(e.getKey());
+                        if (o2 != null &&
+                            sameBits(e.getValue(), o2)) {
+                            inter.put(e.getKey(), e.getValue());
+                        }
+                    }
+                    fields = inter;
+                }
+            }
+            if (fields == null || fields.isEmpty()) continue;
+            out.put(rec.entryKey, fields);
+            long stripped =
+                isa.stripInstructionTag(rec.entryKey);
+            if (stripped != rec.entryKey) {
+                out.put(stripped, fields);
+            }
+        }
+        return out;
+    }
+
+    /** v9 struct: equality of two field-summary maps. */
+    private static boolean sameStructSummaries(
+        Map<Long, Map<String, Bits>> a,
+        Map<Long, Map<String, Bits>> b) {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        if (a.size() != b.size()) return false;
+        for (Map.Entry<Long, Map<String, Bits>> e : a.entrySet()) {
+            Map<String, Bits> o = b.get(e.getKey());
+            if (o == null || o.size() != e.getValue().size()) {
+                return false;
+            }
+            for (Map.Entry<String, Bits> fe :
+                e.getValue().entrySet()) {
+                if (!sameBits(fe.getValue(), o.get(fe.getKey()))) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /** Meet over ALL direct call sites of one callee: an argument
@@ -6096,6 +6552,124 @@ public class ExtractIR extends GhidraScript {
             if (k.startsWith("mem:")) drop.add(k);
         }
         for (String k : drop) m.remove(k);
+    }
+
+    // ---------------- v9 struct: object field cells ----------------
+    // Field cells live in the same must-state map as memState, but
+    // under "fld:" keys, so the must-meet's agree-or-drop
+    // discipline applies to them exactly as to registers and
+    // memState: a cell survives a join only when every incoming
+    // path agrees on it (a field stored on one branch only dies
+    // at the join -- no separate dominance check is needed).
+    // Key form: "fld:OBJ:<callAddr>:<delta>:<size>", where the
+    // OBJ symbol already carries the field offset (its delta).
+    // Cells of distinct objects never overlap (distinct call
+    // addresses), and never overlap mem:/gmem: cells (abstract
+    // objects are disjoint from real addresses by construction).
+
+    /** Parse a field-cell key into [callAddr, delta, size], or
+        null when malformed. */
+    private static long[] parseFldKey(String k) {
+        if (k == null || !k.startsWith("fld:OBJ:")) return null;
+        String[] p = k.split(":");
+        if (p.length != 5) return null;
+        try {
+            return new long[] { Long.parseLong(p[2]),
+                Long.parseLong(p[3]), Long.parseLong(p[4]) };
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** Drop field cells of one object overlapping
+        [delta, delta+size) -- the field-cell twin of dropMemRange
+        (cells of other objects are untouched). */
+    private static void fldDropRange(Map<String, Bits> m, long callAddr,
+        long delta, int size) {
+        long end = delta + size;
+        List<String> drop = new ArrayList<String>();
+        for (String k : m.keySet()) {
+            long[] f = parseFldKey(k);
+            if (f == null || f[0] != callAddr) continue;
+            if (f[1] < end && delta < f[1] + f[2]) drop.add(k);
+        }
+        for (String k : drop) m.remove(k);
+    }
+
+    /** Write one field cell (dropping overlapped cells first).
+        An unknown value removes the cell (putKnown semantics):
+        an unknown store to a field makes the field unknown. Full
+        Bits are stored, symbols included (unlike memState). */
+    private static void fldStore(Map<String, Bits> m, String objSym,
+        int size, Bits v) {
+        long[] o = Bits.parseObjSym(objSym);
+        if (o == null || size <= 0 || size > 8) return;
+        fldDropRange(m, o[0], o[1], size);
+        String k = "fld:" + objSym + ":" + size;
+        if (v.ones == 0 && v.zeroes == 0 && v.sym == null) {
+            m.remove(k);
+        } else {
+            m.put(k, v);
+        }
+    }
+
+    /** Read a field value: the cells covering [delta, delta+size)
+        must cover the whole range. A single covering symbol cell
+        yields its symbol only when the load starts at the cell
+        base and covers at least the symbol's width (the v7 view
+        rule); otherwise all covering cells must be exact and
+        their bytes are assembled (memLookup discipline).
+        Anything else -> null (unknown). */
+    private Bits fldLookup(Map<String, Bits> m, String objSym,
+        int size) {
+        long[] o = Bits.parseObjSym(objSym);
+        if (o == null || size <= 0 || size > 8) return null;
+        long callAddr = o[0], delta = o[1], end = delta + size;
+        List<long[]> cells = new ArrayList<long[]>();
+        List<Bits> vals = new ArrayList<Bits>();
+        for (Map.Entry<String, Bits> e : m.entrySet()) {
+            long[] f = parseFldKey(e.getKey());
+            if (f == null || f[0] != callAddr) continue;
+            if (f[1] < end && delta < f[1] + f[2]) {
+                cells.add(f);
+                vals.add(e.getValue());
+            }
+        }
+        if (cells.isEmpty()) return null;
+        long cov = 0;
+        for (long[] f : cells) {
+            long is = Math.max(delta, f[1]);
+            long ie = Math.min(end, f[1] + f[2]);
+            for (long p = is; p < ie; p++) cov |= (1L << (p - delta));
+        }
+        if (cov != ((1L << size) - 1)) return null;
+        if (cells.size() == 1) {
+            Bits v = vals.get(0);
+            if (v.sym != null) {
+                long[] f = cells.get(0);
+                if (delta == f[1] && size >= v.symW) return v;
+                return null;
+            }
+        }
+        long ones = 0, zeroes = 0;
+        for (int i = 0; i < cells.size(); i++) {
+            long[] f = cells.get(i);
+            Bits eb = vals.get(i);
+            if (eb.sym != null) return null;
+            long is = Math.max(delta, f[1]);
+            long ie = Math.min(end, f[1] + f[2]);
+            for (long p = is; p < ie; p++) {
+                long ej = p - f[1];
+                long lb = p - delta;
+                long srcShift = memBigEndian ? (f[2] - 1 - ej) * 8 :
+                    ej * 8;
+                long dstShift = memBigEndian ? (size - 1 - lb) * 8 :
+                    lb * 8;
+                ones |= ((eb.ones >>> srcShift) & 0xffL) << dstShift;
+                zeroes |= ((eb.zeroes >>> srcShift) & 0xffL) << dstShift;
+            }
+        }
+        return new Bits(ones, zeroes);
     }
 
     /** Covering memState lookup for a load of [addr, addr+size).
@@ -6714,6 +7288,14 @@ public class ExtractIR extends GhidraScript {
                     }
                 }
             }
+            // v9 struct: loop-carried call sites (branchTargets are
+            // final here, so the CFG used matches the fixpoints').
+            try {
+                rec.loopCallOps = loopCallOpsFor(pops,
+                    rec.branchTargets);
+            } catch (Exception e) {
+                rec.loopCallOps = new HashSet<Integer>();
+            }
             try {
                 long funcStart = pf.getEntryPoint().getOffset();
                 long funcEnd = funcStart + 1L;
@@ -6856,7 +7438,8 @@ public class ExtractIR extends GhidraScript {
                 FixResult nfx;
                 try {
                     nfx = runFixpoint(rec.or.ops, memA,
-                        rec.branchTargets, e);
+                        rec.branchTargets, e,
+                        rec.loopCallOps);
                 } catch (Exception ex) {
                     nfx = emptyFix(rec.or.ops.size());
                 }
@@ -6901,7 +7484,8 @@ public class ExtractIR extends GhidraScript {
                 if (rec == null) continue;
                 try {
                     FixResult nfx = runFixpoint(rec.or.ops, memA,
-                        rec.branchTargets, entries.get(ek));
+                        rec.branchTargets, entries.get(ek),
+                        rec.loopCallOps);
                     if (nfx.converged || rec.fx == null ||
                         !rec.fx.converged) {
                         rec.fx = nfx;
@@ -6997,7 +7581,8 @@ public class ExtractIR extends GhidraScript {
                 FixResult nfx;
                 try {
                     nfx = runFixpoint(rec.or.ops, memA,
-                        rec.branchTargets, entries.get(rec.entryKey));
+                        rec.branchTargets, entries.get(rec.entryKey),
+                        rec.loopCallOps);
                 } catch (Exception ex) {
                     nfx = emptyFix(rec.or.ops.size());
                 }
@@ -7014,7 +7599,8 @@ public class ExtractIR extends GhidraScript {
             for (FuncRec rec : funcRecs) {
                 try {
                     FixResult nfx = runFixpoint(rec.or.ops, memA,
-                        rec.branchTargets, entries.get(rec.entryKey));
+                        rec.branchTargets, entries.get(rec.entryKey),
+                        rec.loopCallOps);
                     if (nfx.converged || rec.fx == null ||
                         !rec.fx.converged) {
                         rec.fx = nfx;
@@ -7030,6 +7616,75 @@ public class ExtractIR extends GhidraScript {
         println("[*] retprop: " + retRounds + " rounds, converged=" +
             retConverged + ", summaries=" + retSummaries.size() +
             ".");
+        // ---- v9 struct, Phase S: struct return summaries ----
+        // A callee's field summary is the field cells for the
+        // object it returns, agreed on ALL its RETURN ops (see
+        // extractStructSummaries), and the CALL branch installs
+        // those cells under each direct call site's own object id.
+        // Iteration is JOINT like Phase R: an installed summary
+        // lets a wrapper callee form its own summary (it returns
+        // the object it received, whose cells are the installed
+        // ones), so nested struct returns need a second round.
+        // Recursion never yields an unsound summary (a recursive
+        // callee's RETURNs disagree on the object id, so no summary
+        // forms -- the loop converges on unknown). Non-convergence
+        // drops ALL summaries and re-runs, so no unstable summary
+        // ever reaches emission. Phase M's re-runs below apply the
+        // final summaries automatically (same instance field).
+        boolean structConverged = false;
+        int structRounds = 0;
+        for (int round = 0; round < MAX_CONSTPROP_ROUNDS &&
+            !structConverged; round++) {
+            if (monitor.isCancelled()) break;
+            structRounds++;
+            Map<Long, Map<String, Bits>> next =
+                extractStructSummaries(funcRecs);
+            if (sameStructSummaries(structSummaries, next)) {
+                structConverged = true;
+                break;
+            }
+            structSummaries = next;
+            for (FuncRec rec : funcRecs) {
+                FixResult nfx;
+                try {
+                    nfx = runFixpoint(rec.or.ops, memA,
+                        rec.branchTargets, entries.get(rec.entryKey),
+                        rec.loopCallOps);
+                } catch (Exception ex) {
+                    nfx = emptyFix(rec.or.ops.size());
+                }
+                if (nfx.converged || rec.fx == null ||
+                    !rec.fx.converged) {
+                    rec.fx = nfx;
+                }
+            }
+        }
+        if (!structConverged && !monitor.isCancelled()) {
+            structSummaries = new HashMap<Long, Map<String, Bits>>();
+            for (FuncRec rec : funcRecs) {
+                try {
+                    FixResult nfx = runFixpoint(rec.or.ops, memA,
+                        rec.branchTargets, entries.get(rec.entryKey),
+                        rec.loopCallOps);
+                    if (nfx.converged || rec.fx == null ||
+                        !rec.fx.converged) {
+                        rec.fx = nfx;
+                    }
+                } catch (Exception ex) {
+                    // Keep the previous fixpoint.
+                }
+            }
+            println("[!] struct: stopped after " +
+                MAX_CONSTPROP_ROUNDS +
+                " rounds without convergence; summaries dropped.");
+        }
+        int structFields = 0;
+        for (Map<String, Bits> f : structSummaries.values()) {
+            structFields += f.size();
+        }
+        println("[*] struct: " + structRounds + " rounds, converged=" +
+            structConverged + ", summaries=" + structSummaries.size() +
+            ", fields=" + structFields + ".");
         // ---- v2 item #3, Phase P: protocol-aware points-to ----
         // Gated to x86-64 (UEFI Boot Services + protocol tables
         // are x86-64 ABI facts; other ISAs keep v3.9 behaviour
@@ -7292,6 +7947,60 @@ public class ExtractIR extends GhidraScript {
             println("[*] provret: " + provRetRounds + " rounds, converged=" +
                 provRetConverged + ", summaries=" + provSummaries.size() +
                 ".");
+            // ---- v9 struct (Prov), Phase S-Prov: struct layouts ----
+            // A second, separate iteration AFTER Phase P2's loop
+            // (that loop is untouched, so its behaviour cannot
+            // regress): extract struct-layout summaries from the
+            // final provenance fixpoints, apply them at direct
+            // CALLs via the structProvSummaries field, and re-run
+            // all provenance fixpoints until summaries stabilize.
+            // A caller that receives a struct through a CALL return
+            // can then resolve a member CALLIND through a field
+            // interface exactly as if it had filled the struct
+            // itself. Non-convergence drops ALL struct summaries
+            // and re-runs with provEntries + provSummaries only, so
+            // no unstable summary ever reaches emission.
+            boolean structProvConverged = false;
+            int structProvRounds = 0;
+            for (int round = 0; round < MAX_CONSTPROP_ROUNDS &&
+                !structProvConverged; round++) {
+                if (monitor.isCancelled()) break;
+                structProvRounds++;
+                Map<Long, Prov> next =
+                    extractStructProvSummaries(funcRecs);
+                if (sameProvSummaries(structProvSummaries, next)) {
+                    structProvConverged = true;
+                    break;
+                }
+                structProvSummaries = next;
+                for (FuncRec rec : funcRecs) {
+                    try {
+                        rec.pv = runProvFixpoint(rec.or.ops,
+                            rec.branchTargets,
+                            provEntries.get(rec.entryKey), provCtx);
+                    } catch (Exception ex) {
+                        // Keep the previous Prov result.
+                    }
+                }
+            }
+            if (!structProvConverged && !monitor.isCancelled()) {
+                structProvSummaries = new HashMap<Long, Prov>();
+                for (FuncRec rec : funcRecs) {
+                    try {
+                        rec.pv = runProvFixpoint(rec.or.ops,
+                            rec.branchTargets,
+                            provEntries.get(rec.entryKey), provCtx);
+                    } catch (Exception ex) {
+                        // Keep the previous Prov result.
+                    }
+                }
+                println("[!] structprov: stopped after " +
+                    MAX_CONSTPROP_ROUNDS +
+                    " rounds without convergence; summaries dropped.");
+            }
+            println("[*] structprov: " + structProvRounds +
+                " rounds, converged=" + structProvConverged +
+                ", summaries=" + structProvSummaries.size() + ".");
         }
 
         // ---- Memory/global propagation, Phase M ----
@@ -7382,7 +8091,8 @@ public class ExtractIR extends GhidraScript {
                 FixResult nfx;
                 try {
                     nfx = runFixpoint(rec.or.ops, memA,
-                        rec.branchTargets, merged);
+                        rec.branchTargets, merged,
+                        rec.loopCallOps);
                 } catch (Exception ex) {
                     nfx = emptyFix(rec.or.ops.size());
                 }
@@ -7397,7 +8107,8 @@ public class ExtractIR extends GhidraScript {
             for (FuncRec rec : funcRecs) {
                 try {
                     FixResult nfx = runFixpoint(rec.or.ops, memA,
-                        rec.branchTargets, entries.get(rec.entryKey));
+                        rec.branchTargets, entries.get(rec.entryKey),
+                        rec.loopCallOps);
                     if (nfx.converged || rec.fx == null ||
                         !rec.fx.converged) {
                         rec.fx = nfx;
@@ -7560,6 +8271,35 @@ public class ExtractIR extends GhidraScript {
                                 ", \"value_known_ones\": " + Long.toUnsignedString(valBits.ones) +
                                 ", \"value_known_zeroes\": " + Long.toUnsignedString(valBits.zeroes) + "}");
                             mustRecorded = true;
+                        }
+                    }
+                }
+                // ---- v9 struct: COPY-to-ram MMIO stores ----
+                // The transfer treats COPY-to-ram as an absolute
+                // store (x86-64 movabs / RIP-relative stores never
+                // become STORE ops), but emission only recorded
+                // LOAD/STORE, so absolute MMIO stores were silently
+                // dropped. A COPY-to-ram address is a constant, so
+                // this is a must-recording, never a may. Value and
+                // size mirror the STORE rule.
+                if (op.mnem.equals("COPY") && op.out != null &&
+                    isRamSpace(op.out) && op.ins.length >= 1) {
+                    Map<String, Bits> bvals = fx.inStates[i];
+                    if (bvals != null) {
+                        long a = op.out.getOffset();
+                        if (isa.isMmioAddress(a)) {
+                            Bits valBits = resolveBits(op.ins[0], bvals);
+                            int sz = op.out.getSize();
+                            Long exact = valBits.exactValue(
+                                sizeMask(sz == 0 ? 4 : sz));
+                            mmio.add("{\"instr\": \"" + op.instrAddr +
+                                "\", \"op\": \"" + op.mnem +
+                                "\", \"address\": \"0x" + Long.toHexString(a) +
+                                "\", \"size\": " + sz +
+                                ", \"value\": " +
+                                (exact == null ? "null" : Long.toUnsignedString(exact)) +
+                                ", \"value_known_ones\": " + Long.toUnsignedString(valBits.ones) +
+                                ", \"value_known_zeroes\": " + Long.toUnsignedString(valBits.zeroes) + "}");
                         }
                     }
                 }
