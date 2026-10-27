@@ -1186,9 +1186,71 @@ public class ExtractIR extends GhidraScript {
     private static class Bits {
         final long ones;
         final long zeroes;
+        // v7 cfgspace: optional symbolic value. A Bits with sym != null
+        // ALWAYS has ones == 0 && zeroes == 0 (never exact), so a symbol
+        // can never masquerade as a constant: exactValue() returns null
+        // for it, and isMmioAddress() never fires on it. Forms:
+        //   "BAR:bus:dev:fn:idx:off"  raw BAR register value (unmasked)
+        //   "BASE:bus:dev:fn:idx:off" masked BAR base (flags cleared)
+        // Only BASE symbols yield findings; raw BAR symbols never do.
+        final String sym;
+        // v7 cfgspace: width (in bytes) at which the symbol value is
+        // fully contained. Deriving a narrower view of a symbol
+        // value is sound ONLY for a view that starts at the value's
+        // base and covers at least symW bytes (e.g. EAX from a
+        // ZEXT-widened RAX: the low 4 bytes ARE the 32-bit BAR
+        // value). Deriving a view narrower than symW, or not
+        // starting at the base, must drop the symbol (e.g. EAX from
+        // a 64-bit BAR+offset address is just address bits, not the
+        // BAR symbol). 0 means "no symbol".
+        final int symW;
         Bits(long ones, long zeroes) {
+            this(ones, zeroes, null, 0);
+        }
+        Bits(long ones, long zeroes, String sym, int symW) {
             this.ones = ones;
             this.zeroes = zeroes;
+            this.sym = sym;
+            this.symW = symW;
+        }
+        static Bits symBits(String sym, int symW) {
+            return new Bits(0, 0, sym, symW);
+        }
+        static String barSym(long bus, long dev, long fn, long bar,
+            long off) {
+            return "BAR:" + bus + ":" + dev + ":" + fn + ":" + bar +
+                ":" + off;
+        }
+        static String baseSym(long bus, long dev, long fn, long bar,
+            long off) {
+            return "BASE:" + bus + ":" + dev + ":" + fn + ":" + bar +
+                ":" + off;
+        }
+        // Parses a BAR/BASE symbol. Returns [kind, bus, dev, fn, bar,
+        // off] with kind 0 = BAR, 1 = BASE, or null if malformed.
+        static long[] parseBarSym(String sym) {
+            if (sym == null) return null;
+            String[] p = sym.split(":");
+            if (p.length != 6) return null;
+            int kind;
+            if (p[0].equals("BAR")) kind = 0;
+            else if (p[0].equals("BASE")) kind = 1;
+            else return null;
+            try {
+                return new long[] { kind, Long.parseLong(p[1]),
+                    Long.parseLong(p[2]), Long.parseLong(p[3]),
+                    Long.parseLong(p[4]), Long.parseLong(p[5]) };
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        // Same symbol with its offset shifted by delta, or null.
+        static String adjustBarSym(String sym, long delta) {
+            long[] p = parseBarSym(sym);
+            if (p == null) return null;
+            String kind = p[0] == 0 ? "BAR" : "BASE";
+            return kind + ":" + p[1] + ":" + p[2] + ":" + p[3] + ":" +
+                p[4] + ":" + (p[5] + delta);
         }
         static Bits unknown() {
             return new Bits(0, 0);
@@ -1215,7 +1277,11 @@ public class ExtractIR extends GhidraScript {
             return Bits.exact(v.getOffset(), sizeMask(v.getSize()));
         }
         Bits b = bvals.get(vkey(v));
-        if (b != null && (b.ones != 0 || b.zeroes != 0)) return b;
+        // v7: a symbol entry must return directly. Without this, the
+        // old 0/0 skip falls through to the slicing path, which builds
+        // fresh Bits without sym and the symbol is lost at every COPY.
+        if (b != null && (b.ones != 0 || b.zeroes != 0 ||
+            b.sym != null)) return b;
         // Sub-register view of a wider known value (x86: reading
         // EAX after RAX was written, or DX after RDX). Writes only
         // create the written view, so the narrower view's exact key
@@ -1388,7 +1454,9 @@ public class ExtractIR extends GhidraScript {
     /** Put a value canonically: unknown entries are dropped (missing key
         already means unknown), which keeps states comparable. */
     private static void putKnown(Map<String, Bits> m, String key, Bits b) {
-        if (b.ones == 0 && b.zeroes == 0) {
+        // v7: a symbol entry (ones == 0, zeroes == 0, sym != null) is
+        // kept, not dropped: dropping it would erase the BAR symbol.
+        if (b.ones == 0 && b.zeroes == 0 && b.sym == null) {
             m.remove(key);
         } else {
             m.put(key, b);
@@ -1440,7 +1508,9 @@ public class ExtractIR extends GhidraScript {
                         dropMemRange(bvals, a, out.getSize(), true);
                         Bits vb = resolveBits(ins[0], bvals);
                         if (vb.ones != 0 || vb.zeroes != 0) {
-                            bvals.put(memKey(a, out.getSize()), vb);
+                            // v7 cfgspace: strip symbols (see STORE).
+                            bvals.put(memKey(a, out.getSize()),
+                                new Bits(vb.ones, vb.zeroes));
                         }
                     }
                 } else if (isRamSpace(ins[0]) &&
@@ -1471,6 +1541,36 @@ public class ExtractIR extends GhidraScript {
                 if (mnem.equals("INT_AND")) {
                     r = new Bits((a.ones & bb.ones) & mask,
                         (a.zeroes | bb.zeroes) & mask);
+                    // v7 cfgspace: memory-BAR flag masking. A raw BAR
+                    // ANDed with the flag mask (0xFFFFFFF0 for 32-bit,
+                    // 0xFFFFFFFFFFFFFFF0 for 64-bit) becomes a BASE
+                    // symbol. Any other mask, an already-masked
+                    // symbol, or a nonzero offset is dropped
+                    // (conservative): masking an offset symbol is not
+                    // in general equal to BASE + offset.
+                    Bits s0 = resolveBits(ins[0], bvals);
+                    Bits s1 = resolveBits(ins[1], bvals);
+                    Long m0 = resolveExact(ins[0], bvals);
+                    Long m1 = resolveExact(ins[1], bvals);
+                    String raw = null;
+                    long maskVal = 0;
+                    if (s0.sym != null && s0.sym.startsWith("BAR:") &&
+                        m1 != null) {
+                        raw = s0.sym;
+                        maskVal = m1;
+                    } else if (s1.sym != null &&
+                        s1.sym.startsWith("BAR:") && m0 != null) {
+                        raw = s1.sym;
+                        maskVal = m0;
+                    }
+                    if (raw != null && (maskVal == 0xFFFFFFF0L ||
+                        maskVal == 0xFFFFFFFFFFFFFFF0L)) {
+                        long[] p = Bits.parseBarSym(raw);
+                        if (p != null && p[5] == 0) {
+                            r = Bits.symBits(Bits.baseSym(p[1], p[2], p[3],
+                                p[4], 0), out.getSize());
+                        }
+                    }
                 } else if (mnem.equals("INT_OR")) {
                     r = new Bits((a.ones | bb.ones) & mask,
                         (a.zeroes & bb.zeroes) & mask);
@@ -1494,6 +1594,30 @@ public class ExtractIR extends GhidraScript {
                     else if (mnem.equals("INT_SUB")) r = a - b;
                     else r = a * b;
                     putKnown(bvals, vkey(out), Bits.exact(r, mask));
+                } else if (mnem.equals("INT_ADD") ||
+                    mnem.equals("INT_SUB")) {
+                    // v7 cfgspace: symbol + exact constant adjusts the
+                    // offset (either operand order for ADD; only the
+                    // minuend for SUB). Symbol + non-exact, or
+                    // constant - symbol, or any MULT, is unknown.
+                    Bits s0 = resolveBits(ins[0], bvals);
+                    Bits s1 = resolveBits(ins[1], bvals);
+                    Long e0 = resolveExact(ins[0], bvals);
+                    Long e1 = resolveExact(ins[1], bvals);
+                    String adj = null;
+                    if (s0.sym != null && e1 != null) {
+                        adj = Bits.adjustBarSym(s0.sym, mnem.equals("INT_ADD")
+                            ? e1 : -e1);
+                    } else if (mnem.equals("INT_ADD") &&
+                        s1.sym != null && e0 != null) {
+                        adj = Bits.adjustBarSym(s1.sym, e0);
+                    }
+                    if (adj != null) {
+                        putKnown(bvals, vkey(out),
+                            Bits.symBits(adj, out.getSize()));
+                    } else {
+                        putKnown(bvals, vkey(out), Bits.unknown());
+                    }
                 } else {
                     putKnown(bvals, vkey(out), Bits.unknown());
                 }
@@ -1561,8 +1685,15 @@ public class ExtractIR extends GhidraScript {
             Bits a = resolveBits(ins[0], bvals);
             long outMask = sizeMask(out.getSize());
             long inMask = sizeMask(ins[0].getSize());
-            putKnown(bvals, vkey(out), new Bits(a.ones & outMask,
-                (a.zeroes | ~inMask) & outMask));
+            // v7 cfgspace: zero-extension preserves the value, so it
+            // preserves the symbol. (Critical: Ghidra emits INT_ZEXT
+            // to the full register after every 32-bit write.)
+            if (a.sym != null) {
+                putKnown(bvals, vkey(out), Bits.symBits(a.sym, a.symW));
+            } else {
+                putKnown(bvals, vkey(out), new Bits(a.ones & outMask,
+                    (a.zeroes | ~inMask) & outMask));
+            }
         } else if (mnem.equals("INT_SEXT") && ins.length == 1 && out != null) {
             Bits a = resolveBits(ins[0], bvals);
             long outMask = sizeMask(out.getSize());
@@ -1612,7 +1743,13 @@ public class ExtractIR extends GhidraScript {
                     dropMemRange(bvals, addr.longValue(), sz, true);
                     Bits vb = resolveBits(ins[2], bvals);
                     if (vb.ones != 0 || vb.zeroes != 0) {
-                        bvals.put(memKey(addr.longValue(), sz), vb);
+                        // v7 cfgspace: symbols never enter memState
+                        // (defense in depth; the invariant already
+                        // excludes them since recording requires
+                        // known bits). BARs never flow through
+                        // memory in this slice.
+                        bvals.put(memKey(addr.longValue(), sz),
+                            new Bits(vb.ones, vb.zeroes));
                     }
                 } else if (addr == null) {
                     dropAllMem(bvals);
@@ -1645,7 +1782,68 @@ public class ExtractIR extends GhidraScript {
             // every store program-wide agrees on their value, so
             // no callee can change one to a different value.
             dropAllMem(bvals);
+            // v7 cfgspace: a callee may reprogram config space, so
+            // the latched CF8 address dies at the call. (A memory
+            // store does NOT kill it: the latch is CPU state, not
+            // memory. Seeded "gmem:" keys survive, as before.)
+            bvals.remove("cfg:addr");
             if (out != null) putKnown(bvals, vkey(out), Bits.unknown());
+        } else if (mnem.equals("CALLOTHER")) {
+            // v7 cfgspace: CF8/CFC config-space tracking. The
+            // "cfg:addr" cell holds the last OUT 0xCF8 value. Only a
+            // constant config address can yield a BAR symbol; only
+            // BAR registers (0x10..0x24) yield symbols; a CFC write
+            // dirties the latch (BAR sizing read-backs return a size
+            // mask, never a BAR base); an unknown port may be a CFC
+            // write, so it dirties the latch too. A config WRITE
+            // never creates a symbol. All other config reads stay
+            // unknown. RDMSR/WRMSR fall through to unknown out.
+            String am = op.instrAsm == null ? "" : op.instrAsm;
+            if (am.equalsIgnoreCase("OUT") && ins.length >= 3) {
+                Long port = resolveExact(ins[1], bvals);
+                if (port != null && port == 0xCF8L) {
+                    Bits val = resolveBits(ins[2], bvals);
+                    // Unknown value removes the cell (putKnown
+                    // drops 0/0 without sym), so a variable address
+                    // yields nothing downstream.
+                    putKnown(bvals, "cfg:addr", val);
+                } else if (port != null && port == 0xCFCL) {
+                    bvals.remove("cfg:addr");
+                } else if (port == null) {
+                    bvals.remove("cfg:addr");
+                }
+                // OUT to any other exact port: latch untouched.
+            } else if (am.equalsIgnoreCase("IN") && ins.length >= 2 &&
+                out != null) {
+                Long port = resolveExact(ins[1], bvals);
+                Bits cfg = bvals.get("cfg:addr");
+                Long cfgVal = cfg == null ? null :
+                    cfg.exactValue(0xFFFFFFFFL);
+                boolean made = false;
+                if (port != null && port == 0xCFCL &&
+                    cfgVal != null) {
+                    long v = cfgVal;
+                    // Bit 31 = enable; dword-aligned; BAR register.
+                    if ((v & 0x80000000L) != 0 && (v & 0x3L) == 0) {
+                        long reg = v & 0xFCL;
+                        if (reg >= 0x10 && reg <= 0x24) {
+                            long idx = (reg - 0x10) / 4;
+                            long bus = (v >>> 16) & 0xFFL;
+                            long dev = (v >>> 11) & 0x1FL;
+                            long fn = (v >>> 8) & 0x7L;
+                            putKnown(bvals, vkey(out),
+                                Bits.symBits(Bits.barSym(bus, dev, fn,
+                                    idx, 0), out.getSize()));
+                            made = true;
+                        }
+                    }
+                }
+                if (!made) {
+                    putKnown(bvals, vkey(out), Bits.unknown());
+                }
+            } else if (out != null) {
+                putKnown(bvals, vkey(out), Bits.unknown());
+            }
         } else {
             if (out != null) putKnown(bvals, vkey(out), Bits.unknown());
         }
@@ -1688,9 +1886,21 @@ public class ExtractIR extends GhidraScript {
                             o + s <= outOff + outSize) {
                             int sh = (int) (o - outOff) * 8;
                             long m = sizeMask(s);
+                            // v7 cfgspace: a derived view keeps the
+                            // symbol ONLY if it starts at the value
+                            // base and covers the symbol's full
+                            // width (see symW). Otherwise the view
+                            // is partial bits, not the symbol.
+                            String dsym = null;
+                            int dw = 0;
+                            if (outBits.sym != null && o == outOff &&
+                                s >= outBits.symW) {
+                                dsym = outBits.sym;
+                                dw = outBits.symW;
+                            }
                             derive.put(k, new Bits(
                                 (outBits.ones >>> sh) & m,
-                                (outBits.zeroes >>> sh) & m));
+                                (outBits.zeroes >>> sh) & m, dsym, dw));
                         } else {
                             drop.add(k);
                         }
@@ -1722,8 +1932,18 @@ public class ExtractIR extends GhidraScript {
             long ones = (x == null ? 0 : x.ones) & (y == null ? 0 : y.ones);
             long zeroes = (x == null ? 0 : x.zeroes) &
                 (y == null ? 0 : y.zeroes);
-            if (ones != 0 || zeroes != 0) {
-                r.put(k, new Bits(ones, zeroes));
+            // v7 cfgspace: a symbol survives the meet only if both
+            // sides carry the identical symbol (agree-or-drop, same
+            // rule as exact bits). A symbol on one side only dies.
+            String sym = null;
+            int symW = 0;
+            if (x != null && y != null && x.sym != null &&
+                x.sym.equals(y.sym) && x.symW == y.symW) {
+                sym = x.sym;
+                symW = x.symW;
+            }
+            if (ones != 0 || zeroes != 0 || sym != null) {
+                r.put(k, new Bits(ones, zeroes, sym, symW));
             }
         }
         return r;
@@ -1737,6 +1957,16 @@ public class ExtractIR extends GhidraScript {
             Bits o = b.get(e.getKey());
             if (o == null || o.ones != e.getValue().ones ||
                 o.zeroes != e.getValue().zeroes) {
+                return false;
+            }
+            // v7 cfgspace: a symbol change is a state change, or the
+            // fixpoint could stop while symbols still differ.
+            String s1 = e.getValue().sym;
+            String s2 = o.sym;
+            if (s1 == null ? s2 != null : !s1.equals(s2)) {
+                return false;
+            }
+            if (e.getValue().symW != o.symW) {
                 return false;
             }
         }
@@ -6071,6 +6301,7 @@ public class ExtractIR extends GhidraScript {
         int totalTailCallTargets = 0;
         int totalUnresolvedTail = 0;
         int totalProtoEdges = 0;
+        int totalBarRel = 0;
         // v3.5 pass 1: function-pointer store map for the whole
         // program, before any function is printed (may-edges need
         // cross-function stores). Best-effort: a failure here only
@@ -6820,6 +7051,8 @@ public class ExtractIR extends GhidraScript {
             List<String> may = new ArrayList<String>();
             List<String> portIo = new ArrayList<String>();
             List<String> msr = new ArrayList<String>();
+            // v7 cfgspace: BAR-relative findings (additive class).
+            List<String> barRel = new ArrayList<String>();
             Memory mem = currentProgram.getMemory();
             // Successors for the recording-time feasibility filter.
             List<List<Integer>> maySucc = buildSucc(ops, branchTargets);
@@ -7047,6 +7280,49 @@ public class ExtractIR extends GhidraScript {
                         }
                     }
                 }
+                // v7 cfgspace: BAR-relative findings. The access
+                // address is a BASE symbol (masked BAR + constant
+                // offset). This is a provenance statement (device
+                // BDF, BAR index, offset), never a fixed address:
+                // MUST-class is forbidden for symbolic values, and
+                // the may-trace parses hex addresses, so a symbolic
+                // address must not enter may_accesses either. Raw
+                // BAR symbols (unmasked flag bits) never yield a
+                // finding. Uses fx.inStates[i], the same mechanism
+                // the CALLOTHER port/MSR block above relies on.
+                // Guard null like the neighboring blocks: ops in
+                // unreached code have a null in-state, and
+                // resolveBits would NPE on it (hit on DxeCore,
+                // PciBusDxe, stripped BMP).
+                if (i < rec.fx.inStates.length &&
+                    rec.fx.inStates[i] != null) {
+                    Map<String, Bits> eb = rec.fx.inStates[i];
+                    Bits ab = null;
+                    int asz = 0;
+                    if (op.mnem.equals("LOAD") && op.out != null &&
+                        op.ins.length >= 2) {
+                        ab = resolveBits(op.ins[1], eb);
+                        asz = op.out.getSize();
+                    } else if (op.mnem.equals("STORE") &&
+                        op.ins.length >= 3) {
+                        ab = resolveBits(op.ins[1], eb);
+                        asz = op.ins[2].getSize();
+                    }
+                    if (ab != null && ab.sym != null) {
+                        long[] p = Bits.parseBarSym(ab.sym);
+                        if (p != null && p[0] == 1) {
+                            barRel.add("{\"instr\": \"" +
+                                op.instrAddr +
+                                "\", \"op\": \"" + op.mnem + "\"" +
+                                ", \"bus\": " + p[1] +
+                                ", \"device\": " + p[2] +
+                                ", \"function\": " + p[3] +
+                                ", \"bar\": " + p[4] +
+                                ", \"offset\": " + p[5] +
+                                ", \"size\": " + asz + "}");
+                        }
+                    }
+                }
             }
             // v2 item #3: protocol/BS call resolution from the
             // provenance fixpoint (Phase P). A resolved site is
@@ -7125,6 +7401,15 @@ public class ExtractIR extends GhidraScript {
             w.println();
             w.println("      ],");
             w.println("      \"msr_access_count\": " + msr.size() + ",");
+            w.println("      \"bar_relative_accesses\": [");
+            for (int i = 0; i < barRel.size(); i++) {
+                if (i > 0) w.println(",");
+                w.print("        " + barRel.get(i));
+            }
+            w.println();
+            w.println("      ],");
+            w.println("      \"bar_relative_access_count\": " +
+                barRel.size() + ",");
             w.println("      \"may_fixpoint_converged\": " + my.converged + ",");
             w.println("      \"indirect_calls\": [");
             for (int i = 0; i < ind.sites.size(); i++) {
@@ -7194,6 +7479,7 @@ public class ExtractIR extends GhidraScript {
             totalTailCallTargets += tc.targets;
             totalUnresolvedTail += tc.unresolved;
             totalProtoEdges += protoEdges.size();
+            totalBarRel += barRel.size();
             totalMmio += mmio.size();
             totalMay += may.size();
             totalPortIo += portIo.size();
@@ -7296,6 +7582,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"may_tail_call_target_total\": " + totalTailCallTargets + ",");
         w.println("  \"unresolved_tail_call_total\": " + totalUnresolvedTail + ",");
         w.println("  \"protocol_call_edge_total\": " + totalProtoEdges + ",");
+        w.println("  \"bar_relative_access_total\": " + totalBarRel + ",");
         w.println("  \"literal_scan\": {");
         w.println("    \"literal_count\": " + litScan.literalCount + ",");
         w.print("    \"attributed\": {");
@@ -7328,6 +7615,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  }");
         w.println("}");
         w.close();
+        println("[*] cfgspace: " + totalBarRel + " bar-relative findings");
         println("[+] JSON Export Complete: " + outputJson +
             " (" + fnCount + " functions, " + strCount + " strings)");
     }
