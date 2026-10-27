@@ -2482,6 +2482,26 @@ public class ExtractIR extends GhidraScript {
         return -1;
     }
 
+    /** v2 item #3, Prov-pass ONLY def lookup (window 200).
+        x86-64 P-Code expands each instruction into many ops, so
+        argument setup (e.g. an R9 GUID loaded 60+ ops before its
+        call) falls outside findDef's 40-op window and silently
+        fails to resolve. The wide window is deliberately NOT
+        applied to constprop/points-to: widening findDef globally
+        moved BMP may sets (step-3 precise resolution replacing
+        step-4 coarse offset sets at 40+ sites, may targets
+        1930 -> 1725) in ways not provably sound site-by-site, so
+        existing analyses keep their exact v3.9 behaviour and only
+        the new Prov pass uses the wide window. */
+    private static int findDefWide(List<OpRec> ops, String key,
+        int beforeIdx) {
+        for (int j = beforeIdx - 1; j >= 0 && j >= beforeIdx - 200; j--) {
+            Varnode out = ops.get(j).out;
+            if (out != null && vkey(out).equals(key)) return j;
+        }
+        return -1;
+    }
+
     private static class IndirectResult {
         final List<String> sites;
         final int edges;
@@ -3035,6 +3055,53 @@ public class ExtractIR extends GhidraScript {
         return null;
     }
 
+    /** v2 item #3: Prov-pass ONLY value resolver. Identical to
+        resolveValue except it uses findDefWide (see findDefWide):
+        GUID and interface-argument chains in x86-64 span more
+        than 40 P-Code ops. Existing analyses keep resolveValue. */
+    private Long resolveValueWide(Varnode v, List<OpRec> ops,
+        Memory mem, int pos, int depth) {
+        if (v.isConstant()) return v.getOffset();
+        String spName = v.getAddress().getAddressSpace().getName();
+        if (!spName.equals("register") && !spName.equals("unique") &&
+            !spName.equals("const")) {
+            try {
+                return isa.readPointer(mem, v.getAddress());
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        if (depth <= 0) return null;
+        int d = findDefWide(ops, vkey(v), pos);
+        if (d < 0) return null;
+        OpRec dd = ops.get(d);
+        if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
+            return resolveValueWide(dd.ins[0], ops, mem, d,
+                depth - 1);
+        }
+        if (dd.mnem.equals("INT_ADD") && dd.ins.length == 2) {
+            Long a = resolveValueWide(dd.ins[0], ops, mem, d,
+                depth - 1);
+            Long b = resolveValueWide(dd.ins[1], ops, mem, d,
+                depth - 1);
+            if (a != null && b != null) {
+                return a.longValue() + b.longValue();
+            }
+            return null;
+        }
+        if (dd.mnem.equals("LOAD") && dd.ins.length >= 2) {
+            Long a = resolveValueWide(dd.ins[1], ops, mem, d,
+                depth - 1);
+            if (a == null) return null;
+            try {
+                return isa.readPointer(mem, toAddr(a.longValue()));
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
     /** v3.6: shared indirect-target resolution for one indirect site
         (CALLIND or BRANCHIND) at index i. Unwraps the Thumb-bit
         INT_AND; with unwrapCopy also unwraps COPY chains (tail-call
@@ -3337,6 +3404,1403 @@ public class ExtractIR extends GhidraScript {
             unresolved++;
         }
         return new TailCallResult(out, targets, unresolved, targetNames);
+    }
+
+    // ---------------- v2 item #3: protocol-aware points-to ----------------
+    // UEFI protocol calls are indirect calls through a function-
+    // pointer table inside an interface struct. The interface itself
+    // is obtained via Boot Services (LocateProtocol / HandleProtocol
+    // / OpenProtocol, identified by a GUID argument) or installed
+    // (InstallProtocolInterface / InstallMultipleProtocolInterfaces).
+    // This pass tracks INTERFACE PROVENANCE: for each value, what
+    // protocol instance (if any) it certainly points to. A method
+    // call resolves only when the interface identity AND the method
+    // offset are both certain; anything ambiguous stays unknown
+    // (never a guessed must-finding). See the design note above
+    // runProvFixpoint.
+    //
+    // GUID byte order: EFI_GUID {UINT32, UINT16, UINT16, UINT8[8]}
+    // is stored little-endian for the first three fields, then the
+    // 8 Data4 bytes as written. Verified against the EDK2 headers
+    // (MdePkg/Include/Protocol/PciIo.h, UEFI spec 2.9A §14).
+    //
+    // Hardware-effect attribution (Pci.Read/Write -> CF8/CFC) is
+    // sound for THIS corpus because the platform host bridge driver
+    // (PciHostBridgeDxe.pe) implements config access with MOV
+    // ECX,0xcf8 + IN/OUT (verified in its disassembly). On an
+    // ECAM-only platform the mechanism differs; the attribution
+    // records the config cycle as the legacy CF8/CFC pair, which is
+    // the mechanism this corpus uses. All other protocol methods
+    // (BAR-relative Mem/Io, DMA Map/CopyMem, ...) have no fixed
+    // hardware effect and are recorded as edges only, never as
+    // fabricated port/MMIO accesses.
+    private static class ProtoField {
+        final String guid;
+        final boolean embedded;
+        ProtoField(String g, boolean e) { guid = g; embedded = e; }
+        public boolean equals(Object o) {
+            if (!(o instanceof ProtoField)) return false;
+            ProtoField p = (ProtoField) o;
+            return guid.equals(p.guid) && embedded == p.embedded;
+        }
+        public int hashCode() { return guid.hashCode() * 31 +
+            (embedded ? 1 : 0); }
+    }
+
+    /** Provenance of one value. Kinds: 0 unknown, 1 Boot Services
+        table pointer, 2 interface instance, 3 method function
+        pointer, 4 struct pointer (layout: field offset -> field),
+        5 method-slot pointer (address of a method slot), 6 pointer
+        to an interface-pointer field (LOAD yields the interface).
+        Only non-unknown values are stored in states (missing key
+        already means unknown), mirroring the Bits convention. */
+    private static class Prov {
+        static final int UNKNOWN = 0;
+        static final int BS = 1;
+        static final int IFACE = 2;
+        static final int METHOD = 3;
+        static final int STRUCT = 4;
+        static final int SLOT = 5;
+        static final int FIELDPTR = 6;
+        final int kind;
+        final String guid;
+        final long off;
+        final Map<Long, ProtoField> layout;
+        final Prov structProv;
+        final long fieldOff;
+        private Prov(int k, String g, long o,
+            Map<Long, ProtoField> l, Prov s, long f) {
+            kind = k; guid = g; off = o; layout = l; structProv = s;
+            fieldOff = f;
+        }
+        static Prov unknown() { return new Prov(UNKNOWN, null, 0,
+            null, null, 0); }
+        static Prov bs() { return new Prov(BS, "BS", 0, null, null, 0); }
+        static Prov iface(String g) { return new Prov(IFACE, g, 0,
+            null, null, 0); }
+        static Prov method(String g, long o) { return new Prov(METHOD,
+            g, o, null, null, 0); }
+        static Prov struct(Map<Long, ProtoField> l) { return new Prov(
+            STRUCT, null, 0, l, null, 0); }
+        static Prov slot(String g, long o) { return new Prov(SLOT,
+            g, o, null, null, 0); }
+        static Prov fieldPtr(Prov s, long f) { return new Prov(
+            FIELDPTR, null, 0, null, s, f); }
+        public boolean equals(Object o) {
+            if (!(o instanceof Prov)) return false;
+            Prov p = (Prov) o;
+            if (kind != p.kind) return false;
+            if (guid == null ? p.guid != null : !guid.equals(p.guid))
+                return false;
+            if (off != p.off || fieldOff != p.fieldOff) return false;
+            if (layout == null ? p.layout != null :
+                !layout.equals(p.layout)) return false;
+            if (structProv == null ? p.structProv != null :
+                !structProv.equals(p.structProv)) return false;
+            return true;
+        }
+        public int hashCode() {
+            int h = kind * 31 + (int) off + (int) fieldOff;
+            if (guid != null) h = h * 31 + guid.hashCode();
+            if (layout != null) h = h * 31 + layout.hashCode();
+            if (structProv != null) h = h * 31 + structProv.hashCode();
+            return h;
+        }
+        public String toString() {
+            switch (kind) {
+                case BS: return "BS";
+                case IFACE: return "IFACE(" + guid + ")";
+                case METHOD: return "METHOD(" + guid + ",0x" +
+                    Long.toHexString(off) + ")";
+                case STRUCT: return "STRUCT(" + layout + ")";
+                case SLOT: return "SLOT(" + guid + ",0x" +
+                    Long.toHexString(off) + ")";
+                case FIELDPTR: return "FIELDPTR(" + structProv + "," +
+                    fieldOff + ")";
+                default: return "UNKNOWN";
+            }
+        }
+    }
+
+    /** One known protocol: GUID bytes + method offset -> name. */
+    private static class ProtoInfo {
+        final String name;
+        final byte[] guidBytes;
+        final Map<Long, String> methods;
+        ProtoInfo(String n, byte[] g, String[][] m) {
+            name = n; guidBytes = g;
+            methods = new HashMap<Long, String>();
+            for (String[] e : m) {
+                methods.put(Long.parseLong(e[0], 16), e[1]);
+            }
+        }
+    }
+
+    private static byte[] guidBytes(long d1, int d2, int d3,
+        int b0, int b1, int b2, int b3, int b4, int b5, int b6,
+        int b7) {
+        return new byte[] {
+            (byte) d1, (byte) (d1 >>> 8), (byte) (d1 >>> 16),
+            (byte) (d1 >>> 24), (byte) d2, (byte) (d2 >>> 8),
+            (byte) d3, (byte) (d3 >>> 8),
+            (byte) b0, (byte) b1, (byte) b2, (byte) b3,
+            (byte) b4, (byte) b5, (byte) b6, (byte) b7 };
+    }
+
+    private static List<ProtoInfo> protoTable() {
+        List<ProtoInfo> t = new ArrayList<ProtoInfo>();
+        t.add(new ProtoInfo("PciIo",
+            guidBytes(0x4cf5b200L, 0x68b8, 0x4ca5,
+                0x9e, 0xec, 0xb2, 0x3e, 0x3f, 0x50, 0x02, 0x9a),
+            new String[][] {
+                {"0", "PollMem"}, {"8", "PollIo"},
+                {"10", "Mem.Read"}, {"18", "Mem.Write"},
+                {"20", "Io.Read"}, {"28", "Io.Write"},
+                {"30", "Pci.Read"}, {"38", "Pci.Write"},
+                {"40", "CopyMem"}, {"48", "Map"}, {"50", "Unmap"},
+                {"58", "AllocateBuffer"}, {"60", "FreeBuffer"},
+                {"68", "Flush"}, {"70", "GetLocation"},
+                {"78", "Attributes"}, {"80", "GetBarAttributes"},
+                {"88", "SetBarAttributes"}}));
+        t.add(new ProtoInfo("PciRootBridgeIo",
+            guidBytes(0x2f707ebbL, 0x4a1a, 0x11d4,
+                0x9a, 0x38, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d),
+            new String[][] {
+                {"8", "PollMem"}, {"10", "PollIo"},
+                {"18", "Mem.Read"}, {"20", "Mem.Write"},
+                {"28", "Io.Read"}, {"30", "Io.Write"},
+                {"38", "Pci.Read"}, {"40", "Pci.Write"},
+                {"48", "CopyMem"}, {"50", "Map"}, {"58", "Unmap"},
+                {"60", "AllocateBuffer"}, {"68", "FreeBuffer"},
+                {"70", "Flush"}, {"78", "GetAttributes"},
+                {"80", "SetAttributes"}, {"88", "Configuration"}}));
+        return t;
+    }
+
+    /** EFI_BOOT_SERVICES method offsets (x86-64, 8-byte pointers,
+        24-byte EFI_TABLE_HEADER first). Only the methods this pass
+        reasons about are listed; anything else is "unknown BS
+        method" (still a resolved edge, never a finding). */
+    private static Map<Long, String> bsMethods() {
+        Map<Long, String> m = new HashMap<Long, String>();
+        m.put(0x18L, "RaiseTPL"); m.put(0x20L, "RestoreTPL");
+        m.put(0x28L, "AllocatePages"); m.put(0x30L, "FreePages");
+        m.put(0x38L, "GetMemoryMap"); m.put(0x40L, "AllocatePool");
+        m.put(0x48L, "FreePool"); m.put(0x50L, "CreateEvent");
+        m.put(0x58L, "SetTimer"); m.put(0x60L, "WaitForEvent");
+        m.put(0x68L, "SignalEvent"); m.put(0x70L, "CloseEvent");
+        m.put(0x78L, "CheckEvent");
+        m.put(0x80L, "InstallProtocolInterface");
+        m.put(0x88L, "ReinstallProtocolInterface");
+        m.put(0x90L, "UninstallProtocolInterface");
+        m.put(0x98L, "HandleProtocol");
+        m.put(0xa8L, "RegisterProtocolNotify");
+        m.put(0xb0L, "LocateHandle"); m.put(0xb8L, "LocateDevicePath");
+        m.put(0xc0L, "InstallConfigurationTable");
+        m.put(0xc8L, "LoadImage"); m.put(0xd0L, "StartImage");
+        m.put(0xd8L, "Exit"); m.put(0xe0L, "UnloadImage");
+        m.put(0xe8L, "ExitBootServices");
+        m.put(0xf0L, "GetNextMonotonicCount"); m.put(0xf8L, "Stall");
+        m.put(0x100L, "SetWatchdogTimer");
+        m.put(0x108L, "ConnectController");
+        m.put(0x110L, "DisconnectController");
+        m.put(0x118L, "OpenProtocol"); m.put(0x120L, "CloseProtocol");
+        m.put(0x128L, "OpenProtocolInformation");
+        m.put(0x130L, "ProtocolsPerHandle");
+        m.put(0x138L, "LocateHandleBuffer");
+        m.put(0x140L, "LocateProtocol");
+        m.put(0x148L, "InstallMultipleProtocolInterfaces");
+        m.put(0x150L, "UninstallMultipleProtocolInterfaces");
+        m.put(0x158L, "CalculateCrc32"); m.put(0x160L, "CopyMem");
+        m.put(0x168L, "SetMem"); m.put(0x170L, "CreateEventEx");
+        return m;
+    }
+
+    /** Read 16 bytes at a program address; null if unreadable. */
+    private byte[] readGuidBytes(Memory mem, long addr) {
+        try {
+            Address a = toAddr(addr);
+            byte[] b = new byte[16];
+            for (int i = 0; i < 16; i++) {
+                b[i] = mem.getByte(a.add(i));
+            }
+            return b;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static boolean guidEquals(byte[] a, byte[] b) {
+        if (a == null || b == null || a.length != 16 ||
+            b.length != 16) return false;
+        for (int i = 0; i < 16; i++) {
+            if (a[i] != b[i]) return false;
+        }
+        return true;
+    }
+
+    /** Match 16 GUID bytes against the table; null if unknown. */
+    private static String matchGuid(byte[] b, List<ProtoInfo> t) {
+        if (b == null) return null;
+        for (ProtoInfo p : t) {
+            if (guidEquals(b, p.guidBytes)) return p.name;
+        }
+        return null;
+    }
+
+    private static ProtoInfo protoByName(String name,
+        List<ProtoInfo> t) {
+        for (ProtoInfo p : t) {
+            if (p.name.equals(name)) return p;
+        }
+        return null;
+    }
+
+    /** One provenance state: varnode provenances, stack-slot
+        provenances (RSP/RBP-relative locals), and function-local
+        global assignments. Unknown = absent key (mirroring Bits).
+        Slots and globals are memory: they survive across
+        instructions, unlike unique varnodes (stripped by
+        stripProvUniques on cross-instruction propagation). */
+    private static class ProvState {
+        final Map<String, Prov> varProv;
+        final Map<String, Prov> slotProv;
+        final Map<Long, Prov> globalProv;
+        ProvState() {
+            varProv = new HashMap<String, Prov>();
+            slotProv = new HashMap<String, Prov>();
+            globalProv = new HashMap<Long, Prov>();
+        }
+        ProvState(ProvState o) {
+            varProv = new HashMap<String, Prov>(o.varProv);
+            slotProv = new HashMap<String, Prov>(o.slotProv);
+            globalProv = new HashMap<Long, Prov>(o.globalProv);
+        }
+        boolean sameAs(ProvState o) {
+            if (o == null) return false;
+            return varProv.equals(o.varProv) &&
+                slotProv.equals(o.slotProv) &&
+                globalProv.equals(o.globalProv);
+        }
+    }
+
+    private static class ProvResult {
+        final ProvState[] inStates;
+        final boolean converged;
+        ProvResult(ProvState[] s, boolean c) {
+            inStates = s; converged = c;
+        }
+    }
+
+    /** Context for the provenance fixpoint (per program run). */
+    private static class ProvCtx {
+        Memory mem;
+        Set<Long> gbsAddrs;
+        Map<Long, Prov> globalProvPre;
+        List<ProtoInfo> protos;
+        Map<Long, String> bsMethods;
+        long rspOff;
+        long rbpOff;
+    }
+
+    /** Meet of two provenances: equal stays, STRUCT layouts meet
+        by field intersection, anything else becomes unknown
+        (dropped). This is the certainty lattice: a value is a
+        known interface only if EVERY path agrees. */
+    private static Prov meetProv(Prov a, Prov b) {
+        // Null here means "unknown on that path" (the state exists
+        // but lacks the key), NOT "unreachable": a certain value
+        // meeting unknown becomes unknown. State-level null
+        // (unreachable) is handled by meetProvState, never here.
+        if (a == null || b == null) return null;
+        if (a.equals(b)) return a;
+        if (a.kind == Prov.STRUCT && b.kind == Prov.STRUCT) {
+            Map<Long, ProtoField> inter =
+                new HashMap<Long, ProtoField>();
+            for (Map.Entry<Long, ProtoField> e :
+                a.layout.entrySet()) {
+                ProtoField o = b.layout.get(e.getKey());
+                if (o != null && o.equals(e.getValue())) {
+                    inter.put(e.getKey(), e.getValue());
+                }
+            }
+            return Prov.struct(inter);
+        }
+        return null;
+    }
+
+    private static ProvState meetProvState(ProvState a,
+        ProvState b) {
+        if (a == null) return b;
+        if (b == null) return a;
+        ProvState out = new ProvState();
+        for (Map.Entry<String, Prov> e : a.varProv.entrySet()) {
+            Prov m = meetProv(e.getValue(), b.varProv.get(e.getKey()));
+            if (m != null) out.varProv.put(e.getKey(), m);
+        }
+        for (Map.Entry<String, Prov> e : a.slotProv.entrySet()) {
+            Prov m = meetProv(e.getValue(), b.slotProv.get(e.getKey()));
+            if (m != null) out.slotProv.put(e.getKey(), m);
+        }
+        for (Map.Entry<Long, Prov> e : a.globalProv.entrySet()) {
+            Prov m = meetProv(e.getValue(), b.globalProv.get(e.getKey()));
+            if (m != null) out.globalProv.put(e.getKey(), m);
+        }
+        return out;
+    }
+
+    private static ProvState stripProvUniques(ProvState s) {
+        ProvState out = new ProvState();
+        for (Map.Entry<String, Prov> e : s.varProv.entrySet()) {
+            if (!e.getKey().startsWith("unique:")) {
+                out.varProv.put(e.getKey(), e.getValue());
+            }
+        }
+        out.slotProv.putAll(s.slotProv);
+        out.globalProv.putAll(s.globalProv);
+        return out;
+    }
+
+    /** Provenance fixpoint: mirrors runFixpoint's CFG and
+        cross-instruction unique stripping, but over Prov states.
+        Entry state binds the callee's argument registers (from
+        inter-procedural parameter propagation); a loop back to op
+        0 meets into it, so an entry provenance survives only if
+        no loop path redefines it. Non-convergence falls back to
+        all-unknown (sound: claim nothing). */
+    private ProvResult runProvFixpoint(List<OpRec> ops,
+        Map<Integer, List<Integer>> branchTargets,
+        Map<String, Prov> entry, ProvCtx ctx) {
+        int n = ops.size();
+        ProvState[] in = new ProvState[n];
+        if (n == 0) return new ProvResult(in, true);
+        in[0] = new ProvState();
+        if (entry != null) in[0].varProv.putAll(entry);
+        List<List<Integer>> succ = buildSucc(ops, branchTargets);
+        boolean converged = false;
+        for (int round = 0; round < MAX_FIXPOINT_ROUNDS &&
+            !converged; round++) {
+            boolean changed = false;
+            for (int i = 0; i < n; i++) {
+                if (in[i] == null) continue;
+                ProvState out = new ProvState(in[i]);
+                applyProvTransfer(out, ops.get(i), ops, i, ctx);
+                for (int j : succ.get(i)) {
+                    ProvState prop = out;
+                    if (!ops.get(j).instrAddr.equals(
+                        ops.get(i).instrAddr)) {
+                        prop = stripProvUniques(out);
+                    }
+                    ProvState merged = meetProvState(in[j], prop);
+                    if (in[j] == null || !in[j].sameAs(merged)) {
+                        in[j] = merged;
+                        changed = true;
+                    }
+                }
+            }
+            if (!changed) converged = true;
+        }
+        if (!converged) {
+            for (int i = 0; i < n; i++) in[i] = new ProvState();
+        }
+        return new ProvResult(in, converged);
+    }
+
+    /** Drop every provenance for one register offset (all sizes):
+        any write to a register kills certainty for all its views
+        (a narrow write still changes the full value). */
+    private static void killReg(ProvState st, String space, long off) {
+        String pfx = space + ":" + off + ":";
+        List<String> dead = new ArrayList<String>();
+        for (String k : st.varProv.keySet()) {
+            if (k.startsWith(pfx)) dead.add(k);
+        }
+        for (String k : dead) st.varProv.remove(k);
+    }
+
+    private static void setProv(ProvState st, Varnode v, Prov p) {
+        if (v == null) return;
+        String space = v.getAddress().getAddressSpace().getName();
+        if (!space.equals("unique")) {
+            killReg(st, space, v.getOffset());
+        }
+        if (p == null || p.kind == Prov.UNKNOWN) {
+            st.varProv.remove(vkey(v));
+        } else {
+            st.varProv.put(vkey(v), p);
+        }
+    }
+
+    private static Prov getProv(ProvState st, Varnode v) {
+        if (v == null) return null;
+        return st.varProv.get(vkey(v));
+    }
+
+    /** Resolve an RBP-relative stack slot key for an address
+        varnode, following COPY chains and INT_ADD(RBP, c). Only
+        RBP slots are tracked: RSP moves with pushes/subs, so an
+        RSP-relative offset does not identify a stable slot, and
+        tracking it would alias distinct memory (unsound). RBP is
+        the frame pointer, stable after the prologue; any direct
+        RBP write clears all RBP slots (see applyProvTransfer). */
+    private static String rbpSlotOf(Varnode v, List<OpRec> ops,
+        int pos, ProvCtx ctx) {
+        Varnode cur = v;
+        for (int hop = 0; hop < 5; hop++) {
+            if (cur == null) return null;
+            String sp = cur.getAddress().getAddressSpace().getName();
+            if (sp.equals("register") && cur.getOffset() == ctx.rbpOff) {
+                return "rbp:0";
+            }
+            int d = findDefWide(ops, vkey(cur), pos);
+            if (d < 0) return null;
+            OpRec dd = ops.get(d);
+            if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
+                cur = dd.ins[0];
+                continue;
+            }
+            if (dd.mnem.equals("INT_ADD") && dd.ins.length == 2) {
+                for (int s = 0; s < 2; s++) {
+                    if (dd.ins[s].isConstant()) {
+                        Varnode o = dd.ins[1 - s];
+                        String osp = o.getAddress().getAddressSpace()
+                            .getName();
+                        if (osp.equals("register") &&
+                            o.getOffset() == ctx.rbpOff) {
+                            return "rbp:" + dd.ins[s].getOffset();
+                        }
+                        // One COPY hop to RBP.
+                        int d2 = findDefWide(ops, vkey(o), d);
+                        if (d2 >= 0) {
+                            OpRec dd2 = ops.get(d2);
+                            if (dd2.mnem.equals("COPY") &&
+                                dd2.ins.length == 1) {
+                                Varnode o2 = dd2.ins[0];
+                                String o2sp = o2.getAddress()
+                                    .getAddressSpace().getName();
+                                if (o2sp.equals("register") && o2
+                                    .getOffset() == ctx.rbpOff) {
+                                    return "rbp:" +
+                                        dd.ins[s].getOffset();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /** Struct-field access for an address varnode: follows COPY
+        chains to INT_ADD(structBase, constOff) where the base's
+        provenance in the state is a STRUCT. Returns
+        {baseKey, fieldOff, structProv} or null. */
+    private static Object[] structFieldOf(Varnode v, List<OpRec> ops,
+        int pos, ProvState st) {
+        Varnode cur = v;
+        for (int hop = 0; hop < 5; hop++) {
+            if (cur == null) return null;
+            int d = findDefWide(ops, vkey(cur), pos);
+            if (d < 0) return null;
+            OpRec dd = ops.get(d);
+            if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
+                cur = dd.ins[0];
+                continue;
+            }
+            if (dd.mnem.equals("INT_ADD") && dd.ins.length == 2) {
+                for (int s = 0; s < 2; s++) {
+                    if (dd.ins[s].isConstant()) {
+                        Varnode o = dd.ins[1 - s];
+                        Prov bp = getProv(st, o);
+                        if (bp != null && bp.kind == Prov.STRUCT) {
+                            return new Object[] {vkey(o),
+                                dd.ins[s].getOffset(), bp};
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /** Resolve a GUID argument (a register holding a pointer to 16
+        GUID bytes in the image) to a protocol name; null if the
+        pointer does not resolve or the GUID is unknown. Uses the
+        def-chain resolver (COPY / INT_ADD / LOAD), never a guess.
+        Tries the full register width, then a 32-bit view (a small
+        image address may be set with a 32-bit MOV, zero-extended). */
+    private String resolveGuidArg(long regOff, List<OpRec> ops,
+        Memory mem, int pos, ProvCtx ctx) {
+        int[] sizes = new int[] {isa.pointerSize(), 4};
+        for (int sz : sizes) {
+            Varnode arg = regVarnode(regOff, sz);
+            if (arg == null) continue;
+            Long addr = resolveValueWide(arg, ops, mem, pos, 6);
+            if (addr == null) continue;
+            byte[] b = readGuidBytes(mem, addr.longValue());
+            String g = matchGuid(b, ctx.protos);
+            if (g != null) return g;
+        }
+        return null;
+    }
+
+    /** Resolve a GUID value varnode (a register or stack slot
+        holding a GUID address) to a protocol name; null if the
+        address does not resolve or the GUID is unknown. */
+    private String resolveGuidValue(Varnode v, List<OpRec> ops,
+        Memory mem, int pos, ProvCtx ctx) {
+        if (v == null) return null;
+        Long addr = resolveValueWide(v, ops, mem, pos, 6);
+        if (addr == null) return null;
+        byte[] b = readGuidBytes(mem, addr.longValue());
+        return matchGuid(b, ctx.protos);
+    }
+
+    /** True when a STORE is a PUSH: address = RSP, and RSP's def
+        is INT_SUB(RSP, 8). (Ghidra lifts x86 PUSH as SUB + STORE;
+        the return-address push inside a CALL instruction is
+        excluded by the caller skipping the call's own ops.) */
+    private static boolean isPushStore(List<OpRec> ops, int sIdx,
+        ProvCtx ctx) {
+        OpRec op = ops.get(sIdx);
+        if (!op.mnem.equals("STORE") || op.ins.length < 3) {
+            return false;
+        }
+        Varnode av = op.ins[1];
+        if (av == null || !av.isRegister() ||
+            av.getOffset() != ctx.rspOff) return false;
+        int d = findDefWide(ops, vkey(av), sIdx);
+        if (d < 0) return false;
+        OpRec dd = ops.get(d);
+        if (!dd.mnem.equals("INT_SUB") || dd.ins.length != 2) {
+            return false;
+        }
+        for (int s = 0; s < 2; s++) {
+            if (dd.ins[s].isConstant() &&
+                dd.ins[s].getOffset() == 8L) return true;
+        }
+        return false;
+    }
+
+    /** Stack argument values via the PUSH pattern, in order
+        (stack0 first = most recent push). Skips the call's own
+        P-Code (its return-address push). Stops at any CALL /
+        BRANCH / RET (pushes beyond belong to another call) and
+        at the scan window (200 ops). The InstallMultiple list is
+        NULL-terminated, so prologue pushes beyond the terminator
+        are never interpreted as pairs. */
+    private static List<Varnode> readStackArgsPush(List<OpRec> ops,
+        int pos, ProvCtx ctx) {
+        List<Varnode> out = new ArrayList<Varnode>();
+        Address callAddr = ops.get(pos).instrAddr;
+        int i = pos - 1;
+        while (i >= 0 && ops.get(i).instrAddr.equals(callAddr)) {
+            i--;
+        }
+        for (; i >= Math.max(0, pos - 200) && out.size() < 16; i--) {
+            OpRec op = ops.get(i);
+            String m = op.mnem;
+            if (m.equals("CALL") || m.equals("CALLIND") ||
+                m.equals("BRANCH") || m.equals("BRANCHIND") ||
+                m.equals("RETURN") || m.equals("RET")) {
+                break;
+            }
+            if (m.equals("STORE") && isPushStore(ops, i, ctx)) {
+                out.add(op.ins[2]);
+            }
+        }
+        return out;
+    }
+
+    /** Stack argument values via the MOV pattern: stack arg k is
+        the value most recently stored to [RSP + 0x20 + 8k] with no
+        RSP write between that store and the call (the call's own
+        P-Code excluded). Returns the longest valid prefix
+        (stack0, stack1, ...); empty when slot 0 has no valid
+        store. */
+    private static List<Varnode> readStackArgsMov(List<OpRec> ops,
+        int pos, ProvCtx ctx) {
+        List<Varnode> out = new ArrayList<Varnode>();
+        Address callAddr = ops.get(pos).instrAddr;
+        for (int k = 0; k < 16; k++) {
+            long want = 0x20L + 8L * k;
+            int found = -1;
+            for (int i = pos - 1; i >= Math.max(0, pos - 200); i--) {
+                if (ops.get(i).instrAddr.equals(callAddr)) continue;
+                OpRec op = ops.get(i);
+                if (!op.mnem.equals("STORE") ||
+                    op.ins.length < 3) continue;
+                Varnode av = op.ins[1];
+                int da = findDefWide(ops, vkey(av), i);
+                if (da < 0) continue;
+                OpRec ad = ops.get(da);
+                if (!ad.mnem.equals("INT_ADD") ||
+                    ad.ins.length != 2) continue;
+                Long c = null;
+                Varnode b = null;
+                for (int s = 0; s < 2; s++) {
+                    if (ad.ins[s].isConstant()) {
+                        c = ad.ins[s].getOffset();
+                        b = ad.ins[1 - s];
+                    }
+                }
+                if (c == null || c.longValue() != want ||
+                    b == null || !b.isRegister() ||
+                    b.getOffset() != ctx.rspOff) continue;
+                found = i;
+                break;
+            }
+            if (found < 0) break;
+            // No RSP write between the store and the call (call's
+            // own P-Code excluded: its return-address SUB is not
+            // an arg-setup change).
+            boolean rspMoved = false;
+            for (int j = found + 1; j < pos; j++) {
+                if (ops.get(j).instrAddr.equals(callAddr)) continue;
+                Varnode o = ops.get(j).out;
+                if (o != null && o.isRegister() &&
+                    o.getOffset() == ctx.rspOff) {
+                    rspMoved = true;
+                    break;
+                }
+            }
+            if (rspMoved) break;
+            out.add(ops.get(found).ins[2]);
+        }
+        return out;
+    }
+
+    /** Stack argument values (stack0, stack1, ...) for a call:
+        PUSH pattern first (the common InstallMultiple shape),
+        else MOV pattern. Empty when neither pattern yields a
+        slot-0 value. */
+    private static List<Varnode> readStackArgs(List<OpRec> ops,
+        int pos, ProvCtx ctx) {
+        List<Varnode> push = readStackArgsPush(ops, pos, ctx);
+        if (!push.isEmpty()) return push;
+        return readStackArgsMov(ops, pos, ctx);
+    }
+
+    /** True when register regV holds the same value as baseV at
+        op pos: regV's COPY-chain reaches baseV, and baseV was not
+        redefined between that COPY and pos. (Each link uses the
+        most-recent def, so intermediate redefinitions are already
+        excluded: a redefined intermediate would resolve to its
+        newer def, breaking the chain.) This is the "parameter
+        saved to a callee-saved register before learning" case:
+        without it, a layout learned for RSI never reaches the
+        R14 copy the function actually uses. */
+    private static boolean isCopyAlias(List<OpRec> ops, int pos,
+        Varnode regV, Varnode baseV) {
+        String baseKey = vkey(baseV);
+        Varnode cur = regV;
+        int curPos = pos;
+        for (int hop = 0; hop < 8; hop++) {
+            if (cur == null) return false;
+            int d = findDefWide(ops, vkey(cur), curPos);
+            if (d < 0) return false;
+            OpRec dd = ops.get(d);
+            if (!dd.mnem.equals("COPY") || dd.ins.length != 1) {
+                return false;
+            }
+            cur = dd.ins[0];
+            curPos = d;
+            if (vkey(cur).equals(baseKey)) {
+                for (int j = d + 1; j < pos; j++) {
+                    Varnode o = ops.get(j).out;
+                    if (o != null && vkey(o).equals(baseKey)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Learn an installed interface: interface arg = INT_ADD(base,
+        F) (an embedded instance at base+F) or a bare register
+        holding the instance pointer. Updates the base's STRUCT
+        layout (or the register) in the post-call state. */
+    /** Find the most recent STORE to an RBP slot before pos
+        (scan window 200 ops); -1 if none. Used to follow an
+        interface pointer that was staged through a stack slot
+        (the InstallMultiple PUSH pattern). */
+    private static int findSlotStore(List<OpRec> ops, String slot,
+        int pos, ProvCtx ctx) {
+        for (int i = pos - 1; i >= Math.max(0, pos - 200); i--) {
+            OpRec op = ops.get(i);
+            if (!op.mnem.equals("STORE") || op.ins.length < 3) {
+                continue;
+            }
+            String s = rbpSlotOf(op.ins[1], ops, i, ctx);
+            if (slot.equals(s)) return i;
+        }
+        return -1;
+    }
+
+    private void learnInstall(Varnode ifaceArg, String guid,
+        List<OpRec> ops, int pos, ProvState st, ProvCtx ctx) {
+        if (guid == null || ifaceArg == null) return;
+        Varnode cur = ifaceArg;
+        int curPos = pos;
+        for (int hop = 0; hop < 8; hop++) {
+            if (cur == null) return;
+            int d = findDefWide(ops, vkey(cur), curPos);
+            if (d < 0) break;
+            OpRec dd = ops.get(d);
+            if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
+                cur = dd.ins[0];
+                curPos = d;
+                continue;
+            }
+            // Interface staged through a stack slot (InstallMultiple
+            // PUSH pattern): follow the slot's STORE to its value.
+            if (dd.mnem.equals("LOAD") && dd.ins.length >= 2) {
+                String slot = rbpSlotOf(dd.ins[1], ops, d, ctx);
+                if (slot != null) {
+                    int sIdx = findSlotStore(ops, slot, d, ctx);
+                    if (sIdx >= 0) {
+                        cur = ops.get(sIdx).ins[2];
+                        curPos = sIdx;
+                        continue;
+                    }
+                }
+                break;
+            }
+            if (dd.mnem.equals("INT_ADD") && dd.ins.length == 2) {
+                for (int s = 0; s < 2; s++) {
+                    if (dd.ins[s].isConstant()) {
+                        Varnode o = dd.ins[1 - s];
+                        Prov bp = getProv(st, o);
+                        if (bp != null && bp.kind != Prov.STRUCT) {
+                            return;
+                        }
+                        Map<Long, ProtoField> nl =
+                            new HashMap<Long, ProtoField>();
+                        if (bp != null && bp.layout != null) {
+                            nl.putAll(bp.layout);
+                        }
+                        nl.put(dd.ins[s].getOffset(),
+                            new ProtoField(guid, true));
+                        Prov learned = Prov.struct(nl);
+                        setProv(st, o, learned);
+                        // Alias update: registers holding the same
+                        // value as the base (e.g. a parameter
+                        // saved to a callee-saved register before
+                        // this call) share the learned layout.
+                        // RSP/RBP excluded defensively (frame).
+                        long[] gprs = new long[] {0x0L, 0x8L, 0x10L,
+                            0x18L, 0x30L, 0x38L, 0x80L, 0x88L, 0x90L,
+                            0x98L, 0xa0L, 0xa8L, 0xb0L, 0xb8L};
+                        for (long ro : gprs) {
+                            Varnode rv = regVarnode(ro,
+                                isa.pointerSize());
+                            if (rv == null ||
+                                vkey(rv).equals(vkey(o))) continue;
+                            if (isCopyAlias(ops, pos, rv, o)) {
+                                setProv(st, rv, learned);
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+            break;
+        }
+        // Bare register holding the instance pointer.
+        setProv(st, ifaceArg, Prov.iface(guid));
+    }
+
+    /** Bind an acquired interface (out-param of Locate / Handle /
+        OpenProtocol) to its destination: an RBP stack slot, a
+        struct field (pointer field), or a global. Anything else is
+        left unbound (sound: no binding, no finding). */
+    private void bindAcquisition(Varnode outArg, String guid,
+        List<OpRec> ops, int pos, ProvState st, ProvCtx ctx) {
+        if (guid == null || outArg == null) return;
+        String slot = rbpSlotOf(outArg, ops, pos, ctx);
+        if (slot != null) {
+            st.slotProv.put(slot, Prov.iface(guid));
+            return;
+        }
+        Object[] sf = structFieldOf(outArg, ops, pos, st);
+        if (sf != null) {
+            String baseKey = (String) sf[0];
+            long f = (Long) sf[1];
+            Prov bp = (Prov) sf[2];
+            Map<Long, ProtoField> nl =
+                new HashMap<Long, ProtoField>(bp.layout);
+            nl.put(f, new ProtoField(guid, false));
+            // Rewrite the base varnode's provenance: find the
+            // varnode by key (space:offset:size) -- the key alone
+            // is enough for the state map.
+            st.varProv.put(baseKey, Prov.struct(nl));
+            return;
+        }
+        Long addr = resolveValueWide(outArg, ops, ctx.mem, pos, 6);
+        if (addr != null) {
+            st.globalProv.put(addr.longValue(), Prov.iface(guid));
+        }
+    }
+
+    /** The provenance transfer for one op. Mutates st (the
+        out-state). BS acquisition/install side effects are applied
+        here (post-clobber); method attribution itself happens at
+        emission from the final in-states. */
+    private void applyProvTransfer(ProvState st, OpRec op,
+        List<OpRec> ops, int idx, ProvCtx ctx) {
+        String mnem = op.mnem;
+        // Any direct RBP write clears RBP slots (frame pointer
+        // moved: old slot provenances no longer identify memory).
+        if (op.out != null) {
+            String osp = op.out.getAddress().getAddressSpace()
+                .getName();
+            if (osp.equals("register") &&
+                op.out.getOffset() == ctx.rbpOff) {
+                st.slotProv.clear();
+            }
+        }
+        if (mnem.equals("COPY")) {
+            if (op.ins.length >= 1) {
+                Varnode src = op.ins[0];
+                String ssp = src.getAddress().getAddressSpace()
+                    .getName();
+                // x86 absolute-address load: MOV reg, [addr] is a
+                // COPY from a ram varnode, not a LOAD op. Treat it
+                // as a global read (this is where gBS lives).
+                if (!ssp.equals("register") &&
+                    !ssp.equals("unique") &&
+                    !ssp.equals("const")) {
+                    Prov gp = st.globalProv.get(src.getOffset());
+                    if (gp == null && ctx.globalProvPre != null) {
+                        gp = ctx.globalProvPre.get(src.getOffset());
+                    }
+                    setProv(st, op.out, gp);
+                } else {
+                    Prov p = getProv(st, src);
+                    setProv(st, op.out, p);
+                }
+            } else {
+                setProv(st, op.out, null);
+            }
+            return;
+        }
+        if (mnem.equals("INT_ADD") && op.ins.length == 2) {
+            for (int s = 0; s < 2; s++) {
+                if (op.ins[s].isConstant()) {
+                    Prov bp = getProv(st, op.ins[1 - s]);
+                    long c = op.ins[s].getOffset();
+                    if (bp == null) {
+                        setProv(st, op.out, null);
+                    } else if (bp.kind == Prov.IFACE) {
+                        setProv(st, op.out, Prov.slot(bp.guid, c));
+                    } else if (bp.kind == Prov.BS) {
+                        setProv(st, op.out, Prov.slot("BS", c));
+                    } else if (bp.kind == Prov.STRUCT) {
+                        ProtoField fld = bp.layout.get(c);
+                        if (fld == null) {
+                            setProv(st, op.out, null);
+                        } else if (fld.embedded) {
+                            setProv(st, op.out,
+                                Prov.iface(fld.guid));
+                        } else {
+                            setProv(st, op.out,
+                                Prov.fieldPtr(bp, c));
+                        }
+                    } else {
+                        setProv(st, op.out, null);
+                    }
+                    return;
+                }
+            }
+            setProv(st, op.out, null);
+            return;
+        }
+        if (mnem.equals("INT_SUB") && op.ins.length == 2) {
+            // Container-record (CR) pattern: This - fieldOff =
+            // the enclosing struct, whose fieldOff embeds the
+            // interface. Bounded (small offsets only): a large
+            // subtraction is buffer arithmetic, not CR.
+            for (int s = 0; s < 2; s++) {
+                if (op.ins[s].isConstant()) {
+                    // Only base - const (not const - base).
+                    if (s != 1) {
+                        setProv(st, op.out, null);
+                        return;
+                    }
+                    Prov bp = getProv(st, op.ins[0]);
+                    long c = op.ins[1].getOffset();
+                    if (bp != null && bp.kind == Prov.IFACE &&
+                        c > 0 && c <= 0x1000L) {
+                        Map<Long, ProtoField> nl =
+                            new HashMap<Long, ProtoField>();
+                        nl.put(c, new ProtoField(bp.guid, true));
+                        setProv(st, op.out, Prov.struct(nl));
+                    } else {
+                        setProv(st, op.out, null);
+                    }
+                    return;
+                }
+            }
+            setProv(st, op.out, null);
+            return;
+        }
+        if (mnem.equals("LOAD")) {
+            if (op.ins.length < 2) {
+                setProv(st, op.out, null);
+                return;
+            }
+            Varnode addrV = op.ins[1];
+            if (addrV.isConstant()) {
+                long a = addrV.getOffset();
+                Prov p = st.globalProv.get(a);
+                if (p == null) p = ctx.globalProvPre.get(a);
+                setProv(st, op.out, p);
+                return;
+            }
+            Prov ap = getProv(st, addrV);
+            if (ap != null && ap.kind == Prov.SLOT) {
+                setProv(st, op.out, Prov.method(ap.guid, ap.off));
+                return;
+            }
+            if (ap != null && ap.kind == Prov.FIELDPTR) {
+                Prov sp = ap.structProv;
+                if (sp != null && sp.kind == Prov.STRUCT) {
+                    ProtoField fld = sp.layout.get(ap.fieldOff);
+                    if (fld != null && !fld.embedded) {
+                        setProv(st, op.out, Prov.iface(fld.guid));
+                        return;
+                    }
+                }
+                setProv(st, op.out, null);
+                return;
+            }
+            if (ap != null && ap.kind == Prov.IFACE) {
+                setProv(st, op.out, Prov.method(ap.guid, 0L));
+                return;
+            }
+            if (ap != null && ap.kind == Prov.BS) {
+                setProv(st, op.out, Prov.method("BS", 0L));
+                return;
+            }
+            String slot = rbpSlotOf(addrV, ops, idx, ctx);
+            if (slot != null) {
+                setProv(st, op.out, st.slotProv.get(slot));
+                return;
+            }
+            // Embedded-method fallback: address = structBase +
+            // (fieldOff + methodOff) for a UNIQUE embedded field
+            // whose method table contains the residual offset.
+            Object[] sf = structFieldOf(addrV, ops, idx, st);
+            if (sf != null) {
+                long c = (Long) sf[1];
+                Prov bp = (Prov) sf[2];
+                String foundGuid = null;
+                long foundOff = 0;
+                int matches = 0;
+                for (Map.Entry<Long, ProtoField> e :
+                    bp.layout.entrySet()) {
+                    if (!e.getValue().embedded) continue;
+                    long f = e.getKey();
+                    if (c < f) continue;
+                    long m = c - f;
+                    ProtoInfo pi = protoByName(e.getValue().guid,
+                        ctx.protos);
+                    if (pi != null && pi.methods.containsKey(m)) {
+                        foundGuid = e.getValue().guid;
+                        foundOff = m;
+                        matches++;
+                    }
+                }
+                if (matches == 1) {
+                    setProv(st, op.out,
+                        Prov.method(foundGuid, foundOff));
+                } else {
+                    setProv(st, op.out, null);
+                }
+                return;
+            }
+            setProv(st, op.out, null);
+            return;
+        }
+        if (mnem.equals("STORE")) {
+            if (op.ins.length < 3) return;
+            Varnode addrV = op.ins[1];
+            Prov vp = getProv(st, op.ins[2]);
+            String slot = rbpSlotOf(addrV, ops, idx, ctx);
+            if (slot != null) {
+                if (vp == null) st.slotProv.remove(slot);
+                else st.slotProv.put(slot, vp);
+                return;
+            }
+            if (addrV.isConstant()) {
+                long a = addrV.getOffset();
+                if (vp == null) st.globalProv.remove(a);
+                else st.globalProv.put(a, vp);
+                return;
+            }
+            Object[] sf = structFieldOf(addrV, ops, idx, st);
+            if (sf != null) {
+                String baseKey = (String) sf[0];
+                long f = (Long) sf[1];
+                Prov bp = (Prov) sf[2];
+                Map<Long, ProtoField> nl =
+                    new HashMap<Long, ProtoField>(bp.layout);
+                if (vp != null && vp.kind == Prov.IFACE) {
+                    nl.put(f, new ProtoField(vp.guid, false));
+                } else {
+                    nl.remove(f);
+                }
+                st.varProv.put(baseKey, Prov.struct(nl));
+            }
+            return;
+        }
+        if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
+            // Resolve a BS method call (target provenance) BEFORE
+            // clobbering: the argument registers are pre-call.
+            Prov tgt = null;
+            if (mnem.equals("CALLIND") && op.ins.length >= 1) {
+                tgt = getProv(st, op.ins[0]);
+            }
+            String bsMethod = null;
+            long bsOff = 0;
+            if (tgt != null && tgt.kind == Prov.METHOD &&
+                "BS".equals(tgt.guid)) {
+                bsMethod = ctx.bsMethods.get(tgt.off);
+                bsOff = tgt.off;
+            }
+            // Argument values needed post-clobber: resolve GUIDs
+            // and destinations from the PRE-call state.
+            String acqGuid = null;
+            Varnode acqOut = null;
+            // Install pairs (guid, iface-value) in order. Pair 1
+            // is (RDX, R8); InstallMultiple adds variadic pairs:
+            // pair 2 = (R9, stack0), pair j>=3 = (stack[2j-5],
+            // stack[2j-4]). Unknown GUIDs stay in the list as
+            // (null, value) and are skipped at learning time, so
+            // a later known pair (e.g. PciIo after DevicePath)
+            // is still learned. A NULL GUID address terminates
+            // the list.
+            List<String> instGuids = new ArrayList<String>();
+            List<Varnode> instIfaces = new ArrayList<Varnode>();
+            if (bsMethod != null) {
+                // MS ABI (EFIAPI) argument registers, x86-64:
+                // RCX=0x8, RDX=0x10, R8=0x80. LocateProtocol takes
+                // the GUID in arg0; Handle/Open/Install take it in
+                // arg1; the Interface out-param / interface arg is
+                // always arg2 (R8).
+                if (bsOff == 0x140L) {
+                    acqGuid = resolveGuidArg(0x8L, ops, ctx.mem, idx,
+                        ctx);
+                    acqOut = regVarnode(0x80L, isa.pointerSize());
+                } else if (bsOff == 0x98L || bsOff == 0x118L) {
+                    acqGuid = resolveGuidArg(0x10L, ops, ctx.mem, idx,
+                        ctx);
+                    acqOut = regVarnode(0x80L, isa.pointerSize());
+                } else if (bsOff == 0x80L) {
+                    instGuids.add(resolveGuidArg(0x10L, ops, ctx.mem,
+                        idx, ctx));
+                    instIfaces.add(regVarnode(0x80L,
+                        isa.pointerSize()));
+                } else if (bsOff == 0x148L) {
+                    instGuids.add(resolveGuidArg(0x10L, ops, ctx.mem,
+                        idx, ctx));
+                    instIfaces.add(regVarnode(0x80L,
+                        isa.pointerSize()));
+                    // Variadic pairs: R9 + stack args.
+                    Varnode r9 = regVarnode(0x88L,
+                        isa.pointerSize());
+                    Long g2addr = r9 == null ? null : resolveValueWide(
+                        r9, ops, ctx.mem, idx, 6);
+                    if (g2addr != null && g2addr.longValue() != 0L) {
+                        List<Varnode> sargs = readStackArgs(ops, idx,
+                            ctx);
+                        instGuids.add(resolveGuidValue(r9, ops,
+                            ctx.mem, idx, ctx));
+                        instIfaces.add(sargs.isEmpty() ? null :
+                            sargs.get(0));
+                        // Pairs j>=3: (stack[2j-5], stack[2j-4]).
+                        for (int j = 3; j <= 10; j++) {
+                            int gi = 2 * j - 5;
+                            int ii = 2 * j - 4;
+                            if (gi >= sargs.size()) break;
+                            Varnode gv = sargs.get(gi);
+                            Long ga = resolveValueWide(gv, ops, ctx.mem,
+                                idx, 6);
+                            if (ga != null &&
+                                ga.longValue() == 0L) break;
+                            instGuids.add(resolveGuidValue(gv, ops,
+                                ctx.mem, idx, ctx));
+                            instIfaces.add(ii < sargs.size() ?
+                                sargs.get(ii) : null);
+                        }
+                    }
+                }
+            }
+            // Clobber caller-saved registers (union fallback: the
+            // System V set, a superset of the Windows set, so this
+            // is sound under either ABI).
+            long[] clob = isa.clobberForConvention(null);
+            if (clob != null) {
+                for (long off : clob) {
+                    killReg(st, isa.registerSpaceName(), off);
+                }
+            }
+            // Post-call bindings (memory effects of the call).
+            if (acqGuid != null && acqOut != null) {
+                bindAcquisition(acqOut, acqGuid, ops, idx, st, ctx);
+            }
+            for (int p = 0; p < instGuids.size(); p++) {
+                if (instGuids.get(p) != null &&
+                    instIfaces.get(p) != null) {
+                    learnInstall(instIfaces.get(p), instGuids.get(p),
+                        ops, idx, st, ctx);
+                }
+            }
+            return;
+        }
+        // All other ops (arithmetic, logic, extension, CALLOTHER,
+        // branches, returns): the output provenance is unknown.
+        // CALLOTHER (IN/OUT/MSR userops) has no register effect
+        // modelled here; its port/MSR recording is unchanged.
+        if (op.out != null) {
+            setProv(st, op.out, null);
+        }
+    }
+
+    /** One resolved protocol/BS call at a CALLIND site. */
+    private static class ProtoCall {
+        final String guid;
+        final String method;
+        final long off;
+        final boolean isBs;
+        ProtoCall(String g, String m, long o, boolean b) {
+            guid = g; method = m; off = o; isBs = b;
+        }
+    }
+
+    /** Resolve a CALLIND to a protocol/BS method from the
+        provenance in-state at that op. Returns null unless the
+        target provenance is a METHOD whose (protocol, offset) is
+        in the known tables. Unknown methods are NOT resolved
+        (they stay on the existing may/unresolved path). */
+    private static ProtoCall resolveProtoCall(OpRec op,
+        ProvState st, ProvCtx ctx) {
+        if (op == null || st == null || !op.mnem.equals("CALLIND") ||
+            op.ins.length < 1) return null;
+        Prov tgt = st.varProv.get(vkey(op.ins[0]));
+        if (tgt == null || tgt.kind != Prov.METHOD) return null;
+        if ("BS".equals(tgt.guid)) {
+            String m = ctx.bsMethods.get(tgt.off);
+            if (m == null) return null;
+            return new ProtoCall("BS", m, tgt.off, true);
+        }
+        ProtoInfo pi = protoByName(tgt.guid, ctx.protos);
+        if (pi == null) return null;
+        String m = pi.methods.get(tgt.off);
+        if (m == null) return null;
+        return new ProtoCall(tgt.guid, m, tgt.off, false);
+    }
+
+    /** Known hardware effect of a protocol method, as port cycles
+        (port, direction). Only PCI config Read/Write have a fixed
+        effect (CF8 address + CFC data, verified against this
+        corpus's host bridge driver). Everything else returns null
+        (edge only, never a fabricated access). */
+    private static String[][] protoHwEffect(ProtoCall pc) {
+        if (pc == null || pc.isBs) return null;
+        if (pc.method.equals("Pci.Read")) {
+            return new String[][] {{"0xcf8", "OUT"},
+                {"0xcfc", "IN"}};
+        }
+        if (pc.method.equals("Pci.Write")) {
+            return new String[][] {{"0xcf8", "OUT"},
+                {"0xcfc", "OUT"}};
+        }
+        return null;
+    }
+
+    /** Follow COPY chains to the first non-COPY defining op of a
+        varnode; -1 if none (within 8 hops). x86 CALLIND targets
+        and address computations routinely pass through COPYs
+        (register moves, unique temps), so a single-def lookup
+        misses them. */
+    private static int followCopyTo(List<OpRec> ops, Varnode v,
+        int pos) {
+        Varnode cur = v;
+        int curPos = pos;
+        for (int hop = 0; hop < 8; hop++) {
+            if (cur == null) return -1;
+            int d = findDefWide(ops, vkey(cur), curPos);
+            if (d < 0) return -1;
+            OpRec dd = ops.get(d);
+            if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
+                cur = dd.ins[0];
+                curPos = d;
+                continue;
+            }
+            return d;
+        }
+        return -1;
+    }
+
+    /** Resolve a base varnode to a global address: either a direct
+        ram varnode (x86 absolute-address operand, e.g. MOV RAX,
+        [0xa220] is COPY RAX <- ram:0xa220) reached through COPYs,
+        or a LOAD from a constant address. Null otherwise (a
+        parameter or computed base is not a global). */
+    private static Long resolveGlobalBase(List<OpRec> ops, Varnode v,
+        int pos) {
+        Varnode cur = v;
+        int curPos = pos;
+        for (int hop = 0; hop < 8; hop++) {
+            if (cur == null) return null;
+            String sp = cur.getAddress().getAddressSpace().getName();
+            if (sp.equals("ram")) return cur.getOffset();
+            if (cur.isConstant()) return null;
+            int d = findDefWide(ops, vkey(cur), curPos);
+            if (d < 0) return null;
+            OpRec dd = ops.get(d);
+            if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
+                cur = dd.ins[0];
+                curPos = d;
+                continue;
+            }
+            if (dd.mnem.equals("LOAD") && dd.ins.length >= 2 &&
+                dd.ins[1].isConstant()) {
+                return dd.ins[1].getOffset();
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /** Boot Services table fingerprint pre-pass: for each CALLIND
+        whose target def (through COPYs) is LOAD [INT_ADD(base,
+        constOff)] where base resolves to a global address, record
+        constOff under that global. A global used with >= 2
+        distinct BS method offsets including >= 1 protocol method
+        (Handle/Open/LocateProtocol) IS the Boot Services table
+        pointer: the offsets are UEFI ABI constants, not
+        driver-specific addresses, so this identifies gBS without
+        symbols. Returns the set of such globals (normally exactly
+        one). */
+    private static Set<Long> findGbsGlobals(List<FuncRec> funcRecs,
+        Map<Long, String> bsMethods) {
+        Map<Long, Set<Long>> offsByGlobal =
+            new HashMap<Long, Set<Long>>();
+        for (FuncRec rec : funcRecs) {
+            List<OpRec> ops = rec.or.ops;
+            for (int i = 0; i < ops.size(); i++) {
+                OpRec op = ops.get(i);
+                if (!op.mnem.equals("CALLIND") ||
+                    op.ins.length < 1) continue;
+                int def = followCopyTo(ops, op.ins[0], i);
+                if (def < 0) continue;
+                OpRec dd = ops.get(def);
+                if (!dd.mnem.equals("LOAD") ||
+                    dd.ins.length < 2) continue;
+                Varnode addrV = dd.ins[1];
+                int da = followCopyTo(ops, addrV, def);
+                if (da < 0) continue;
+                OpRec ad = ops.get(da);
+                if (!ad.mnem.equals("INT_ADD") ||
+                    ad.ins.length != 2) continue;
+                Long constOff = null;
+                Varnode baseV = null;
+                for (int s = 0; s < 2; s++) {
+                    if (ad.ins[s].isConstant()) {
+                        constOff = ad.ins[s].getOffset();
+                        baseV = ad.ins[1 - s];
+                    }
+                }
+                if (constOff == null || baseV == null) continue;
+                if (!bsMethods.containsKey(constOff)) continue;
+                Long gaddr = resolveGlobalBase(ops, baseV, da);
+                if (gaddr == null) continue;
+                Set<Long> s = offsByGlobal.get(gaddr);
+                if (s == null) {
+                    s = new HashSet<Long>();
+                    offsByGlobal.put(gaddr, s);
+                }
+                s.add(constOff);
+            }
+        }
+        Set<Long> out = new HashSet<Long>();
+        for (Map.Entry<Long, Set<Long>> e : offsByGlobal.entrySet()) {
+            Set<Long> s = e.getValue();
+            boolean hasProto = s.contains(0x98L) ||
+                s.contains(0x118L) || s.contains(0x140L);
+            if (s.size() >= 2 && hasProto) out.add(e.getKey());
+        }
+        return out;
+    }
+
+    /** Meet over ALL direct call sites of one callee, for
+        provenance: a parameter register is bound only when every
+        site has a provenance for it AND all sites agree (STRUCT
+        layouts meet by field intersection). Anything else stays
+        unknown. The register set is the x86-64 union (SysV +
+        Windows args): entry states are just "what each register
+        holds", which is ABI-independent, so propagating the union
+        is sound (a register the callee never reads is harmless,
+        and a register it does read holds exactly what the caller
+        passed). */
+    private Map<String, Prov> meetOverSitesProv(long calleeKey,
+        Map<Long, List<CallSite>> sitesByCallee) {
+        Map<String, Prov> out = new HashMap<String, Prov>();
+        List<CallSite> sites = sitesByCallee.get(calleeKey);
+        if (sites == null || sites.isEmpty()) return out;
+        long[] regs = new long[] {0x38L, 0x30L, 0x10L, 0x8L,
+            0x80L, 0x88L};
+        int ptrSize = isa.pointerSize();
+        for (long off : regs) {
+            String key = isa.registerSpaceName() + ":" + off + ":" +
+                ptrSize;
+            Prov agreed = null;
+            boolean allHave = true;
+            for (CallSite s : sites) {
+                FuncRec caller = s.caller;
+                Prov v = null;
+                if (caller.pv != null && caller.pv.inStates != null &&
+                    s.opIdx < caller.pv.inStates.length &&
+                    caller.pv.inStates[s.opIdx] != null) {
+                    v = caller.pv.inStates[s.opIdx].varProv.get(key);
+                }
+                if (v == null) {
+                    allHave = false;
+                    break;
+                }
+                if (agreed == null) {
+                    agreed = v;
+                } else {
+                    agreed = meetProv(agreed, v);
+                    if (agreed == null) {
+                        allHave = false;
+                        break;
+                    }
+                }
+            }
+            if (allHave && agreed != null) out.put(key, agreed);
+        }
+        return out;
+    }
+
+    /** Entry-state equality for provenance maps (null = empty). */
+    private static boolean provEntrySame(Map<String, Prov> a,
+        Map<String, Prov> b) {
+        if (a == null) a = new HashMap<String, Prov>();
+        if (b == null) b = new HashMap<String, Prov>();
+        if (a.size() != b.size()) return false;
+        for (Map.Entry<String, Prov> e : a.entrySet()) {
+            Prov o = b.get(e.getKey());
+            if (o == null || !o.equals(e.getValue())) return false;
+        }
+        return true;
     }
 
     /** v3.6 field offsets per struct, from the v2.0.0 source layouts
@@ -3675,6 +5139,10 @@ public class ExtractIR extends GhidraScript {
         long entryKey;
         /** Final must-fixpoint (Phase B), never null after Phase B. */
         FixResult fx;
+        /** Final provenance fixpoint (Phase P, v2 item #3); null
+            when the provenance pass is skipped (non-x86-64) or
+            failed for this function. */
+        ProvResult pv;
     }
 
     /** One direct call site: the caller record + the CALL op index. */
@@ -3926,7 +5394,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.9\",");
+        w.println("  \"extractor_version\": \"v3.10\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -3961,6 +5429,7 @@ public class ExtractIR extends GhidraScript {
         int totalTailCallSites = 0;
         int totalTailCallTargets = 0;
         int totalUnresolvedTail = 0;
+        int totalProtoEdges = 0;
         // v3.5 pass 1: function-pointer store map for the whole
         // program, before any function is printed (may-edges need
         // cross-function stores). Best-effort: a failure here only
@@ -4262,6 +5731,213 @@ public class ExtractIR extends GhidraScript {
                 ", functions with propagated entries=" + withEntries +
                 ", entry constants=" + totalConsts + ".");
         }
+        // ---- v2 item #3, Phase P: protocol-aware points-to ----
+        // Gated to x86-64 (UEFI Boot Services + protocol tables
+        // are x86-64 ABI facts; other ISAs keep v3.9 behaviour
+        // (the Prov pass alone uses the wide def window, see
+        // findDefWide).
+        boolean isX86_64 = false;
+        try {
+            String langId = currentProgram.getLanguage()
+                .getLanguageID().getIdAsString();
+            isX86_64 = "x86".equals(proc) && langId.contains(":64:");
+        } catch (Exception e) {
+        }
+        ProvCtx provCtx = null;
+        if (isX86_64) {
+            provCtx = new ProvCtx();
+            provCtx.mem = currentProgram.getMemory();
+            provCtx.protos = protoTable();
+            provCtx.bsMethods = bsMethods();
+            try {
+                provCtx.rspOff = currentProgram.getRegister("RSP")
+                    .getOffset();
+                provCtx.rbpOff = currentProgram.getRegister("RBP")
+                    .getOffset();
+            } catch (Exception e) {
+                provCtx.rspOff = 0x20L;
+                provCtx.rbpOff = 0x28L;
+            }
+            // gBS fingerprint (syntactic, no fixpoint needed).
+            Set<Long> gbsAddrs = findGbsGlobals(funcRecs,
+                provCtx.bsMethods);
+            Map<Long, Prov> provGlobalPre = new HashMap<Long, Prov>();
+            for (Long g : gbsAddrs) {
+                provGlobalPre.put(g, Prov.bs());
+            }
+            provCtx.gbsAddrs = gbsAddrs;
+            provCtx.globalProvPre = provGlobalPre;
+            println("[*] proto: gBS globals=" + gbsAddrs);
+            // Pre-pass: intra-only Prov (unknown entries) to collect
+            // global interface assignments. Disagreeing assignments
+            // (across paths or functions) drop to unknown: a global
+            // whose value is not certain everywhere is not bound.
+            Map<Long, Prov> collected = new HashMap<Long, Prov>();
+            Map<Long, Boolean> conflicted =
+                new HashMap<Long, Boolean>();
+            for (FuncRec rec : funcRecs) {
+                try {
+                    ProvResult pre = runProvFixpoint(rec.or.ops,
+                        rec.branchTargets, null, provCtx);
+                    for (int i = 0; i < rec.or.ops.size(); i++) {
+                        if (pre.inStates[i] == null) continue;
+                        ProvState out = new ProvState(pre.inStates[i]);
+                        applyProvTransfer(out, rec.or.ops.get(i),
+                            rec.or.ops, i, provCtx);
+                        for (Map.Entry<Long, Prov> e :
+                            out.globalProv.entrySet()) {
+                            if (conflicted.containsKey(e.getKey())) {
+                                continue;
+                            }
+                            Prov old = collected.get(e.getKey());
+                            if (old == null) {
+                                collected.put(e.getKey(),
+                                    e.getValue());
+                            } else if (!old.equals(e.getValue())) {
+                                collected.remove(e.getKey());
+                                conflicted.put(e.getKey(), true);
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    // best-effort; the main pass still runs
+                }
+            }
+            for (Map.Entry<Long, Prov> e : collected.entrySet()) {
+                if (!provGlobalPre.containsKey(e.getKey())) {
+                    provGlobalPre.put(e.getKey(), e.getValue());
+                }
+            }
+            provCtx.globalProvPre = provGlobalPre;
+            println("[*] proto: pre-pass globals=" +
+                provGlobalPre.size());
+            // Parameter provenance propagation (mirror constprop
+            // Phase B): worklist over entries, meet over sites.
+            // Eligibility: same call-graph guards as constprop
+            // (direct callers only, not address-taken, not a tail
+            // target, not external). The register set is the
+            // x86-64 union, so no convention-null exclusion
+            // applies (unlike constprop's convention-specific
+            // argument registers).
+            Map<Long, Boolean> provEligible =
+                new HashMap<Long, Boolean>();
+            for (FuncRec callee : funcRecs) {
+                boolean ok = true;
+                List<CallSite> sites =
+                    sitesByCallee.get(callee.entryKey);
+                if (callee.f.isExternal() || sites == null ||
+                    sites.isEmpty()) ok = false;
+                if (ok && addrTakenNames.contains(
+                    callee.f.getName())) ok = false;
+                if (ok && tailTargetNames.contains(
+                    callee.f.getName())) ok = false;
+                if (ok) {
+                    try {
+                        Set<Function> callers = callee.f
+                            .getCallingFunctions(monitor);
+                        Set<Long> directCallers =
+                            directCallersByCallee.get(
+                                callee.entryKey);
+                        for (Function cf : callers) {
+                            FuncRec callerRec = funcByEntry.get(
+                                cf.getEntryPoint().getOffset());
+                            if (callerRec == null ||
+                                directCallers == null ||
+                                !directCallers.contains(
+                                    callerRec.entryKey)) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    } catch (Exception e) {
+                        ok = false;
+                    }
+                }
+                provEligible.put(callee.entryKey, ok);
+            }
+            Map<Long, Map<String, Prov>> provEntries =
+                new HashMap<Long, Map<String, Prov>>();
+            Set<Long> pWorklist = new HashSet<Long>();
+            for (FuncRec rec : funcRecs) {
+                pWorklist.add(rec.entryKey);
+            }
+            boolean provConverged = false;
+            int provRounds = 0;
+            for (int round = 0; round < MAX_CONSTPROP_ROUNDS &&
+                !provConverged; round++) {
+                if (monitor.isCancelled()) break;
+                provRounds++;
+                for (Long ek : pWorklist) {
+                    FuncRec rec = funcByEntry.get(ek);
+                    if (rec == null) continue;
+                    try {
+                        rec.pv = runProvFixpoint(rec.or.ops,
+                            rec.branchTargets,
+                            provEntries.get(ek), provCtx);
+                    } catch (Exception ex) {
+                        rec.pv = null;
+                    }
+                }
+                Set<Long> affected = new HashSet<Long>();
+                for (Long ek : pWorklist) {
+                    Set<Long> cb = calleesByCaller.get(ek);
+                    if (cb != null) affected.addAll(cb);
+                }
+                Set<Long> nextWorklist = new HashSet<Long>();
+                for (Long ck : affected) {
+                    if (!Boolean.TRUE.equals(
+                        provEligible.get(ck))) continue;
+                    Map<String, Prov> m = meetOverSitesProv(ck,
+                        sitesByCallee);
+                    if (!provEntrySame(provEntries.get(ck), m)) {
+                        provEntries.put(ck, m);
+                        nextWorklist.add(ck);
+                    }
+                }
+                if (nextWorklist.isEmpty()) {
+                    provConverged = true;
+                } else {
+                    pWorklist = nextWorklist;
+                }
+            }
+            if (!provConverged && !pWorklist.isEmpty() &&
+                !monitor.isCancelled()) {
+                for (Long ek : pWorklist) {
+                    FuncRec rec = funcByEntry.get(ek);
+                    if (rec == null) continue;
+                    try {
+                        rec.pv = runProvFixpoint(rec.or.ops,
+                            rec.branchTargets,
+                            provEntries.get(ek), provCtx);
+                    } catch (Exception ex) {
+                    }
+                }
+                println("[!] proto: stopped after " +
+                    MAX_CONSTPROP_ROUNDS +
+                    " rounds without convergence; using last entries.");
+            }
+            // Safety net: any function without a Prov result (fixpoint
+            // threw) gets one more attempt with its current entries.
+            for (FuncRec rec : funcRecs) {
+                if (rec.pv == null) {
+                    try {
+                        rec.pv = runProvFixpoint(rec.or.ops,
+                            rec.branchTargets,
+                            provEntries.get(rec.entryKey), provCtx);
+                    } catch (Exception ex) {
+                        rec.pv = null;
+                    }
+                }
+            }
+            int withProvEntries = 0;
+            for (FuncRec rec : funcRecs) {
+                Map<String, Prov> e = provEntries.get(rec.entryKey);
+                if (e != null && !e.isEmpty()) withProvEntries++;
+            }
+            println("[*] proto: " + provRounds + " rounds, converged=" +
+                provConverged + ", functions with propagated entries=" +
+                withProvEntries + ".");
+        }
         for (FuncRec rec : funcRecs) {
             Function f = rec.f;
             if (!firstFn) w.println(",");
@@ -4561,6 +6237,46 @@ public class ExtractIR extends GhidraScript {
                     }
                 }
             }
+            // v2 item #3: protocol/BS call resolution from the
+            // provenance fixpoint (Phase P). A resolved site is
+            // explained, so it is excluded from the points-to
+            // may/unresolved counts below (via ptCertain). Hardware
+            // effects land in the EXISTING port_io_accesses class
+            // with the exact existing entry shape; attribution
+            // lives in protocol_call_edges (joinable on instr).
+            Set<Integer> protoResolved = new HashSet<Integer>();
+            List<String> protoEdges = new ArrayList<String>();
+            if (isX86_64 && provCtx != null && rec.pv != null &&
+                rec.pv.inStates != null) {
+                for (int i = 0; i < ops.size(); i++) {
+                    OpRec op = ops.get(i);
+                    if (!op.mnem.equals("CALLIND")) continue;
+                    if (i >= rec.pv.inStates.length ||
+                        rec.pv.inStates[i] == null) continue;
+                    ProtoCall pc = resolveProtoCall(op,
+                        rec.pv.inStates[i], provCtx);
+                    if (pc == null) continue;
+                    protoResolved.add(i);
+                    protoEdges.add("{\"instr\": \"" + op.instrAddr +
+                        "\", \"protocol\": \"" + pc.guid +
+                        "\", \"method\": \"" + pc.method +
+                        "\", \"offset\": \"0x" +
+                        Long.toHexString(pc.off) + "\"}");
+                    String[][] eff = protoHwEffect(pc);
+                    if (eff != null) {
+                        for (String[] e : eff) {
+                            portIo.add("{\"instr\": \"" + op.instrAddr +
+                                "\", \"op\": \"" + e[1] + "\"" +
+                                ", \"direction\": \"" + e[1] + "\"" +
+                                ", \"port\": \"" + e[0] + "\"" +
+                                ", \"size\": 4" +
+                                ", \"value\": null" +
+                                ", \"value_known_ones\": 0" +
+                                ", \"value_known_zeroes\": 0}");
+                        }
+                    }
+                }
+            }
             w.println();
             w.println("      ],");
             w.println("      \"pcode_op_count\": " + opCount + ",");
@@ -4612,9 +6328,15 @@ public class ExtractIR extends GhidraScript {
             }
             PointsToResult pt;
             try {
+                // Protocol-resolved sites are explained, not
+                // unresolved: exclude them from the may/unresolved
+                // counts (v2 item #3).
+                Set<Integer> ptCertain =
+                    new HashSet<Integer>(ind.certainCalls);
+                ptCertain.addAll(protoResolved);
                 pt = recoverPointsTo(ops, currentProgram.getMemory(),
                     currentProgram.getFunctionManager(), funcPtrByOffset,
-                    funcPtrByAddr, ind.certainCalls);
+                    funcPtrByAddr, ptCertain);
             } catch (Exception e) {
                 pt = new PointsToResult(new ArrayList<String>(), 0, 0);
             }
@@ -4631,6 +6353,14 @@ public class ExtractIR extends GhidraScript {
             w.println("      \"may_call_site_count\": " + pt.maySites.size() + ",");
             w.println("      \"may_call_target_count\": " + pt.mayTargets + ",");
             w.println("      \"unresolved_indirect_count\": " + pt.unresolved + ",");
+            w.println("      \"protocol_call_edges\": [");
+            for (int i = 0; i < protoEdges.size(); i++) {
+                if (i > 0) w.println(",");
+                w.print("        " + protoEdges.get(i));
+            }
+            w.println();
+            w.println("      ],");
+            w.println("      \"protocol_call_edge_count\": " + protoEdges.size() + ",");
             // v3.6: tail-call recovery, computed in Phase A and reused
             // here (same data the entry guards used).
             TailCallResult tc = rec.tc;
@@ -4652,6 +6382,7 @@ public class ExtractIR extends GhidraScript {
             totalTailCallSites += tc.sites.size();
             totalTailCallTargets += tc.targets;
             totalUnresolvedTail += tc.unresolved;
+            totalProtoEdges += protoEdges.size();
             totalMmio += mmio.size();
             totalMay += may.size();
             totalPortIo += portIo.size();
@@ -4753,6 +6484,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"may_tail_call_site_total\": " + totalTailCallSites + ",");
         w.println("  \"may_tail_call_target_total\": " + totalTailCallTargets + ",");
         w.println("  \"unresolved_tail_call_total\": " + totalUnresolvedTail + ",");
+        w.println("  \"protocol_call_edge_total\": " + totalProtoEdges + ",");
         w.println("  \"literal_scan\": {");
         w.println("    \"literal_count\": " + litScan.literalCount + ",");
         w.print("    \"attributed\": {");
