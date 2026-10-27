@@ -1,5 +1,6 @@
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
@@ -263,6 +264,21 @@ public class ExtractIR extends GhidraScript {
             the name to its ABI set (System V / Windows) and falls back
             to the binary default for unknown names. */
         long[] clobberForConvention(String conv);
+        /** Argument register offsets for a callee whose Ghidra
+            calling-convention name is conv (v2 item #2:
+            inter-procedural constant propagation). Returns null
+            when the argument registers cannot be determined
+            (x86-64 unknown convention): such a call site is
+            UNMODELLED and poisons the callee's entry -- never a
+            guess. (The clobber union is sound for KILLING but
+            unsound for READING arguments: e.g. RCX is arg0 under
+            Windows but arg3 under System V, so a union read
+            would mix conventions and corrupt must-facts.)
+            Returns an empty array when arguments are not passed
+            in registers at all (x86-32: stack args) -- propagation
+            is then a no-op for that callee. Single-convention
+            adapters ignore conv. */
+        long[] argumentRegisterOffsets(String conv);
     }
 
     // Selected in run() from the program's processor (default ARM:
@@ -348,6 +364,11 @@ public class ExtractIR extends GhidraScript {
         public boolean hasOverlappingRegisters() { return false; }
         public long[] clobberForConvention(String conv) {
             return callerSavedRegisterOffsets();
+        }
+        public long[] argumentRegisterOffsets(String conv) {
+            // AAPCS r0-r3 (Ghidra ARM offsets rN = 0x20 + 4N,
+            // verified by probe: r0=32, r1=36, r2=40, r3=44).
+            return new long[] {32L, 36L, 40L, 44L};
         }
         /** ARM TBB/TBH jump-table recovery (v3.3), implementing
         IsaAdapter.recoverJumpTableTargets.
@@ -563,6 +584,13 @@ public class ExtractIR extends GhidraScript {
         public boolean hasOverlappingRegisters() { return false; }
         public long[] clobberForConvention(String conv) {
             return callerSavedRegisterOffsets();
+        }
+        public long[] argumentRegisterOffsets(String conv) {
+            // RISC-V calling convention: a0-a7 = x10-x17
+            // (probe-verified: a0 = 0x2000 + stride*10).
+            long[] offs = new long[8];
+            for (int i = 0; i < 8; i++) offs[i] = reg(10 + i);
+            return offs;
         }
         public Map<Integer, List<Integer>> recoverJumpTableTargets(
             List<OpRec> ops, Memory mem) {
@@ -805,6 +833,13 @@ public class ExtractIR extends GhidraScript {
         public long[] clobberForConvention(String conv) {
             return callerSavedRegisterOffsets();
         }
+        public long[] argumentRegisterOffsets(String conv) {
+            // MIPS o32 calling convention: a0-a3 = $4-$7
+            // (probe-verified: a0 = stride*4).
+            long[] offs = new long[4];
+            for (int i = 0; i < 4; i++) offs[i] = reg(4 + i);
+            return offs;
+        }
         public Map<Integer, List<Integer>> recoverJumpTableTargets(
             List<OpRec> ops, Memory mem) {
             Map<Integer, List<Integer>> result =
@@ -927,6 +962,22 @@ public class ExtractIR extends GhidraScript {
             String c = conv.toLowerCase();
             if (c.contains("win")) return windowsClobber();
             return windowsDefault ? windowsClobber() : sysvClobber();
+        }
+        public long[] argumentRegisterOffsets(String conv) {
+            // x86-32: stack args -- no register propagation (no-op).
+            if (!is64) return new long[0];
+            // Unknown convention: UNMODELLED (null), never the union
+            // (see the interface contract: the clobber union is
+            // sound for killing but unsound for reading arguments).
+            if (conv == null) return null;
+            String c = conv.toLowerCase();
+            // Windows x64: RCX, RDX, R8, R9 (probe-verified offsets).
+            if (c.contains("win") || windowsDefault) {
+                return new long[] {0x8L, 0x10L, 0x80L, 0x88L};
+            }
+            // System V AMD64: RDI, RSI, RDX, RCX, R8, R9.
+            return new long[] {0x38L, 0x30L, 0x10L, 0x8L, 0x80L,
+                0x88L};
         }
 
         /** x86 has NO link register: CALL pushes the return
@@ -1601,11 +1652,18 @@ public class ExtractIR extends GhidraScript {
 
     @SuppressWarnings("unchecked")
     private FixResult runFixpoint(List<OpRec> ops, Memory mem,
-        Map<Integer, List<Integer>> branchTargets) {
+        Map<Integer, List<Integer>> branchTargets,
+        Map<String, Bits> entry) {
         int n = ops.size();
         Map<String, Bits>[] in = new Map[n];
         if (n == 0) return new FixResult(in, true);
-        in[0] = new HashMap<String, Bits>();
+        // v2 item #2: inter-procedural entry state (argument
+        // registers bound by the caller meet, or empty = all
+        // unknown, the pre-v2 behaviour). A loop back to op 0
+        // meets into this state, which is correct: an entry
+        // constant survives only if no loop-back path redefines it.
+        in[0] = (entry == null) ? new HashMap<String, Bits>()
+            : new HashMap<String, Bits>(entry);
 
         // First op index per instruction address (for branch targets).
         Map<String, Integer> firstAt = new HashMap<String, Integer>();
@@ -3147,11 +3205,19 @@ public class ExtractIR extends GhidraScript {
         final List<String> sites;
         final int targets;
         final int unresolved;
+        /** Target function names (v2 item #2: a tail-call target has
+            an unmodelled caller, so its entry must stay unknown). */
+        final Set<String> targetNames;
         TailCallResult(List<String> sites, int targets,
             int unresolved) {
+            this(sites, targets, unresolved, new HashSet<String>());
+        }
+        TailCallResult(List<String> sites, int targets,
+            int unresolved, Set<String> targetNames) {
             this.sites = sites;
             this.targets = targets;
             this.unresolved = unresolved;
+            this.targetNames = targetNames;
         }
     }
 
@@ -3168,6 +3234,7 @@ public class ExtractIR extends GhidraScript {
         Map<Long, Set<String>> byAddr, Set<Integer> resolvedBranchInds,
         Set<Integer> jumpTableBranchInds, long funcStart, long funcEnd) {
         List<String> out = new ArrayList<String>();
+        Set<String> targetNames = new HashSet<String>();
         int targets = 0;
         int unresolved = 0;
         for (int i = 0; i < ops.size(); i++) {
@@ -3191,6 +3258,7 @@ public class ExtractIR extends GhidraScript {
                     "\", \"op\": \"BRANCHIND\"" +
                     ", \"targets\": [" + tb.toString() + "]}");
                 targets += sorted.size();
+                targetNames.addAll(sorted);
                 continue;
             }
             // Not a LOAD dispatch: classify instead of guessing.
@@ -3256,6 +3324,7 @@ public class ExtractIR extends GhidraScript {
                             ", \"targets\": [\"" + esc(fn.getName()) +
                             "\"]}");
                         targets += 1;
+                        targetNames.add(fn.getName());
                         continue;
                     }
                     if (t >= funcStart && t < funcEnd) {
@@ -3267,7 +3336,7 @@ public class ExtractIR extends GhidraScript {
             }
             unresolved++;
         }
-        return new TailCallResult(out, targets, unresolved);
+        return new TailCallResult(out, targets, unresolved, targetNames);
     }
 
     /** v3.6 field offsets per struct, from the v2.0.0 source layouts
@@ -3539,6 +3608,166 @@ public class ExtractIR extends GhidraScript {
         return Long.parseLong(s, 16);
     }
 
+    // ---------------- v2 item #2: inter-procedural constant propagation ----------------
+    // SOUND SLICE, not a redesign: constants flow through DIRECT calls
+    // with constant arguments, into callees whose EVERY call site is
+    // modelled and agrees. The must-fixpoint of a callee starts from
+    // an entry state binding its argument registers (all other
+    // registers unknown, as before); propagated constants then
+    // produce MORE entries in the existing mmio/port/msr classes --
+    // no new JSON fields, no new flags, same one-command pipeline.
+    //
+    // SOUNDNESS (non-negotiable -- Lean trusts extractor JSON):
+    // a propagated constant becomes a MUST-fact only when it holds
+    // on ALL executions entering the callee. The entry for callee F
+    // is the meet over ALL of F's direct call sites: one disagreeing
+    // site (different constant, or an unknown value) drops that
+    // argument to unknown. And F gets an entry ONLY when its caller
+    // set is fully accounted for:
+    //   (a) at least one direct call site, and
+    //   (b) every Ghidra caller of F contains a direct CALL to F
+    //       (a purely-indirect caller is unmodelled), and
+    //   (c) F's address is never stored (not address-taken: a stored
+    //       pointer could call F from anywhere), and
+    //   (d) F is never a tail-call target (a jump to F passes
+    //       arguments the direct-call meet cannot see), and
+    //   (e) every direct site is modelled (x86-64: the callee's
+    //       Ghidra convention must be known, so the argument
+    //       registers are determined, never union-guessed), and
+    //   (f) F is not external (no body to analyse).
+    // Anything failing a guard keeps today's behaviour (all-unknown
+    // entry). Functions with no callers (entry points, interrupt
+    // handlers) also stay unknown. Return values are NOT propagated
+    // (still unknown after CALL, as before); globals/memory are NOT
+    // propagated (a BAR base stored to a global and reloaded in
+    // another function is future work, as is context-sensitive
+    // cloning for helpers called with varying constants -- merging
+    // per-context findings into one per-function must-set would
+    // violate the rule above, so it needs per-context attribution).
+    // Residual risk, documented: an indirect call whose target
+    // address is computed arithmetically (never stored, never a
+    // literal) evades guard (c) -- the same hole as the v3.5
+    // points-to recovery itself.
+    //
+    // CONVERGENCE: entries only gain precision across rounds
+    // (intra-procedural transfer is monotone in input precision, and
+    // a site value can only go unknown -> exact, never exact ->
+    // different exact), so the worklist iteration terminates; the
+    // round cap is a safety bound only, and the last iterate is
+    // still sound (every iterate is justified by induction from the
+    // all-unknown round-0 entries). A non-converged per-function
+    // fixpoint keeps its previous converged result when one exists
+    // (a converged result computed under a less-precise entry is a
+    // sound under-approximation under a more-precise entry, by the
+    // same monotonicity); otherwise it falls back to empty states,
+    // as before.
+    private static final int MAX_CONSTPROP_ROUNDS = 32;
+
+    /** One function's Phase A record: everything the emission loop
+        used to compute inline, plus the final must-fixpoint. */
+    private static class FuncRec {
+        Function f;
+        OpsResult or;
+        Map<Integer, List<Integer>> branchTargets;
+        IndirectResult ind;
+        TailCallResult tc;
+        /** Canonical entry key: the function's raw entry offset. */
+        long entryKey;
+        /** Final must-fixpoint (Phase B), never null after Phase B. */
+        FixResult fx;
+    }
+
+    /** One direct call site: the caller record + the CALL op index. */
+    private static class CallSite {
+        final FuncRec caller;
+        final int opIdx;
+        CallSite(FuncRec caller, int opIdx) {
+            this.caller = caller;
+            this.opIdx = opIdx;
+        }
+    }
+
+    /** Synthetic register varnode for reading an argument register
+        out of a fixpoint state. resolveExact slices containing
+        views, so a full-width read after a narrow write correctly
+        yields unknown unless the wider view itself is known. */
+    private Varnode regVarnode(long off, int size) {
+        try {
+            AddressSpace rs = currentProgram.getAddressFactory()
+                .getAddressSpace(isa.registerSpaceName());
+            if (rs == null) return null;
+            return new Varnode(rs.getAddress(off), size);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Entry-state equality with null treated as empty (absent entry
+        and all-unknown entry are the same state). */
+    private static boolean entrySame(Map<String, Bits> a,
+        Map<String, Bits> b) {
+        if (a == null) a = new HashMap<String, Bits>();
+        if (b == null) b = new HashMap<String, Bits>();
+        return sameState(a, b);
+    }
+
+    /** Meet over ALL direct call sites of one callee: an argument
+        register is bound only when every site has it exact AND all
+        sites agree on the value. Anything else stays unknown
+        (absent from the returned map). */
+    private Map<String, Bits> meetOverSites(long calleeKey,
+        Map<Long, List<CallSite>> sitesByCallee,
+        Map<Long, long[]> argRegsByCallee) {
+        Map<String, Bits> out = new HashMap<String, Bits>();
+        List<CallSite> sites = sitesByCallee.get(calleeKey);
+        long[] argRegs = argRegsByCallee.get(calleeKey);
+        if (sites == null || sites.isEmpty() || argRegs == null) {
+            return out;
+        }
+        int ptrSize = isa.pointerSize();
+        long mask = sizeMask(ptrSize);
+        for (long off : argRegs) {
+            Varnode vn = regVarnode(off, ptrSize);
+            if (vn == null) continue;
+            Long agreed = null;
+            boolean allExact = true;
+            for (CallSite s : sites) {
+                FixResult fx = s.caller.fx;
+                Long v = null;
+                if (fx != null && fx.inStates != null &&
+                    s.opIdx < fx.inStates.length &&
+                    fx.inStates[s.opIdx] != null) {
+                    v = resolveExact(vn, fx.inStates[s.opIdx]);
+                }
+                if (v == null) {
+                    allExact = false;
+                    break;
+                }
+                if (agreed == null) {
+                    agreed = v;
+                } else if (!agreed.equals(v)) {
+                    allExact = false;
+                    break;
+                }
+            }
+            if (allExact && agreed != null) {
+                out.put(isa.registerSpaceName() + ":" + off + ":" +
+                    ptrSize, Bits.exact(agreed.longValue(), mask));
+            }
+        }
+        return out;
+    }
+
+    /** Empty must-fixpoint fallback (same as the old per-function
+        exception fallback: claim nothing). */
+    private static FixResult emptyFix(int nOps) {
+        Map<String, Bits>[] empty = new Map[nOps];
+        for (int i = 0; i < empty.length; i++) {
+            empty[i] = new HashMap<String, Bits>();
+        }
+        return new FixResult(empty, false);
+    }
+
     @Override
     public void run() throws Exception {
         if (getScriptArgs().length < 1) {
@@ -3697,7 +3926,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.8\",");
+        w.println("  \"extractor_version\": \"v3.9\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -3718,7 +3947,6 @@ public class ExtractIR extends GhidraScript {
         w.println("  ],");
         w.println("  \"functions\": [");
 
-        FunctionIterator functions = currentProgram.getFunctionManager().getFunctions(true);
         boolean firstFn = true;
         int fnCount = 0;
         int totalMmio = 0;
@@ -3771,8 +3999,271 @@ public class ExtractIR extends GhidraScript {
                 new HashMap<String, Set<String>>(),
                 new ArrayList<String>(), 0);
         }
-        while (functions.hasNext() && !monitor.isCancelled()) {
-            Function f = functions.next();
+        // ---- v2 item #2, Phase A: per-function records + call-site map ----
+        // The emission loop used to analyse each function inline; the
+        // must-fixpoint now needs cross-function entry states, so all
+        // per-function inputs are built first (same computations, same
+        // order: ops, jump-table targets, indirect recovery with the
+        // successor merge, tail calls), then Phase B iterates the
+        // must-fixpoints, then emission reuses the stored results.
+        // The may-fixpoint, points-to and emission code below are
+        // unchanged (may still starts all-unknown).
+        Memory memA = currentProgram.getMemory();
+        FunctionManager fmA = currentProgram.getFunctionManager();
+        List<FuncRec> funcRecs = new ArrayList<FuncRec>();
+        Map<Long, FuncRec> funcByEntry = new HashMap<Long, FuncRec>();
+        FunctionIterator pafns = fmA.getFunctions(true);
+        while (pafns.hasNext() && !monitor.isCancelled()) {
+            Function pf = pafns.next();
+            FuncRec rec = new FuncRec();
+            rec.f = pf;
+            rec.or = buildOps(pf);
+            List<OpRec> pops = rec.or.ops;
+            try {
+                rec.branchTargets = isa.recoverJumpTableTargets(pops, memA);
+            } catch (Exception e) {
+                rec.branchTargets = new HashMap<Integer, List<Integer>>();
+            }
+            try {
+                rec.ind = recoverIndirect(pops, memA, fmA,
+                    rec.branchTargets.keySet());
+            } catch (Exception e) {
+                rec.ind = new IndirectResult(new ArrayList<String>(), 0,
+                    new HashMap<Integer, List<Integer>>(),
+                    new HashSet<Integer>());
+            }
+            for (Map.Entry<Integer, List<Integer>> e :
+                rec.ind.successors.entrySet()) {
+                List<Integer> cur = rec.branchTargets.get(e.getKey());
+                if (cur == null) {
+                    rec.branchTargets.put(e.getKey(), e.getValue());
+                } else {
+                    for (Integer j : e.getValue()) {
+                        if (!cur.contains(j)) cur.add(j);
+                    }
+                }
+            }
+            try {
+                long funcStart = pf.getEntryPoint().getOffset();
+                long funcEnd = funcStart + 1L;
+                try {
+                    funcEnd = pf.getBody().getMaxAddress().getOffset() + 1L;
+                } catch (Exception e) {
+                }
+                rec.tc = recoverTailCalls(pops, memA, fmA,
+                    funcPtrByOffset, funcPtrByAddr,
+                    rec.ind.resolvedBranchInds,
+                    rec.branchTargets.keySet(), funcStart, funcEnd);
+            } catch (Exception e) {
+                rec.tc = new TailCallResult(new ArrayList<String>(), 0, 0);
+            }
+            long ep = pf.getEntryPoint().getOffset();
+            rec.entryKey = ep;
+            rec.fx = emptyFix(pops.size());
+            funcRecs.add(rec);
+            funcByEntry.put(ep, rec);
+            long stripped = isa.stripInstructionTag(ep);
+            if (stripped != ep) funcByEntry.put(stripped, rec);
+        }
+        // Direct call sites, grouped by callee, + caller -> callees.
+        Map<Long, List<CallSite>> sitesByCallee =
+            new HashMap<Long, List<CallSite>>();
+        Map<Long, Set<Long>> calleesByCaller =
+            new HashMap<Long, Set<Long>>();
+        Map<Long, Set<Long>> directCallersByCallee =
+            new HashMap<Long, Set<Long>>();
+        for (FuncRec rec : funcRecs) {
+            List<OpRec> pops = rec.or.ops;
+            for (int i = 0; i < pops.size(); i++) {
+                OpRec op = pops.get(i);
+                if (!op.mnem.equals("CALL") || op.ins.length < 1) {
+                    continue;
+                }
+                Varnode t = op.ins[0];
+                if (t == null || t.getAddress() == null ||
+                    !"ram".equals(t.getAddress().getAddressSpace().
+                        getName())) {
+                    continue;
+                }
+                FuncRec callee = funcByEntry.get(t.getOffset());
+                if (callee == null) {
+                    callee = funcByEntry.get(
+                        isa.stripInstructionTag(t.getOffset()));
+                }
+                if (callee == null) continue;
+                List<CallSite> sl = sitesByCallee.get(callee.entryKey);
+                if (sl == null) {
+                    sl = new ArrayList<CallSite>();
+                    sitesByCallee.put(callee.entryKey, sl);
+                }
+                sl.add(new CallSite(rec, i));
+                Set<Long> cb = calleesByCaller.get(rec.entryKey);
+                if (cb == null) {
+                    cb = new HashSet<Long>();
+                    calleesByCaller.put(rec.entryKey, cb);
+                }
+                cb.add(callee.entryKey);
+                Set<Long> dc = directCallersByCallee.get(callee.entryKey);
+                if (dc == null) {
+                    dc = new HashSet<Long>();
+                    directCallersByCallee.put(callee.entryKey, dc);
+                }
+                dc.add(rec.entryKey);
+            }
+        }
+        // Guards (see the v2 item #2 header comment).
+        Set<String> addrTakenNames = new HashSet<String>();
+        for (Set<String> s : funcPtrByOffset.values()) {
+            addrTakenNames.addAll(s);
+        }
+        for (Set<String> s : funcPtrByAddr.values()) {
+            addrTakenNames.addAll(s);
+        }
+        Set<String> tailTargetNames = new HashSet<String>();
+        for (FuncRec rec : funcRecs) {
+            tailTargetNames.addAll(rec.tc.targetNames);
+        }
+        Map<Long, Boolean> eligible = new HashMap<Long, Boolean>();
+        Map<Long, long[]> argRegsByCallee =
+            new HashMap<Long, long[]>();
+        for (FuncRec callee : funcRecs) {
+            boolean ok = true;
+            List<CallSite> sites = sitesByCallee.get(callee.entryKey);
+            if (callee.f.isExternal() || sites == null ||
+                sites.isEmpty()) {
+                ok = false;
+            }
+            if (ok && addrTakenNames.contains(callee.f.getName())) {
+                ok = false;
+            }
+            if (ok && tailTargetNames.contains(callee.f.getName())) {
+                ok = false;
+            }
+            if (ok) {
+                try {
+                    Set<Function> callers =
+                        callee.f.getCallingFunctions(monitor);
+                    Set<Long> directCallers =
+                        directCallersByCallee.get(callee.entryKey);
+                    for (Function cf : callers) {
+                        FuncRec callerRec = funcByEntry.get(
+                            cf.getEntryPoint().getOffset());
+                        if (callerRec == null || directCallers == null ||
+                            !directCallers.contains(callerRec.entryKey)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                } catch (Exception e) {
+                    ok = false;
+                }
+            }
+            long[] argRegs = null;
+            if (ok) {
+                argRegs = isa.argumentRegisterOffsets(
+                    callConvMap.get(callee.entryKey));
+                if (argRegs == null) ok = false;
+            }
+            eligible.put(callee.entryKey, ok);
+            if (ok) argRegsByCallee.put(callee.entryKey, argRegs);
+        }
+        // ---- v2 item #2, Phase B: worklist iteration over entries ----
+        Map<Long, Map<String, Bits>> entries =
+            new HashMap<Long, Map<String, Bits>>();
+        Set<Long> worklist = new HashSet<Long>();
+        for (FuncRec rec : funcRecs) worklist.add(rec.entryKey);
+        boolean cpConverged = false;
+        int cpRounds = 0;
+        for (int round = 0; round < MAX_CONSTPROP_ROUNDS && !cpConverged;
+            round++) {
+            if (monitor.isCancelled()) break;
+            cpRounds++;
+            for (Long ek : worklist) {
+                FuncRec rec = funcByEntry.get(ek);
+                if (rec == null) continue;
+                Map<String, Bits> e = entries.get(ek);
+                FixResult nfx;
+                try {
+                    nfx = runFixpoint(rec.or.ops, memA,
+                        rec.branchTargets, e);
+                } catch (Exception ex) {
+                    nfx = emptyFix(rec.or.ops.size());
+                }
+                // Keep a previous converged result over a fresh
+                // non-converged one (whose states were emptied):
+                // the old result is a sound under-approximation
+                // under the more-precise entry, and swapping in
+                // emptied states would make entries oscillate.
+                if (nfx.converged || rec.fx == null ||
+                    !rec.fx.converged) {
+                    rec.fx = nfx;
+                }
+            }
+            Set<Long> affected = new HashSet<Long>();
+            for (Long ek : worklist) {
+                Set<Long> cb = calleesByCaller.get(ek);
+                if (cb != null) affected.addAll(cb);
+            }
+            Set<Long> nextWorklist = new HashSet<Long>();
+            for (Long ck : affected) {
+                if (!Boolean.TRUE.equals(eligible.get(ck))) continue;
+                Map<String, Bits> m = meetOverSites(ck, sitesByCallee,
+                    argRegsByCallee);
+                if (!entrySame(entries.get(ck), m)) {
+                    entries.put(ck, m);
+                    nextWorklist.add(ck);
+                }
+            }
+            if (nextWorklist.isEmpty()) {
+                cpConverged = true;
+            } else {
+                worklist = nextWorklist;
+            }
+        }
+        if (!cpConverged && !worklist.isEmpty() &&
+            !monitor.isCancelled()) {
+            // Final pass so emission uses fixpoints consistent with
+            // the final entries (capped iteration is still sound:
+            // every iterate is justified, just possibly less precise).
+            for (Long ek : worklist) {
+                FuncRec rec = funcByEntry.get(ek);
+                if (rec == null) continue;
+                try {
+                    FixResult nfx = runFixpoint(rec.or.ops, memA,
+                        rec.branchTargets, entries.get(ek));
+                    if (nfx.converged || rec.fx == null ||
+                        !rec.fx.converged) {
+                        rec.fx = nfx;
+                    }
+                } catch (Exception ex) {
+                    // Keep the previous fixpoint.
+                }
+            }
+            println("[!] constprop: stopped after " +
+                MAX_CONSTPROP_ROUNDS +
+                " rounds without convergence; using last entries.");
+        }
+        {
+            int withEntries = 0;
+            int totalConsts = 0;
+            int eligibleCount = 0;
+            for (FuncRec rec : funcRecs) {
+                if (Boolean.TRUE.equals(eligible.get(rec.entryKey))) {
+                    eligibleCount++;
+                }
+                Map<String, Bits> e = entries.get(rec.entryKey);
+                if (e != null && !e.isEmpty()) {
+                    withEntries++;
+                    totalConsts += e.size();
+                }
+            }
+            println("[*] constprop: " + cpRounds + " rounds, converged=" +
+                cpConverged + ", eligible callees=" + eligibleCount +
+                ", functions with propagated entries=" + withEntries +
+                ", entry constants=" + totalConsts + ".");
+        }
+        for (FuncRec rec : funcRecs) {
+            Function f = rec.f;
             if (!firstFn) w.println(",");
             firstFn = false;
             fnCount++;
@@ -3810,60 +4301,18 @@ public class ExtractIR extends GhidraScript {
             }
             w.println("],");
 
-            // Phase 1: collect this function's P-Code ops (capped).
-            // Phase 2: CFG fixpoint over them (see header: must-analysis,
-            // unique-strip at instruction boundaries, CALL clobber).
-            // Phase 3: stream the P-Code JSON and record MMIO accesses
-            // from the FINAL states -- never from a running linear scan.
-            OpsResult or = buildOps(f);
+            // Emission reuses the Phase A/B results: ops, merged
+            // branch targets, indirect recovery, and the final
+            // must-fixpoint (with inter-procedural entry states).
+            // The may-fixpoint below still runs inline, all-unknown,
+            // exactly as before v2 item #2.
+            OpsResult or = rec.or;
             List<OpRec> ops = or.ops;
             boolean truncated = or.truncated;
             int opCount = ops.size();
-            // Jump-table targets (ARM: TBB/TBH) via the ISA adapter, shared by both fixpoints.
-            // On any recovery failure, fall back to no targets (same
-            // behaviour as before v3.3 -- sound, just less recall).
-            Map<Integer, List<Integer>> branchTargets;
-            try {
-                branchTargets = isa.recoverJumpTableTargets(ops,
-                    currentProgram.getMemory());
-            } catch (Exception e) {
-                branchTargets = new HashMap<Integer, List<Integer>>();
-            }
-            // v3.4: indirect recovery runs BEFORE the fixpoints, so
-            // pointer-table intra-function successors join the shared
-            // map (call-graph edges are printed, not successors).
-            IndirectResult ind;
-            try {
-                ind = recoverIndirect(ops, currentProgram.getMemory(),
-                    currentProgram.getFunctionManager(),
-                    branchTargets.keySet());
-            } catch (Exception e) {
-                ind = new IndirectResult(new ArrayList<String>(), 0,
-                    new HashMap<Integer, List<Integer>>(),
-                    new HashSet<Integer>());
-            }
-            for (Map.Entry<Integer, List<Integer>> e :
-                ind.successors.entrySet()) {
-                List<Integer> cur = branchTargets.get(e.getKey());
-                if (cur == null) {
-                    branchTargets.put(e.getKey(), e.getValue());
-                } else {
-                    for (Integer j : e.getValue()) {
-                        if (!cur.contains(j)) cur.add(j);
-                    }
-                }
-            }
-            FixResult fx;
-            try {
-                fx = runFixpoint(ops, currentProgram.getMemory(),
-                    branchTargets);
-            } catch (Exception e) {
-                Map<String, Bits>[] empty = new Map[ops.size()];
-                for (int i = 0; i < empty.length; i++) {
-                    empty[i] = new HashMap<String, Bits>();
-                }
-                fx = new FixResult(empty, false);
-            }
+            Map<Integer, List<Integer>> branchTargets = rec.branchTargets;
+            IndirectResult ind = rec.ind;
+            FixResult fx = rec.fx;
             MayResult my;
             try {
                 my = runMayFixpoint(ops, currentProgram.getMemory(),
@@ -4182,22 +4631,9 @@ public class ExtractIR extends GhidraScript {
             w.println("      \"may_call_site_count\": " + pt.maySites.size() + ",");
             w.println("      \"may_call_target_count\": " + pt.mayTargets + ",");
             w.println("      \"unresolved_indirect_count\": " + pt.unresolved + ",");
-            // v3.6: tail-call recovery for this function.
-            TailCallResult tc;
-            try {
-                long funcStart = f.getEntryPoint().getOffset();
-                long funcEnd = funcStart + 1L;
-                try {
-                    funcEnd = f.getBody().getMaxAddress().getOffset() + 1L;
-                } catch (Exception e) {
-                }
-                tc = recoverTailCalls(ops, currentProgram.getMemory(),
-                    currentProgram.getFunctionManager(), funcPtrByOffset,
-                    funcPtrByAddr, ind.resolvedBranchInds,
-                    branchTargets.keySet(), funcStart, funcEnd);
-            } catch (Exception e) {
-                tc = new TailCallResult(new ArrayList<String>(), 0, 0);
-            }
+            // v3.6: tail-call recovery, computed in Phase A and reused
+            // here (same data the entry guards used).
+            TailCallResult tc = rec.tc;
             w.println("      \"may_tail_call_edges\": [");
             for (int i = 0; i < tc.sites.size(); i++) {
                 if (i > 0) w.println(",");
