@@ -9,13 +9,23 @@ import Lean
 
 open Lean
 
-/-- One MMIO access, as exported by ExtractIR v3. -/
+/-- What address space a trace op lives in. -/
+inductive TraceKind | mmio | port | msr
+  deriving Repr, DecidableEq, Inhabited
+
+/-- One trace op, as exported by ExtractIR v3 (MMIO) and v3.8 (port/MSR).
+    The structure keeps its historical name; `kind` distinguishes the
+    space. `addr` is the MMIO address, the I/O port number, or the MSR
+    index, respectively. `isStore` is STORE for MMIO, OUT for ports,
+    WRMSR for MSRs. Default kind is mmio, so pre-v3.8 literals (e.g.
+    BlinkProof's badTrace) keep working unchanged. -/
 structure MmioAccess where
   isStore : Bool
   func : String
   addr : Nat
   ones : Nat
   zeroes : Nat
+  kind : TraceKind := .mmio
   deriving Repr, DecidableEq, Inhabited
 
 /-- What "safe" means for one GPIO pin. -/
@@ -60,16 +70,51 @@ def extractAccess (func : String) (j : Json) : Except String MmioAccess := do
   let addr ← parseHex addrS
   let ones ← j.getObjVal? "value_known_ones" >>= Json.getNat?
   let zeroes ← j.getObjVal? "value_known_zeroes" >>= Json.getNat?
-  pure { isStore := op == "STORE", func := func, addr := addr, ones := ones, zeroes := zeroes }
+  pure { isStore := op == "STORE", func := func, addr := addr, ones := ones, zeroes := zeroes, kind := .mmio }
 
-/-- All MMIO accesses of all functions, in file order. -/
+/-- One I/O-port access: the "port" hex string is the port number.
+    OUT is the write direction (isStore), IN the read direction. -/
+def extractPortAccess (func : String) (j : Json) : Except String MmioAccess := do
+  let op ← j.getObjVal? "op" >>= Json.getStr?
+  let portS ← j.getObjVal? "port" >>= Json.getStr?
+  let port ← parseHex portS
+  let ones ← j.getObjVal? "value_known_ones" >>= Json.getNat?
+  let zeroes ← j.getObjVal? "value_known_zeroes" >>= Json.getNat?
+  pure { isStore := op == "OUT", func := func, addr := port, ones := ones, zeroes := zeroes, kind := .port }
+
+/-- One MSR access: the "index" hex string is the MSR index.
+    WRMSR is the write direction (isStore), RDMSR the read direction. -/
+def extractMsrAccess (func : String) (j : Json) : Except String MmioAccess := do
+  let op ← j.getObjVal? "op" >>= Json.getStr?
+  let idxS ← j.getObjVal? "index" >>= Json.getStr?
+  let idx ← parseHex idxS
+  let ones ← j.getObjVal? "value_known_ones" >>= Json.getNat?
+  let zeroes ← j.getObjVal? "value_known_zeroes" >>= Json.getNat?
+  pure { isStore := op == "WRMSR", func := func, addr := idx, ones := ones, zeroes := zeroes, kind := .msr }
+
+/-- All trace ops of all functions, in file order. Per function the
+    order is MMIO ops, then port ops, then MSR ops (the JSON carries
+    three separate arrays, so no interleaved order exists to preserve).
+    Port/MSR fields are optional: absent (pre-v3.8 reports) means no
+    port/MSR ops, not an error — same policy as may_accesses. A
+    present-but-malformed port/MSR field is an error, not silently
+    ignored. The mmio_accesses field keeps its historical strict
+    behavior (absent = error). -/
 def extractTrace (j : Json) : Except String (List MmioAccess) := do
   let fns ← j.getObjVal? "functions" >>= Json.getArr?
   fns.toList.foldlM (fun acc fn => do
     let name ← fn.getObjVal? "name" >>= Json.getStr?
     let arr ← fn.getObjVal? "mmio_accesses" >>= Json.getArr?
     let accs ← arr.toList.mapM (extractAccess name)
-    pure (acc ++ accs)) []
+    let parr ← match fn.getObjVal? "port_io_accesses" with
+      | .ok v => Json.getArr? v
+      | .error _ => pure #[]
+    let paccs ← parr.toList.mapM (extractPortAccess name)
+    let marr ← match fn.getObjVal? "msr_accesses" with
+      | .ok v => Json.getArr? v
+      | .error _ => pure #[]
+    let maccs ← marr.toList.mapM (extractMsrAccess name)
+    pure (acc ++ accs ++ paccs ++ maccs)) []
 
 /-- All MAY-accesses, expanded: one MmioAccess per possible address.
 Absent "may_accesses" (old reports) means no may data, not an error;
@@ -90,7 +135,7 @@ def extractMayTrace (j : Json) : Except String (List MmioAccess) := do
         let addrS ← Json.getStr? aJson
         let addr ← parseHex addrS
         pure { isStore := op == "STORE", func := name, addr := addr,
-               ones := ones, zeroes := zeroes })
+               ones := ones, zeroes := zeroes, kind := .mmio })
       pure (a2 ++ expanded)) []
     pure (acc ++ accs)) []
 
@@ -146,11 +191,26 @@ def checkMasksConsistent (trace : List MmioAccess) : Bool :=
 def checkWindow (lo hi : Nat) (trace : List MmioAccess) : Bool :=
   trace.all fun a => decide (lo ≤ a.addr) && decide (a.addr < hi)
 
-/-- Window check against a band list: an address passes if it falls in
-    ANY band. The bands come from the report's "mmio_windows" field
-    (the extractor adapter's own constants); see extractMmioWindows. -/
+/-- Window check against a band list, for MMIO ops only: an MMIO address
+    passes if it falls in ANY band. The bands come from the report's
+    "mmio_windows" field (the extractor adapter's own constants); see
+    extractMmioWindows. Port/MSR ops pass vacuously here — they live in
+    different spaces and are covered by checkPortMsrSanity instead, so
+    a port number is never judged against MMIO bands. -/
 def checkWindowBands (windows : List (Nat × Nat)) (trace : List MmioAccess) : Bool :=
-  trace.all fun a => windows.any fun w => decide (w.1 ≤ a.addr) && decide (a.addr < w.2)
+  trace.all fun a => !decide (a.kind = .mmio) ||
+    windows.any fun w => decide (w.1 ≤ a.addr) && decide (a.addr < w.2)
+
+/-- Sanity for non-MMIO ops: a port number must fit the 16-bit I/O
+    port space, an MSR index must fit 32 bits. MMIO ops pass vacuously
+    (their window check is checkWindowBands). This is a sanity bound,
+    NOT a confinement check: port/MSR confinement (which ports/MSRs a
+    driver may touch) is future work, deliberately not added here. -/
+def checkPortMsrSanity (trace : List MmioAccess) : Bool :=
+  trace.all fun a =>
+    if a.kind = .port then decide (a.addr ≤ 0xFFFF)
+    else if a.kind = .msr then decide (a.addr < 2 ^ 32)
+    else true
 
 /-- MMIO bands claimed by the extractor, as [start, end) hex-string pairs
     in the report's top-level "mmio_windows" field. Absent (old reports)

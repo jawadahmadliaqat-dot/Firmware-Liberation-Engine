@@ -3,7 +3,12 @@
   Usage: lake exe ingest_check <report.json> [blink|generic|bmp]
   Default mode is blink (the PA5 spec); generic runs only the
   firmware-agnostic invariants (non-empty trace, consistent masks,
-  addresses inside the MMIO bands).
+  MMIO addresses inside the bands, port/MSR sanity).
+  The trace is unified: "trace ops" counts MMIO + port + MSR ops
+  (the breakdown line right after it splits the count by kind).
+  Reports without port/MSR fields (pre-v3.8) yield the same trace
+  as before — the breakdown is then (N, 0, 0) and every pre-existing
+  output line is unchanged.
   Generic-mode bands: the report's top-level "mmio_windows" field
   (emitted by ExtractIR from the ISA adapter's own constants).
   Reports without the field (old reports) fall back to the historical
@@ -30,10 +35,12 @@ def printGeneric (windows : List (Nat × Nat)) (trace : List MmioAccess) : IO Bo
   let nonempty := !trace.isEmpty
   let masks := checkMasksConsistent trace
   let window := checkWindowBands windows trace
+  let sanity := checkPortMsrSanity trace
   IO.println s!"trace non-empty: {nonempty}"
   IO.println s!"masks consistent (ones & zeroes == 0): {masks}"
   IO.println s!"all addresses in MMIO window: {window}"
-  pure (nonempty && masks && window)
+  IO.println s!"port/MSR sanity (port ≤ 0xFFFF, MSR index < 2^32): {sanity}"
+  pure (nonempty && masks && window && sanity)
 
 def printBmp (trace : List MmioAccess) (mayTrace : List MmioAccess) : IO Bool := do
   let generic := checkGeneric trace
@@ -55,6 +62,10 @@ def main (args : List String) : IO UInt32 := do
     | .error e => IO.println s!"extract failed: {e}"; pure 1
     | .ok trace => do
       IO.println s!"trace ops: {trace.length}"
+      let mmioN := (trace.filter fun a => decide (a.kind = .mmio)).length
+      let portN := (trace.filter fun a => decide (a.kind = .port)).length
+      let msrN := (trace.filter fun a => decide (a.kind = .msr)).length
+      IO.println s!"trace ops by kind (mmio, port, msr): ({mmioN}, {portN}, {msrN})"
       match extractMayTrace j with
       | .error e => IO.println s!"may extract failed: {e}"; pure 1
       | .ok mayTrace => do
