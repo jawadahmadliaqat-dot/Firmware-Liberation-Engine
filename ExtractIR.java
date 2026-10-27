@@ -1481,16 +1481,152 @@ public class ExtractIR extends GhidraScript {
         return b.exactValue(sizeMask(v.getSize()));
     }
 
-    private static Bits copyBits(Varnode in, Memory mem, Map<String, Bits> bvals,
+    // ---------------- v10 u32: sound sign-extension truncation ----
+    // A 32-bit address held in a u32 (bit 31 set) is widened to 64
+    // bits through a SIGNED int on x86-64, so Ghidra lifts an
+    // INT_SEXT and the address becomes 0xFFFFFFFFFED00000 --
+    // outside every MMIO band, so the access was missed (and a
+    // STORE even polluted memState at the bogus address). The
+    // memprop fixtures had to use u64 globals to dodge this.
+    //
+    // Predicate (ones/zeroes reasoning): a Bits value is provably
+    // the sign-extension of a 32-bit value iff bit 31 is KNOWN and
+    // bits 63..32 are all KNOWN copies of bit 31: bit 31 known 1
+    // requires every upper bit a known 1; bit 31 known 0 requires
+    // every upper bit a known 0. A symbol never satisfies it
+    // (ones == 0 && zeroes == 0, so bit 31 is unknown), a value
+    // with unknown upper bits never does, and a genuine 64-bit
+    // pointer with meaningful upper bits (e.g. 0x00007F00FED00000:
+    // upper 0x00007F00, not all copies of bit 31) never does.
+    // The residual, stated honestly: a genuine 64-bit address whose
+    // upper 32 bits HAPPEN to be all sign copies (e.g. a kernel
+    // address 0xFFFFFFFFFED00000 used as a real pointer) is
+    // indistinguishable from a sign-extended 32-bit address at the
+    // Bits level, and is read as the 32-bit address. In the
+    // analyzed domain (x86-64 firmware/UEFI, where addresses are
+    // 32-bit values) that reading is the programmer's intent.
+    //
+    // Band gate (why truncation is band-checked, not blanket): a
+    // truncated value whose low 32 bits are NOT in any band keeps
+    // today's exact behaviour (same key, same non-MMIO verdict), so
+    // the fix changes NOTHING except MMIO-band recoveries. A
+    // blanket truncation would re-key non-band memState cells and
+    // break currently-working absolute-address connections.
+    private static boolean isSext32(Bits b) {
+        if (b == null || b.sym != null) return false;
+        final long UPPER = 0xFFFFFFFF00000000L;
+        final long SIGN = 0x80000000L;
+        if ((b.ones & SIGN) != 0) return (b.ones & UPPER) == UPPER;
+        if ((b.zeroes & SIGN) != 0) return (b.zeroes & UPPER) == UPPER;
+        return false;
+    }
+
+    /** Exact-long version of the sext32 shape test, for values
+        (may-address sets, constant ram addresses) that carry no
+        Bits: true iff a is exactly the sign-extension of its low
+        32 bits. Note a plain 32-bit-range constant (e.g.
+        0xFED00000 as a long) is NOT sext-shaped -- its
+        sign-extension is 0xFFFFFFFFFED00000, a different value --
+        so band addresses already in 32-bit form are untouched. */
+    private static boolean isSext32Value(long a) {
+        return a == (long)(int)a;
+    }
+
+    /** Address resolution for MEMORY addresses (band-gated
+        truncation): the exact value when known; when the Bits
+        provably represent a sign-extended 32-bit value AND the low
+        32 bits fall in an MMIO band, the low 32 bits (the true
+        address). Otherwise exactly today's resolveExact result
+        (including null for unknown/symbolic values). Callers still
+        apply their own band check to the result; a truncated value
+        outside every band is never returned here, so it can never
+        be band-shopped into a finding. */
+    private Long resolveAddressExact(Varnode v,
+        Map<String, Bits> bvals) {
+        if (v == null) return null;
+        Bits b = resolveBits(v, bvals);
+        if (b.sym != null) return null;
+        Long ex = b.exactValue(sizeMask(v.getSize()));
+        if (ex != null) {
+            if (isSext32(b)) {
+                long low = ex.longValue() & 0xFFFFFFFFL;
+                if (isa.isMmioAddress(low)) return low;
+            }
+            return ex;
+        }
+        if (isSext32(b)) {
+            Long low = b.exactValue(0xFFFFFFFFL);
+            if (low != null && isa.isMmioAddress(low.longValue())) {
+                return low;
+            }
+        }
+        return null;
+    }
+
+    /** Constant-address version of the band-gated rule, for
+        COPY-to-ram addresses (which never pass through Bits): a
+        sext-shaped constant whose low 32 bits are in a band reads
+        as the low 32 bits; anything else is unchanged. */
+    private long canonicalizeBandAddr(long a) {
+        if (isSext32Value(a)) {
+            long low = a & 0xFFFFFFFFL;
+            if (isa.isMmioAddress(low)) return low;
+        }
+        return a;
+    }
+
+    /** MSR-index resolution (NOT band-gated: MSR indices are
+        architecturally 32-bit -- WRMSR/RDMSR take ECX -- so a
+        sext-shaped 64-bit index IS the 32-bit index; there is no
+        band to gate on and no genuine-64-bit index domain). */
+    private static Long resolveMsrIndexExact(Varnode v,
+        Map<String, Bits> bvals) {
+        if (v == null) return null;
+        Bits b = resolveBits(v, bvals);
+        if (b.sym != null) return null;
+        Long ex = b.exactValue(sizeMask(v.getSize()));
+        if (ex != null) {
+            if (isSext32(b)) return ex.longValue() & 0xFFFFFFFFL;
+            return ex;
+        }
+        if (isSext32(b)) return b.exactValue(0xFFFFFFFFL);
+        return null;
+    }
+
+    // v10 u32: instance method (was static) because the size-correct
+    // image read now consults memLookup, which needs the instance's
+    // memBigEndian. All callers are in instance methods.
+    private Bits copyBits(Varnode in, Memory mem, Map<String, Bits> bvals,
         IsaAdapter isa) {
         if (in.isConstant()) {
             return Bits.exact(in.getOffset(), sizeMask(in.getSize()));
         }
         if (in.getAddress() != null &&
             "ram".equals(in.getAddress().getAddressSpace().getName())) {
+            // v10 u32: read EXACTLY the load's size, not a pointer.
+            // readPointer reads 8 bytes even for a 4-byte (or
+            // 1-byte) load, and throws when the variable sits at
+            // the end of its memory block -- proven by the u32
+            // fixture: a 4-byte global as the last word of .data
+            // (getLong crossing into unreadable .bss) made every
+            // 4-byte global load yield unknown. Size-correct reads
+            // mirror loadBits. MMIO addresses stay unknown
+            // (hardware state, never image bytes); a memState entry
+            // wins over image bytes, exactly as in the COPY-from-ram
+            // branch and loadBits.
+            long a = in.getAddress().getOffset();
+            if (isa.isMmioAddress(a)) return Bits.unknown();
+            Bits m = memLookup(bvals, a, in.getSize());
+            if (m != null) return m;
             try {
-                long val = isa.readPointer(mem, in.getAddress());
-                return Bits.exact(val, sizeMask(in.getSize()));
+                int sz = in.getSize();
+                long val;
+                if (sz == 8) val = mem.getLong(in.getAddress());
+                else if (sz == 4) val = mem.getInt(in.getAddress()) & 0xffffffffL;
+                else if (sz == 2) val = mem.getShort(in.getAddress()) & 0xffffL;
+                else if (sz == 1) val = mem.getByte(in.getAddress()) & 0xffL;
+                else return Bits.unknown();
+                return Bits.exact(val, sizeMask(sz));
             } catch (Exception e) {
                 return Bits.unknown();
             }
@@ -1517,7 +1653,7 @@ public class ExtractIR extends GhidraScript {
             Bits r = fldLookup(bvals, ab.sym, out.getSize());
             return r != null ? r : Bits.unknown();
         }
-        Long addr = resolveExact(ins[1], bvals);
+        Long addr = resolveAddressExact(ins[1], bvals);
         if (addr == null) return Bits.unknown();
         // Memory propagation: a memState entry covering the load
         // range wins over image bytes (the entry proves a
@@ -1629,7 +1765,12 @@ public class ExtractIR extends GhidraScript {
                     // hole that must not be left live. Any stale
                     // ram key from an earlier path is purged.
                     bvals.remove(vkey(out));
-                    long a = out.getOffset();
+                    // v10 u32: band-gated canonicalization of a
+                    // sext-shaped constant address (movabs to
+                    // 0xFFFFFFFFFED00020 reads as 0xFED00020, so
+                    // the MMIO store skips memState instead of
+                    // polluting it at the bogus address).
+                    long a = canonicalizeBandAddr(out.getOffset());
                     if (!isa.isMmioAddress(a)) {
                         dropMemRange(bvals, a, out.getSize(), true);
                         Bits vb = resolveBits(ins[0], bvals);
@@ -1811,7 +1952,15 @@ public class ExtractIR extends GhidraScript {
                 putKnown(bvals, vkey(out), Bits.unknown());
             }
         } else if (mnem.equals("INT_ZEXT") && ins.length == 1 && out != null) {
-            Bits a = resolveBits(ins[0], bvals);
+            // v10 u32: a direct ram input (Ghidra folds a global
+            // load into the extension, e.g. movslq mem -> SEXT)
+            // resolves from image bytes like COPY-from-ram; the
+            // plain resolveBits path returns unknown for ram keys
+            // (ram keys never live in bvals). Without this, every
+            // SEXT/ZEXT of a global was unknown before it began.
+            Bits a = isRamSpace(ins[0]) ?
+                copyBits(ins[0], mem, bvals, isa) :
+                resolveBits(ins[0], bvals);
             long outMask = sizeMask(out.getSize());
             long inMask = sizeMask(ins[0].getSize());
             // v7 cfgspace: zero-extension preserves the value, so it
@@ -1824,7 +1973,11 @@ public class ExtractIR extends GhidraScript {
                     (a.zeroes | ~inMask) & outMask));
             }
         } else if (mnem.equals("INT_SEXT") && ins.length == 1 && out != null) {
-            Bits a = resolveBits(ins[0], bvals);
+            // v10 u32: same ram-input resolution as INT_ZEXT
+            // (movslq of a u32 global folds the load into SEXT).
+            Bits a = isRamSpace(ins[0]) ?
+                copyBits(ins[0], mem, bvals, isa) :
+                resolveBits(ins[0], bvals);
             long outMask = sizeMask(out.getSize());
             long inMask = sizeMask(ins[0].getSize());
             long signBit = 1L << (ins[0].getSize() * 8 - 1);
@@ -1883,7 +2036,7 @@ public class ExtractIR extends GhidraScript {
             // later load from the same MMIO address does NOT
             // return the stored value.
             if (!op.addrIsStack) {
-                Long addr = resolveExact(ins[1], bvals);
+                Long addr = resolveAddressExact(ins[1], bvals);
                 if (addr != null &&
                     !isa.isMmioAddress(addr.longValue())) {
                     int sz = ins[2].getSize();
@@ -2048,7 +2201,7 @@ public class ExtractIR extends GhidraScript {
             // unknown. RDMSR/WRMSR fall through to unknown out.
             String am = op.instrAsm == null ? "" : op.instrAsm;
             if (am.equalsIgnoreCase("OUT") && ins.length >= 3) {
-                Long port = resolveExact(ins[1], bvals);
+                Long port = resolveAddressExact(ins[1], bvals);
                 if (port != null && port == 0xCF8L) {
                     Bits val = resolveBits(ins[2], bvals);
                     // Unknown value removes the cell (putKnown
@@ -2063,7 +2216,7 @@ public class ExtractIR extends GhidraScript {
                 // OUT to any other exact port: latch untouched.
             } else if (am.equalsIgnoreCase("IN") && ins.length >= 2 &&
                 out != null) {
-                Long port = resolveExact(ins[1], bvals);
+                Long port = resolveAddressExact(ins[1], bvals);
                 Bits cfg = bvals.get("cfg:addr");
                 Long cfgVal = cfg == null ? null :
                     cfg.exactValue(0xFFFFFFFFL);
@@ -6848,7 +7001,7 @@ public class ExtractIR extends GhidraScript {
                     sz = op.out.getSize();
                     vb = resolveBits(op.ins[0], st);
                 } else {
-                    Long addr = resolveExact(op.ins[1], st);
+                    Long addr = resolveAddressExact(op.ins[1], st);
                     if (addr == null) {
                         res.hasUnknownStore = true;
                         continue;
@@ -6934,7 +7087,7 @@ public class ExtractIR extends GhidraScript {
                         for (long off : argRegs) {
                             Varnode vn = regVarnode(off, ptrSize);
                             if (vn == null) continue;
-                            Long v = resolveExact(vn, st);
+                            Long v = resolveAddressExact(vn, st);
                             if (v != null &&
                                 candAddrs.contains(v.longValue())) {
                                 leaked.add(v.longValue());
@@ -6944,7 +7097,7 @@ public class ExtractIR extends GhidraScript {
                 } else if (op.mnem.equals("CALLIND")) {
                     leakScanRegs(st, candAddrs, leaked, regSpace);
                 } else if (op.mnem.equals("STORE") && op.ins.length >= 3) {
-                    Long v = resolveExact(op.ins[2], st);
+                    Long v = resolveAddressExact(op.ins[2], st);
                     if (v != null && candAddrs.contains(v.longValue())) {
                         leaked.add(v.longValue());
                     }
@@ -6953,7 +7106,7 @@ public class ExtractIR extends GhidraScript {
                     // COPY-to-ram store of a candidate address
                     // leaks it (storing &global into another
                     // global is an escape, same as a STORE).
-                    Long v = resolveExact(op.ins[0], st);
+                    Long v = resolveAddressExact(op.ins[0], st);
                     if (v != null && candAddrs.contains(v.longValue())) {
                         leaked.add(v.longValue());
                     }
@@ -8255,7 +8408,7 @@ public class ExtractIR extends GhidraScript {
                         } else if (op.mnem.equals("STORE") && op.ins.length >= 3) {
                             valBits = resolveBits(op.ins[2], bvals);
                         }
-                        Long addr = resolveExact(op.ins[1], bvals);
+                        Long addr = resolveAddressExact(op.ins[1], bvals);
                         if (addr != null && isa.isMmioAddress(addr)) {
                             int sz = (op.mnem.equals("STORE") && op.ins.length >= 3)
                                 ? op.ins[2].getSize()
@@ -8286,7 +8439,10 @@ public class ExtractIR extends GhidraScript {
                     isRamSpace(op.out) && op.ins.length >= 1) {
                     Map<String, Bits> bvals = fx.inStates[i];
                     if (bvals != null) {
-                        long a = op.out.getOffset();
+                        // v10 u32: band-gated canonicalization, so
+                        // a movabs to 0xFFFFFFFFFED00020 records as
+                        // the MMIO address 0xFED00020.
+                        long a = canonicalizeBandAddr(op.out.getOffset());
                         if (isa.isMmioAddress(a)) {
                             Bits valBits = resolveBits(op.ins[0], bvals);
                             int sz = op.out.getSize();
@@ -8347,6 +8503,15 @@ public class ExtractIR extends GhidraScript {
                         List<Long> win = new ArrayList<Long>();
                         for (long a : addrSet) {
                             if (isa.isMmioAddress(a)) win.add(a);
+                            // v10 u32: may-addresses are exact longs
+                            // (the may transfer computes SEXT exactly),
+                            // so the shape test applies directly: a
+                            // sext-shaped may-address whose low 32
+                            // bits are in a band is that band address.
+                            else if (isSext32Value(a) &&
+                                isa.isMmioAddress(a & 0xFFFFFFFFL)) {
+                                win.add(a & 0xFFFFFFFFL);
+                            }
                         }
                         if (!win.isEmpty()) {
                             java.util.Collections.sort(win);
@@ -8395,7 +8560,10 @@ public class ExtractIR extends GhidraScript {
                         String am = op.instrAsm;
                         if (am.equalsIgnoreCase("OUT") &&
                             op.ins.length >= 3) {
-                            Long port = resolveExactSlice(op.ins[1],
+                            // v10 u32: band-gated address helper
+                            // (a no-op after the 0xFFFF mask below,
+                            // kept for uniformity with MMIO sites).
+                            Long port = resolveAddressExact(op.ins[1],
                                 bvals);
                             if (port != null) {
                                 Bits vb = resolveBitsSlice(op.ins[2],
@@ -8419,7 +8587,7 @@ public class ExtractIR extends GhidraScript {
                             }
                         } else if (am.equalsIgnoreCase("IN") &&
                             op.ins.length >= 2) {
-                            Long port = resolveExactSlice(op.ins[1],
+                            Long port = resolveAddressExact(op.ins[1],
                                 bvals);
                             if (port != null) {
                                 int sz = op.out != null ?
@@ -8436,7 +8604,10 @@ public class ExtractIR extends GhidraScript {
                             }
                         } else if (am.equalsIgnoreCase("WRMSR") &&
                             op.ins.length >= 3) {
-                            Long idx = resolveExactSlice(op.ins[1],
+                            // v10 u32: MSR indices are 32-bit by
+                            // architecture, so a sext-shaped index
+                            // reads as its low 32 bits (no band gate).
+                            Long idx = resolveMsrIndexExact(op.ins[1],
                                 bvals);
                             if (idx != null) {
                                 // Combined 64-bit value (EDX:EAX):
@@ -8463,7 +8634,7 @@ public class ExtractIR extends GhidraScript {
                             }
                         } else if (am.equalsIgnoreCase("RDMSR") &&
                             op.ins.length >= 2) {
-                            Long idx = resolveExactSlice(op.ins[1],
+                            Long idx = resolveMsrIndexExact(op.ins[1],
                                 bvals);
                             if (idx != null) {
                                 msr.add("{\"instr\": \"" +
