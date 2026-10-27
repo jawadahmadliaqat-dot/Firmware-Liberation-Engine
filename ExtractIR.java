@@ -6638,6 +6638,385 @@ public class ExtractIR extends GhidraScript {
         return out;
     }
 
+    /** v12 persite: MUST-finding recording for ONE op under ONE
+        in-state, factored out of the emission loop so per-site
+        clone fixpoints can be recorded with the IDENTICAL logic
+        (no duplicated predicates to drift apart). Appends the
+        same JSON strings the emission loop used to build inline
+        (mmio LOAD/STORE + COPY-to-ram, CALLOTHER port/MSR, BAR
+        symbols) and records each finding's identity (instr +
+        accessed location) in the parallel sets. Returns true iff
+        a LOAD/STORE must-MMIO was recorded (the may gate). A null
+        in-state records nothing. */
+    private boolean recordMustFindings(OpRec op,
+        Map<String, Bits> bvals, Memory mem,
+        List<String> mmio, List<String> portIo, List<String> msr,
+        List<String> barRel,
+        List<String> mmioIds, List<String> portIds,
+        List<String> msrIds, List<String> barIds) {
+        boolean mustRecorded = false;
+        if (bvals == null) return false;
+        // ---- MMIO recording (LOAD/STORE) ----
+        // Masks and exact values print UNSIGNED (v3.8): a
+        // 64-bit mask/value with the high bit set prints
+        // negative as a Java long, which Lean's Nat parser
+        // rejects. 32-bit values print identically either way.
+        if (op.mnem.equals("LOAD") || op.mnem.equals("STORE")) {
+            if (op.ins.length >= 2) {
+                Bits valBits = Bits.unknown();
+                if (op.mnem.equals("LOAD") && op.out != null) {
+                    valBits = loadBits(op.ins, op.out, bvals, mem);
+                } else if (op.mnem.equals("STORE") &&
+                    op.ins.length >= 3) {
+                    valBits = resolveBits(op.ins[2], bvals);
+                }
+                Long addr = resolveAddressExact(op.ins[1], bvals);
+                if (addr != null && isa.isMmioAddress(addr)) {
+                    int sz = (op.mnem.equals("STORE") &&
+                        op.ins.length >= 3)
+                        ? op.ins[2].getSize()
+                        : (op.out != null ? op.out.getSize() : 0);
+                    Long exact = valBits.exactValue(
+                        sizeMask(sz == 0 ? 4 : sz));
+                    mmio.add("{\"instr\": \"" + op.instrAddr +
+                        "\", \"op\": \"" + op.mnem +
+                        "\", \"address\": \"0x" + Long.toHexString(addr) +
+                        "\", \"size\": " + sz +
+                        ", \"value\": " +
+                        (exact == null ? "null" : Long.toUnsignedString(exact)) +
+                        ", \"value_known_ones\": " + Long.toUnsignedString(valBits.ones) +
+                        ", \"value_known_zeroes\": " + Long.toUnsignedString(valBits.zeroes) + "}");
+                    mmioIds.add("mmio:" + op.instrAddr + ":0x" +
+                        Long.toHexString(addr));
+                    mustRecorded = true;
+                }
+            }
+        }
+        // ---- v9 struct: COPY-to-ram MMIO stores ----
+        // The transfer treats COPY-to-ram as an absolute
+        // store (x86-64 movabs / RIP-relative stores never
+        // become STORE ops), but emission only recorded
+        // LOAD/STORE, so absolute MMIO stores were silently
+        // dropped. A COPY-to-ram address is a constant, so
+        // this is a must-recording, never a may. Value and
+        // size mirror the STORE rule.
+        if (op.mnem.equals("COPY") && op.out != null &&
+            isRamSpace(op.out) && op.ins.length >= 1) {
+            // v10 u32: band-gated canonicalization, so
+            // a movabs to 0xFFFFFFFFFED00020 records as
+            // the MMIO address 0xFED00020.
+            long a = canonicalizeBandAddr(op.out.getOffset());
+            if (isa.isMmioAddress(a)) {
+                Bits valBits = resolveBits(op.ins[0], bvals);
+                int sz = op.out.getSize();
+                Long exact = valBits.exactValue(
+                    sizeMask(sz == 0 ? 4 : sz));
+                mmio.add("{\"instr\": \"" + op.instrAddr +
+                    "\", \"op\": \"" + op.mnem +
+                    "\", \"address\": \"0x" + Long.toHexString(a) +
+                    "\", \"size\": " + sz +
+                    ", \"value\": " +
+                    (exact == null ? "null" : Long.toUnsignedString(exact)) +
+                    ", \"value_known_ones\": " + Long.toUnsignedString(valBits.ones) +
+                    ", \"value_known_zeroes\": " + Long.toUnsignedString(valBits.zeroes) + "}");
+                mmioIds.add("mmio:" + op.instrAddr + ":0x" +
+                    Long.toHexString(a));
+            }
+        }
+        // ---- Port I/O + MSR recording (x86 CALLOTHER) ----
+        // Ghidra lifts IN/OUT/RDMSR/WRMSR to CALLOTHER
+        // userops; the instruction mnemonic (op.instrAsm)
+        // is the signal, NOT the userop index (a Ghidra
+        // internal). Port/MSR spaces are disjoint from
+        // memory, so they get their own JSON classes (v3.8
+        // shape change) instead of polluting mmio_accesses.
+        // Port numbers are masked to the 16-bit port space.
+        // IN/RDMSR values are hardware inputs -> null.
+        // PCI config ports 0xCF8/0xCFC fall out raw here;
+        // BDF decoding is v2.
+        if (op.mnem.equals("CALLOTHER") &&
+            op.ins.length >= 1) {
+            String am = op.instrAsm;
+            if (am.equalsIgnoreCase("OUT") &&
+                op.ins.length >= 3) {
+                // v10 u32: band-gated address helper
+                // (a no-op after the 0xFFFF mask below,
+                // kept for uniformity with MMIO sites).
+                Long port = resolveAddressExact(op.ins[1],
+                    bvals);
+                if (port != null) {
+                    Bits vb = resolveBitsSlice(op.ins[2],
+                        bvals);
+                    int sz = op.ins[2].getSize();
+                    Long exact = vb.exactValue(
+                        sizeMask(sz));
+                    portIo.add("{\"instr\": \"" +
+                        op.instrAddr + "\", \"op\": \"OUT\"" +
+                        ", \"direction\": \"OUT\"" +
+                        ", \"port\": \"0x" +
+                        Long.toHexString(port & 0xFFFFL) +
+                        "\", \"size\": " + sz +
+                        ", \"value\": " +
+                        (exact == null ? "null" :
+                            Long.toUnsignedString(exact)) +
+                        ", \"value_known_ones\": " +
+                        Long.toUnsignedString(vb.ones) +
+                        ", \"value_known_zeroes\": " +
+                        Long.toUnsignedString(vb.zeroes) + "}");
+                    portIds.add("port:" + op.instrAddr + ":0x" +
+                        Long.toHexString(port & 0xFFFFL));
+                }
+            } else if (am.equalsIgnoreCase("IN") &&
+                op.ins.length >= 2) {
+                Long port = resolveAddressExact(op.ins[1],
+                    bvals);
+                if (port != null) {
+                    int sz = op.out != null ?
+                        op.out.getSize() : 0;
+                    portIo.add("{\"instr\": \"" +
+                        op.instrAddr + "\", \"op\": \"IN\"" +
+                        ", \"direction\": \"IN\"" +
+                        ", \"port\": \"0x" +
+                        Long.toHexString(port & 0xFFFFL) +
+                        "\", \"size\": " + sz +
+                        ", \"value\": null" +
+                        ", \"value_known_ones\": 0" +
+                        ", \"value_known_zeroes\": 0}");
+                    portIds.add("port:" + op.instrAddr + ":0x" +
+                        Long.toHexString(port & 0xFFFFL));
+                }
+            } else if (am.equalsIgnoreCase("WRMSR") &&
+                op.ins.length >= 3) {
+                // v10 u32: MSR indices are 32-bit by
+                // architecture, so a sext-shaped index
+                // reads as its low 32 bits (no band gate).
+                Long idx = resolveMsrIndexExact(op.ins[1],
+                    bvals);
+                if (idx != null) {
+                    // Combined 64-bit value (EDX:EAX):
+                    // an intra-instruction unique, so
+                    // exact-key lookup resolves it.
+                    Bits vb = resolveBits(op.ins[2],
+                        bvals);
+                    Long exact = vb.exactValue(
+                        sizeMask(8));
+                    msr.add("{\"instr\": \"" +
+                        op.instrAddr +
+                        "\", \"op\": \"WRMSR\"" +
+                        ", \"direction\": \"WR\"" +
+                        ", \"index\": \"0x" +
+                        Long.toHexString(idx) +
+                        "\", \"size\": 8" +
+                        ", \"value\": " +
+                        (exact == null ? "null" :
+                            Long.toUnsignedString(exact)) +
+                        ", \"value_known_ones\": " +
+                        Long.toUnsignedString(vb.ones) +
+                        ", \"value_known_zeroes\": " +
+                        Long.toUnsignedString(vb.zeroes) + "}");
+                    msrIds.add("msr:" + op.instrAddr + ":0x" +
+                        Long.toHexString(idx));
+                }
+            } else if (am.equalsIgnoreCase("RDMSR") &&
+                op.ins.length >= 2) {
+                Long idx = resolveMsrIndexExact(op.ins[1],
+                    bvals);
+                if (idx != null) {
+                    msr.add("{\"instr\": \"" +
+                        op.instrAddr +
+                        "\", \"op\": \"RDMSR\"" +
+                        ", \"direction\": \"RD\"" +
+                        ", \"index\": \"0x" +
+                        Long.toHexString(idx) +
+                        "\", \"size\": 8" +
+                        ", \"value\": null" +
+                        ", \"value_known_ones\": 0" +
+                        ", \"value_known_zeroes\": 0}");
+                    msrIds.add("msr:" + op.instrAddr + ":0x" +
+                        Long.toHexString(idx));
+                }
+            }
+        }
+        // v7 cfgspace: BAR-relative findings. The access
+        // address is a BASE symbol (masked BAR + constant
+        // offset). This is a provenance statement (device
+        // BDF, BAR index, offset), never a fixed address:
+        // MUST-class is forbidden for symbolic values, and
+        // the may-trace parses hex addresses, so a symbolic
+        // address must not enter may_accesses either. Raw
+        // BAR symbols (unmasked flag bits) never yield a
+        // finding. Guard null like the neighboring blocks:
+        // ops in unreached code have a null in-state, and
+        // resolveBits would NPE on it (hit on DxeCore,
+        // PciBusDxe, stripped BMP).
+        {
+            Bits ab = null;
+            int asz = 0;
+            if (op.mnem.equals("LOAD") && op.out != null &&
+                op.ins.length >= 2) {
+                ab = resolveBits(op.ins[1], bvals);
+                asz = op.out.getSize();
+            } else if (op.mnem.equals("STORE") &&
+                op.ins.length >= 3) {
+                ab = resolveBits(op.ins[1], bvals);
+                asz = op.ins[2].getSize();
+            }
+            if (ab != null && ab.sym != null) {
+                long[] p = Bits.parseBarSym(ab.sym);
+                if (p != null && p[0] == 1) {
+                    barRel.add("{\"instr\": \"" +
+                        op.instrAddr +
+                        "\", \"op\": \"" + op.mnem + "\"" +
+                        ", \"bus\": " + p[1] +
+                        ", \"device\": " + p[2] +
+                        ", \"function\": " + p[3] +
+                        ", \"bar\": " + p[4] +
+                        ", \"offset\": " + p[5] +
+                        ", \"size\": " + asz + "}");
+                    barIds.add("bar:" + op.instrAddr + ":" +
+                        p[1] + ":" + p[2] + ":" + p[3] + ":" +
+                        p[4] + ":" + p[5]);
+                }
+            }
+        }
+        return mustRecorded;
+    }
+
+    /** v12 persite: one per-site clone of a callee: the callee
+        analyzed with ONE argument-binding group as its entry,
+        instead of the merged all-sites-agree entry. The clone's
+        findings belong to the callee function (where the
+        instruction lives); the group key records which binding
+        produced them, so a human can attribute every extra
+        finding to its site group. Clones never merge back into
+        a shared summary: each clone's fixpoint is used only to
+        record extra findings for its own group. */
+    private static class PerSiteGroup {
+        long calleeKey;
+        String groupKey;
+        FixResult fx;
+        List<String> sites;
+        PerSiteGroup(long calleeKey, String groupKey,
+            FixResult fx, List<String> sites) {
+            this.calleeKey = calleeKey;
+            this.groupKey = groupKey;
+            this.fx = fx;
+            this.sites = sites;
+        }
+    }
+
+    /** v12 persite: canonical encoding of ONE argument-register
+        value for grouping. Mirrors meetOverSites' discipline:
+        only exact constants and BAR symbols count as
+        informative; anything else (unknown, partial, non-BAR
+        symbol) is "U". Two sites share a group iff every
+        argument register encodes identically. */
+    private String persiteComponent(Bits b, long mask) {
+        if (b == null) return "U";
+        if (b.sym != null) {
+            if (Bits.parseBarSym(b.sym) == null) return "U";
+            return "B:" + b.sym + ":" + b.symW;
+        }
+        Long v = b.exactValue(mask);
+        if (v == null) return "U";
+        return "V:" + Long.toUnsignedString(v);
+    }
+
+    /** v12 persite: group key for a binding vector (one
+        component per argument register, in convention order). */
+    private String persiteGroupKey(List<Bits> vals, long mask) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < vals.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append(persiteComponent(vals.get(i), mask));
+        }
+        return sb.toString();
+    }
+
+    /** v12 persite: true when every component is "U" (no
+        informative argument at all -- a clone with this
+        binding could add nothing over the merged analysis). */
+    private boolean persiteAllUnknown(String groupKey) {
+        if (groupKey.length() == 0) return true;
+        for (String c : groupKey.split(",", -1)) {
+            if (!c.equals("U")) return false;
+        }
+        return true;
+    }
+
+    /** v12 persite: argument-register values at a direct call
+        site, resolved in the CALL op's in-state (the state
+        BEFORE the call's clobber -- the site's own values).
+        Null entries mark unresolvable registers. */
+    private List<Bits> persiteBindingFromState(
+        Map<String, Bits> state, long[] argRegs) {
+        List<Bits> vals = new ArrayList<Bits>();
+        int ptrSize = isa.pointerSize();
+        for (long off : argRegs) {
+            Bits b = null;
+            if (state != null) {
+                Varnode vn = regVarnode(off, ptrSize);
+                if (vn != null) b = resolveBits(vn, state);
+            }
+            vals.add(b);
+        }
+        return vals;
+    }
+
+    /** v12 persite: entry map for a clone: the group's
+        informative bindings as register keys, plus the
+        program-wide global seeds (mirroring Phase M's final
+        entry construction: merged entry + seeds, with the
+        group binding in place of the merged entry). Unknown
+        components stay absent (= unknown), exactly as in
+        meetOverSites. */
+    private Map<String, Bits> persiteEntry(List<Bits> vals,
+        long[] argRegs, Map<String, Bits> memSeeds, long mask) {
+        Map<String, Bits> entry = new HashMap<String, Bits>();
+        int ptrSize = isa.pointerSize();
+        for (int i = 0; i < vals.size(); i++) {
+            Bits b = vals.get(i);
+            if (b == null) continue;
+            if (b.sym != null) {
+                if (Bits.parseBarSym(b.sym) == null) continue;
+                entry.put(isa.registerSpaceName() + ":" +
+                    argRegs[i] + ":" + ptrSize,
+                    Bits.symBits(b.sym, b.symW));
+            } else {
+                Long v = b.exactValue(mask);
+                if (v == null) continue;
+                entry.put(isa.registerSpaceName() + ":" +
+                    argRegs[i] + ":" + ptrSize,
+                    Bits.exact(v.longValue(), mask));
+            }
+        }
+        if (memSeeds != null) entry.putAll(memSeeds);
+        return entry;
+    }
+
+    /** v12 persite: true when a group's binding equals the
+        callee's merged entry on every argument register
+        (absent merged key = unknown). Such a clone would
+        reproduce the merged fixpoint exactly, so it is
+        skipped for efficiency, never for soundness. */
+    private boolean persiteEqualsMerged(String groupKey,
+        Map<String, Bits> mergedEntry, long[] argRegs,
+        long mask) {
+        String[] comps = groupKey.split(",", -1);
+        for (int i = 0; i < argRegs.length; i++) {
+            String gc = (i < comps.length) ? comps[i] : "U";
+            String mc = "U";
+            if (mergedEntry != null) {
+                Bits mb = mergedEntry.get(
+                    isa.registerSpaceName() + ":" + argRegs[i] +
+                    ":" + isa.pointerSize());
+                if (mb != null) mc = persiteComponent(mb, mask);
+            }
+            if (!gc.equals(mc)) return false;
+        }
+        return true;
+    }
+
     /** Empty must-fixpoint fallback (same as the old per-function
         exception fallback: claim nothing). */
     private static FixResult emptyFix(int nOps) {
@@ -7299,7 +7678,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.10\",");
+        w.println("  \"extractor_version\": \"v3.11\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -8304,6 +8683,317 @@ public class ExtractIR extends GhidraScript {
                 shown++;
             }
         }
+        // ---- v12 persite: per-site transfer ----
+        // Constprop (v3.9), retprop (v8) and struct summaries
+        // (v9) all use the all-sites-agree discipline: a callee
+        // entry/return/field summary forms only when EVERY call
+        // site agrees. QemuVideoDxe breaks it (its config-read
+        // helper is called with different ports), and so does
+        // any helper whose sites legitimately disagree. This
+        // phase analyzes a callee separately per DISTINCT
+        // argument-binding group, so each site gets its own
+        // propagated values instead of one merged summary that
+        // dies on disagreement.
+        //
+        // DESIGN DECISIONS (each justified, none silent):
+        // (a) GRANULARITY: clone per distinct argument-binding
+        // equivalence class, not per call site: sites with
+        // identical bindings share one analysis. Blowup is
+        // bounded by distinct vectors per callee (OVMF: every
+        // callee has a handful of sites; the caps below bind
+        // first on pathological inputs, never on this corpus).
+        // (b) ATTRIBUTION: a clone's findings are recorded
+        // under the CALLEE function (where the instruction
+        // lives), deduped by (instr + accessed location)
+        // against the merged lists. A finding identical
+        // across clones is recorded ONCE (the identity set
+        // dedups it); a finding that differs by location
+        // across clones is recorded per location, which is
+        // exactly the per-site win. Clones never merge back
+        // into a shared summary.
+        // (c) RECURSION: a clone's own fixpoint is
+        // intra-procedural (inner CALLs use merged summaries),
+        // so clones never recurse into themselves. Inner
+        // sites whose callee is the clone's own function are
+        // skipped (self-recursion keeps merged behaviour);
+        // mutual recursion is bounded by the global clone
+        // cap below, which stops generation (never guesses).
+        // (d) MERGED INTERACTION: per-site applies ONLY where
+        // merged is weaker. Groups identical to the merged
+        // entry are skipped (their clone would reproduce the
+        // merged fixpoint exactly); merged findings are never
+        // removed or replaced -- extras only ADD at (instr,
+        // class, location) triples the merged analysis missed.
+        // (e) CAPS: 32 groups per callee, 1024 clones total.
+        // Exceeding a cap skips the excess groups (those
+        // sites keep merged behaviour = unknown, never a
+        // guessed value), and the skip is logged.
+        // (f) VALUE CLASSES: argument constants + BAR/BASE
+        // symbols flow per-site (the binding vector carries
+        // full Bits, so symbols group and propagate exactly
+        // like constants). Struct/interface provenance
+        // (Prov) per-site is OUT -- the Prov fixpoint is a
+        // separate analysis that clones would need to
+        // replicate; named as the next slice, not silently
+        // omitted. Value refinement (same location, more
+        // precise value than merged) is also OUT: extras
+        // never replace a merged finding.
+        //
+        // SOUNDNESS: a clone's entry is read from its own
+        // sites' CALL-op in-states (pre-clobber values), so a
+        // site's value can never leak to another site: each
+        // clone's fixpoint starts from exactly its group's
+        // bindings, and each clone's findings are recorded
+        // only under the callee with location dedup. A site
+        // with an unknown argument joins the all-unknown
+        // group, which is skipped (no clone, merged
+        // behaviour for that site, other sites unaffected).
+        // Per-site eligibility is deliberately RELAXED vs
+        // merged (no address-taken / tail-call /
+        // every-caller-direct guards): a clone models ONE
+        // direct site, and other entries to the callee
+        // (indirect calls, tail jumps) keep merged
+        // behaviour -- they cannot invalidate the direct
+        // site's own binding.
+        Map<Long, long[]> persiteArgRegs =
+            new HashMap<Long, long[]>();
+        for (FuncRec callee : funcRecs) {
+            if (callee.f.isExternal()) continue;
+            List<CallSite> sites =
+                sitesByCallee.get(callee.entryKey);
+            if (sites == null || sites.isEmpty()) continue;
+            long[] argRegs = isa.argumentRegisterOffsets(
+                callConvMap.get(callee.entryKey));
+            if (argRegs == null) continue;
+            persiteArgRegs.put(callee.entryKey, argRegs);
+        }
+        Map<Long, Map<String, PerSiteGroup>> persiteMap =
+            new HashMap<Long, Map<String, PerSiteGroup>>();
+        List<PerSiteGroup> persiteQueue =
+            new ArrayList<PerSiteGroup>();
+        int persiteSkippedIdentical = 0;
+        int persiteSkippedUnknown = 0;
+        int persiteSkippedCap = 0;
+        int persiteSkippedNonconv = 0;
+        int persiteClones = 0;
+        long persiteMask = sizeMask(isa.pointerSize());
+        // Seed groups from merged contexts (caller final
+        // fixpoints), grouped by binding vector.
+        for (FuncRec callee : funcRecs) {
+            long[] argRegs = persiteArgRegs.get(callee.entryKey);
+            if (argRegs == null) continue;
+            List<CallSite> sites =
+                sitesByCallee.get(callee.entryKey);
+            Map<String, List<Bits>> valsByKey =
+                new HashMap<String, List<Bits>>();
+            Map<String, List<String>> sitesByKey =
+                new HashMap<String, List<String>>();
+            for (CallSite s : sites) {
+                Map<String, Bits> st = null;
+                if (s.caller.fx != null &&
+                    s.caller.fx.inStates != null &&
+                    s.opIdx < s.caller.fx.inStates.length) {
+                    st = s.caller.fx.inStates[s.opIdx];
+                }
+                List<Bits> vals =
+                    persiteBindingFromState(st, argRegs);
+                String key = persiteGroupKey(vals, persiteMask);
+                if (!valsByKey.containsKey(key)) {
+                    valsByKey.put(key, vals);
+                    sitesByKey.put(key, new ArrayList<String>());
+                }
+                String desc = s.caller.f.getName() + "@" +
+                    s.caller.or.ops.get(s.opIdx).instrAddr;
+                sitesByKey.get(key).add(desc);
+            }
+            List<String> keys =
+                new ArrayList<String>(valsByKey.keySet());
+            java.util.Collections.sort(keys);
+            for (String key : keys) {
+                if (persiteAllUnknown(key)) {
+                    persiteSkippedUnknown++;
+                    continue;
+                }
+                if (persiteEqualsMerged(key,
+                    entries.get(callee.entryKey), argRegs,
+                    persiteMask)) {
+                    persiteSkippedIdentical++;
+                    continue;
+                }
+                Map<String, PerSiteGroup> have =
+                    persiteMap.get(callee.entryKey);
+                if (have != null && have.size() >= 32) {
+                    persiteSkippedCap++;
+                    continue;
+                }
+                if (persiteClones >= 1024) {
+                    persiteSkippedCap++;
+                    continue;
+                }
+                Map<String, Bits> entry = persiteEntry(
+                    valsByKey.get(key), argRegs, memSeeds,
+                    persiteMask);
+                FixResult cfx;
+                try {
+                    cfx = runFixpoint(callee.or.ops, memA,
+                        callee.branchTargets, entry,
+                        callee.loopCallOps);
+                } catch (Exception ex) {
+                    cfx = emptyFix(callee.or.ops.size());
+                }
+                if (!cfx.converged) {
+                    persiteSkippedNonconv++;
+                    continue;
+                }
+                PerSiteGroup g = new PerSiteGroup(
+                    callee.entryKey, key, cfx, sitesByKey.get(key));
+                if (have == null) {
+                    have = new HashMap<String, PerSiteGroup>();
+                    persiteMap.put(callee.entryKey, have);
+                }
+                have.put(key, g);
+                persiteQueue.add(g);
+                persiteClones++;
+            }
+        }
+        // Worklist: scan each clone's ops for inner direct
+        // CALLs, whose bindings (read from the CLONE's
+        // in-states) may form new groups for the inner
+        // callee. Termination is structural: groups are only
+        // added (never modified), keyed by (callee, vector),
+        // and bounded by the caps above.
+        int persiteQueueIdx = 0;
+        while (persiteQueueIdx < persiteQueue.size()) {
+            PerSiteGroup g = persiteQueue.get(persiteQueueIdx++);
+            FuncRec calleeRec = funcByEntry.get(g.calleeKey);
+            if (calleeRec == null || g.fx == null ||
+                g.fx.inStates == null) continue;
+            List<OpRec> pops = calleeRec.or.ops;
+            for (int pi = 0; pi < pops.size(); pi++) {
+                OpRec op = pops.get(pi);
+                if (!op.mnem.equals("CALL") ||
+                    op.ins.length < 1) continue;
+                Varnode t = op.ins[0];
+                if (t == null || t.getAddress() == null ||
+                    !"ram".equals(t.getAddress().getAddressSpace().
+                        getName())) continue;
+                FuncRec inner = funcByEntry.get(t.getOffset());
+                if (inner == null) {
+                    inner = funcByEntry.get(
+                        isa.stripInstructionTag(t.getOffset()));
+                }
+                if (inner == null) continue;
+                // Self-recursion keeps merged behaviour (see
+                // design note (c)); the clone's own entry
+                // already models this caller's context.
+                if (inner.entryKey == g.calleeKey) continue;
+                long[] innerRegs =
+                    persiteArgRegs.get(inner.entryKey);
+                if (innerRegs == null) continue;
+                if (pi >= g.fx.inStates.length ||
+                    g.fx.inStates[pi] == null) continue;
+                List<Bits> vals = persiteBindingFromState(
+                    g.fx.inStates[pi], innerRegs);
+                String key =
+                    persiteGroupKey(vals, persiteMask);
+                if (persiteAllUnknown(key)) {
+                    persiteSkippedUnknown++;
+                    continue;
+                }
+                if (persiteEqualsMerged(key,
+                    entries.get(inner.entryKey), innerRegs,
+                    persiteMask)) {
+                    persiteSkippedIdentical++;
+                    continue;
+                }
+                Map<String, PerSiteGroup> have =
+                    persiteMap.get(inner.entryKey);
+                if (have != null && have.containsKey(key)) continue;
+                if (have != null && have.size() >= 32) {
+                    persiteSkippedCap++;
+                    continue;
+                }
+                if (persiteClones >= 1024) {
+                    persiteSkippedCap++;
+                    continue;
+                }
+                Map<String, Bits> entry = persiteEntry(
+                    vals, innerRegs, memSeeds, persiteMask);
+                FixResult cfx;
+                try {
+                    cfx = runFixpoint(inner.or.ops, memA,
+                        inner.branchTargets, entry,
+                        inner.loopCallOps);
+                } catch (Exception ex) {
+                    cfx = emptyFix(inner.or.ops.size());
+                }
+                if (!cfx.converged) {
+                    persiteSkippedNonconv++;
+                    continue;
+                }
+                List<String> desc = new ArrayList<String>();
+                desc.add(calleeRec.f.getName() + "@" +
+                    op.instrAddr + " [clone " + g.groupKey + "]");
+                PerSiteGroup ng = new PerSiteGroup(
+                    inner.entryKey, key, cfx, desc);
+                if (have == null) {
+                    have = new HashMap<String, PerSiteGroup>();
+                    persiteMap.put(inner.entryKey, have);
+                }
+                have.put(key, ng);
+                persiteQueue.add(ng);
+                persiteClones++;
+            }
+        }
+        // Sorted per-callee group lists for deterministic
+        // emission order (the emission block below iterates
+        // these in order; dedup makes order irrelevant to
+        // the result, but determinism keeps diffs clean).
+        Map<Long, List<PerSiteGroup>> persiteByCallee =
+            new HashMap<Long, List<PerSiteGroup>>();
+        for (Map.Entry<Long, Map<String, PerSiteGroup>> e :
+            persiteMap.entrySet()) {
+            List<PerSiteGroup> gl =
+                new ArrayList<PerSiteGroup>(e.getValue().values());
+            java.util.Collections.sort(gl,
+                new java.util.Comparator<PerSiteGroup>() {
+                    public int compare(PerSiteGroup a,
+                        PerSiteGroup b) {
+                        return a.groupKey.compareTo(b.groupKey);
+                    }
+                });
+            persiteByCallee.put(e.getKey(), gl);
+        }
+        int persiteExtraMmio = 0;
+        int persiteExtraPort = 0;
+        int persiteExtraMsr = 0;
+        int persiteExtraBar = 0;
+        int persiteSkippedIdent = 0;
+        int persiteReplayMismatch = 0;
+        {
+            int shown = 0;
+            for (Map.Entry<Long, List<PerSiteGroup>> e :
+                persiteByCallee.entrySet()) {
+                FuncRec cr = funcByEntry.get(e.getKey());
+                String cn = (cr == null) ? ("0x" +
+                    Long.toHexString(e.getKey())) : cr.f.getName();
+                for (PerSiteGroup g : e.getValue()) {
+                    if (shown < 200) {
+                        println("[*] persite: clone " + cn +
+                            " group [" + g.groupKey + "] sites=" +
+                            g.sites.size());
+                        shown++;
+                    }
+                }
+            }
+            println("[*] persite: callees=" +
+                persiteByCallee.size() + ", clones=" +
+                persiteClones + ", skippedIdentical=" +
+                persiteSkippedIdentical + ", skippedUnknown=" +
+                persiteSkippedUnknown + ", skippedCap=" +
+                persiteSkippedCap + ", skippedNonconv=" +
+                persiteSkippedNonconv + ".");
+        }
         for (FuncRec rec : funcRecs) {
             Function f = rec.f;
             if (!firstFn) w.println(",");
@@ -8695,6 +9385,122 @@ public class ExtractIR extends GhidraScript {
                     }
                 }
             }
+            // v12 persite: append per-site clone findings.
+            // Runs BEFORE the protocol block below, so the
+            // replay comparison stays exact (protocol ports
+            // append to portIo afterwards, from CALLIND ops
+            // that can never collide with clone CALLOTHER
+            // findings). A clone finding is appended ONLY
+            // when its identity (instr + accessed location)
+            // is absent from the merged lists: merged
+            // findings are never duplicated, never replaced,
+            // and value refinement (same location, more
+            // precise value) is deliberately NOT emitted
+            // here -- it needs its own design. The replay
+            // guard below makes this fail-safe: if the
+            // factored recording ever diverges from the
+            // inline walk, extras are skipped for that
+            // function instead of duplicating findings.
+            {
+                List<PerSiteGroup> pgroups = null;
+                if (persiteByCallee != null) {
+                    pgroups = persiteByCallee.get(rec.entryKey);
+                }
+                if (pgroups != null && !pgroups.isEmpty()) {
+                    List<String> rMmio = new ArrayList<String>();
+                    List<String> rPortIo = new ArrayList<String>();
+                    List<String> rMsr = new ArrayList<String>();
+                    List<String> rBarRel = new ArrayList<String>();
+                    List<String> rMmioIds = new ArrayList<String>();
+                    List<String> rPortIds = new ArrayList<String>();
+                    List<String> rMsrIds = new ArrayList<String>();
+                    List<String> rBarIds = new ArrayList<String>();
+                    for (int ri = 0; ri < ops.size(); ri++) {
+                        Map<String, Bits> rb =
+                            (ri < fx.inStates.length) ?
+                            fx.inStates[ri] : null;
+                        recordMustFindings(ops.get(ri), rb, mem,
+                            rMmio, rPortIo, rMsr, rBarRel,
+                            rMmioIds, rPortIds, rMsrIds, rBarIds);
+                    }
+                    if (rMmio.equals(mmio) && rPortIo.equals(portIo) &&
+                        rMsr.equals(msr) && rBarRel.equals(barRel)) {
+                        Set<String> rMmioSet =
+                            new HashSet<String>(rMmioIds);
+                        Set<String> rPortSet =
+                            new HashSet<String>(rPortIds);
+                        Set<String> rMsrSet =
+                            new HashSet<String>(rMsrIds);
+                        Set<String> rBarSet =
+                            new HashSet<String>(rBarIds);
+                        for (PerSiteGroup g : pgroups) {
+                            if (g.fx == null ||
+                                g.fx.inStates == null) continue;
+                            List<String> tMmio =
+                                new ArrayList<String>();
+                            List<String> tPortIo =
+                                new ArrayList<String>();
+                            List<String> tMsr =
+                                new ArrayList<String>();
+                            List<String> tBarRel =
+                                new ArrayList<String>();
+                            List<String> tMmioIds =
+                                new ArrayList<String>();
+                            List<String> tPortIds =
+                                new ArrayList<String>();
+                            List<String> tMsrIds =
+                                new ArrayList<String>();
+                            List<String> tBarIds =
+                                new ArrayList<String>();
+                            for (int ci = 0; ci < ops.size(); ci++) {
+                                Map<String, Bits> cb =
+                                    (ci < g.fx.inStates.length) ?
+                                    g.fx.inStates[ci] : null;
+                                recordMustFindings(ops.get(ci), cb,
+                                    mem, tMmio, tPortIo, tMsr,
+                                    tBarRel, tMmioIds, tPortIds,
+                                    tMsrIds, tBarIds);
+                            }
+                            for (int ti = 0; ti < tMmio.size(); ti++) {
+                                if (rMmioSet.add(tMmioIds.get(ti))) {
+                                    mmio.add(tMmio.get(ti));
+                                    persiteExtraMmio++;
+                                } else {
+                                    persiteSkippedIdent++;
+                                }
+                            }
+                            for (int ti = 0; ti < tPortIo.size(); ti++) {
+                                if (rPortSet.add(tPortIds.get(ti))) {
+                                    portIo.add(tPortIo.get(ti));
+                                    persiteExtraPort++;
+                                } else {
+                                    persiteSkippedIdent++;
+                                }
+                            }
+                            for (int ti = 0; ti < tMsr.size(); ti++) {
+                                if (rMsrSet.add(tMsrIds.get(ti))) {
+                                    msr.add(tMsr.get(ti));
+                                    persiteExtraMsr++;
+                                } else {
+                                    persiteSkippedIdent++;
+                                }
+                            }
+                            for (int ti = 0; ti < tBarRel.size(); ti++) {
+                                if (rBarSet.add(tBarIds.get(ti))) {
+                                    barRel.add(tBarRel.get(ti));
+                                    persiteExtraBar++;
+                                } else {
+                                    persiteSkippedIdent++;
+                                }
+                            }
+                        }
+                    } else {
+                        println("[!] persite: replay mismatch in " +
+                            f.getName() + ", extras skipped.");
+                        persiteReplayMismatch++;
+                    }
+                }
+            }
             // v2 item #3: protocol/BS call resolution from the
             // provenance fixpoint (Phase P). A resolved site is
             // explained, so it is excluded from the points-to
@@ -8987,6 +9793,11 @@ public class ExtractIR extends GhidraScript {
         w.println("}");
         w.close();
         println("[*] cfgspace: " + totalBarRel + " bar-relative findings");
+        println("[*] persite: extra findings mmio=" +
+            persiteExtraMmio + " port=" + persiteExtraPort +
+            " msr=" + persiteExtraMsr + " bar=" + persiteExtraBar +
+            ", skippedByIdentity=" + persiteSkippedIdent +
+            ", replayMismatch=" + persiteReplayMismatch + ".");
         println("[+] JSON Export Complete: " + outputJson +
             " (" + fnCount + " functions, " + strCount + " strings)");
     }
