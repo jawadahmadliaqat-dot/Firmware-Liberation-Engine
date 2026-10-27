@@ -279,6 +279,11 @@ public class ExtractIR extends GhidraScript {
             is then a no-op for that callee. Single-convention
             adapters ignore conv. */
         long[] argumentRegisterOffsets(String conv);
+        /** Offset of the register a callee's return value is left
+            in (v8 retprop): ARM r0, RISC-V a0 (x10), MIPS v0 ($2),
+            x86 RAX/EAX. Always a pointer-size register, so a
+            return summary is a single Bits at pointer size. */
+        long returnRegisterOffset();
     }
 
     // Selected in run() from the program's processor (default ARM:
@@ -310,6 +315,25 @@ public class ExtractIR extends GhidraScript {
         map is semantically inert for ARM/RISC-V/MIPS. */
     private Map<Long, String> callConvMap =
         new HashMap<Long, String>();
+
+    /** v8 retprop: return summaries by callee entry key (dual-keyed
+        with the stripped entry key, like funcByEntry, so the CALL
+        branch can apply a summary from the raw call target alone).
+        Empty during Phase B; set by Phase R before Phase P/M, so
+        Phase M's re-runs apply the final summaries too. A summary
+        is a single Bits at pointer size: an exact constant, or a
+        BAR/BASE symbol. CALLIND never consults this map. */
+    private Map<Long, Bits> retSummaries =
+        new HashMap<Long, Bits>();
+
+    /** v8 retprop (Prov): interface return summaries by callee
+        entry key (dual-keyed like retSummaries). Empty outside
+        Phase P2 (x86-64 only); set by Phase P2 before emission,
+        so member-call resolution in callers sees interfaces
+        returned by helpers. Only IFACE summaries exist (see
+        extractProvSummaries). */
+    private Map<Long, Prov> provSummaries =
+        new HashMap<Long, Prov>();
 
     /** Caller-saved set for a CALL/CALLIND op: for direct CALLs
         to a known function, the per-callee Ghidra convention
@@ -384,6 +408,10 @@ public class ExtractIR extends GhidraScript {
             // AAPCS r0-r3 (Ghidra ARM offsets rN = 0x20 + 4N,
             // verified by probe: r0=32, r1=36, r2=40, r3=44).
             return new long[] {32L, 36L, 40L, 44L};
+        }
+        public long returnRegisterOffset() {
+            // AAPCS return register is r0.
+            return 32L;
         }
         /** ARM TBB/TBH jump-table recovery (v3.3), implementing
         IsaAdapter.recoverJumpTableTargets.
@@ -606,6 +634,10 @@ public class ExtractIR extends GhidraScript {
             long[] offs = new long[8];
             for (int i = 0; i < 8; i++) offs[i] = reg(10 + i);
             return offs;
+        }
+        public long returnRegisterOffset() {
+            // Return register is a0 = x10.
+            return reg(10);
         }
         public Map<Integer, List<Integer>> recoverJumpTableTargets(
             List<OpRec> ops, Memory mem) {
@@ -855,6 +887,10 @@ public class ExtractIR extends GhidraScript {
             for (int i = 0; i < 4; i++) offs[i] = reg(4 + i);
             return offs;
         }
+        public long returnRegisterOffset() {
+            // Return register is v0 = $2.
+            return reg(2);
+        }
         public Map<Integer, List<Integer>> recoverJumpTableTargets(
             List<OpRec> ops, Memory mem) {
             Map<Integer, List<Integer>> result =
@@ -993,6 +1029,13 @@ public class ExtractIR extends GhidraScript {
             // System V AMD64: RDI, RSI, RDX, RCX, R8, R9.
             return new long[] {0x38L, 0x30L, 0x10L, 0x8L, 0x80L,
                 0x88L};
+        }
+        public long returnRegisterOffset() {
+            // Return register is RAX (64-bit) / EAX (32-bit),
+            // offset 0 in both cases (probe-verified: helpers
+            // leave their value in register:0x0, and RETURN's own
+            // input is the return ADDRESS, not the value).
+            return 0L;
         }
 
         /** x86 has NO link register: CALL pushes the return
@@ -1787,6 +1830,33 @@ public class ExtractIR extends GhidraScript {
             // store does NOT kill it: the latch is CPU state, not
             // memory. Seeded "gmem:" keys survive, as before.)
             bvals.remove("cfg:addr");
+            // v8 retprop: a direct CALL to a summarized callee
+            // restores the return register to the summary value.
+            // The summary holds on ALL paths through the callee
+            // (see Phase R), and any argument dependence is covered
+            // by the constprop agree discipline: a callee whose
+            // entry arguments are not agreed computes an unknown
+            // (or argument-independent) return, so the summary is
+            // valid at every direct site. CALLIND gets nothing (the
+            // clobber above already killed the register); the
+            // summary is applied AFTER the clobber, never before.
+            if (mnem.equals("CALL") && op.ins.length >= 1) {
+                Varnode t = op.ins[0];
+                if (t != null && t.getAddress() != null &&
+                    "ram".equals(t.getAddress().getAddressSpace()
+                        .getName())) {
+                    Bits sum = retSummaries.get(t.getOffset());
+                    if (sum == null) {
+                        sum = retSummaries.get(
+                            isa.stripInstructionTag(t.getOffset()));
+                    }
+                    if (sum != null) {
+                        putKnown(bvals, isa.registerSpaceName() +
+                            ":" + isa.returnRegisterOffset() + ":" +
+                            isa.pointerSize(), sum);
+                    }
+                }
+            }
             if (out != null) putKnown(bvals, vkey(out), Bits.unknown());
         } else if (mnem.equals("CALLOTHER")) {
             // v7 cfgspace: CF8/CFC config-space tracking. The
@@ -4898,6 +4968,31 @@ public class ExtractIR extends GhidraScript {
                     killReg(st, isa.registerSpaceName(), off);
                 }
             }
+            // v8 retprop (Prov): a direct CALL to a summarized
+            // callee restores the return register's provenance to
+            // the summary interface (same all-RETURNs-agree rule as
+            // Bits summaries, see Phase P2). Applied AFTER the
+            // clobber, never before. CALLIND gets nothing; the
+            // acquisition bindings below bind out-params (R8), not
+            // the return register, so there is no conflict.
+            if (mnem.equals("CALL") && op.ins.length >= 1) {
+                Varnode t = op.ins[0];
+                if (t != null && t.getAddress() != null &&
+                    "ram".equals(t.getAddress().getAddressSpace()
+                        .getName())) {
+                    Prov ps = provSummaries.get(t.getOffset());
+                    if (ps == null) {
+                        ps = provSummaries.get(
+                            isa.stripInstructionTag(t.getOffset()));
+                    }
+                    if (ps != null) {
+                        Varnode rr = regVarnode(
+                            isa.returnRegisterOffset(),
+                            isa.pointerSize());
+                        if (rr != null) setProv(st, rr, ps);
+                    }
+                }
+            }
             // Post-call bindings (memory effects of the call).
             if (acqGuid != null && acqOut != null) {
                 bindAcquisition(acqOut, acqGuid, ops, idx, st, ctx);
@@ -5675,10 +5770,190 @@ public class ExtractIR extends GhidraScript {
         return sameState(a, b);
     }
 
+    /** v8 retprop: equality of two Bits values, including symbols
+        (Bits has no equals; compare the fields directly). */
+    private static boolean sameBits(Bits a, Bits b) {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        if (a.ones != b.ones || a.zeroes != b.zeroes ||
+            a.symW != b.symW) return false;
+        if (a.sym == null) return b.sym == null;
+        return a.sym.equals(b.sym);
+    }
+
+    /** v8 retprop: equality of two summary maps. */
+    private static boolean sameRetSummaries(Map<Long, Bits> a,
+        Map<Long, Bits> b) {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        if (a.size() != b.size()) return false;
+        for (Map.Entry<Long, Bits> e : a.entrySet()) {
+            if (!sameBits(e.getValue(), b.get(e.getKey()))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** v8 retprop (Prov): equality of two interface-summary maps
+        (Prov has equals; null treated as absent). */
+    private static boolean sameProvSummaries(Map<Long, Prov> a,
+        Map<Long, Prov> b) {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        if (a.size() != b.size()) return false;
+        for (Map.Entry<Long, Prov> e : a.entrySet()) {
+            Prov o = b.get(e.getKey());
+            if (o == null || !e.getValue().equals(o)) return false;
+        }
+        return true;
+    }
+
+    /** v8 retprop (Prov): extract one interface return summary per
+        callee from the current provenance fixpoints. The summary
+        is the return register's provenance agreed on ALL RETURN
+        ops, and only an interface (IFACE with a known GUID)
+        qualifies: a helper that acquired an interface (a
+        LocateProtocol out-param copied to the return register, or
+        an interface parameter passed through) returns that
+        interface to the caller with the same certainty. Any RETURN
+        with a null inState, a non-IFACE provenance, or a
+        disagreeing interface blocks the summary. Argument
+        dependence needs no separate check: the fixpoint ran under
+        the provEntries meet, so a value depending on a non-agreed
+        argument is unknown here (or argument-independent, which is
+        valid at every site). Dual-keyed like retSummaries. */
+    private Map<Long, Prov> extractProvSummaries(
+        List<FuncRec> funcRecs) {
+        Map<Long, Prov> out = new HashMap<Long, Prov>();
+        String retKey = isa.registerSpaceName() + ":" +
+            isa.returnRegisterOffset() + ":" + isa.pointerSize();
+        for (FuncRec rec : funcRecs) {
+            if (rec.pv == null || !rec.pv.converged ||
+                rec.pv.inStates == null) continue;
+            Prov agree = null;
+            boolean seen = false;
+            boolean bad = false;
+            List<OpRec> pops = rec.or.ops;
+            for (int i = 0; i < pops.size(); i++) {
+                if (!pops.get(i).mnem.equals("RETURN")) continue;
+                if (i >= rec.pv.inStates.length) {
+                    bad = true;
+                    break;
+                }
+                ProvState st = rec.pv.inStates[i];
+                if (st == null) {
+                    bad = true;
+                    break;
+                }
+                Prov p = st.varProv.get(retKey);
+                if (p == null || p.kind != Prov.IFACE ||
+                    p.guid == null) {
+                    bad = true;
+                    break;
+                }
+                if (!seen) {
+                    agree = p;
+                    seen = true;
+                } else if (!agree.equals(p)) {
+                    bad = true;
+                    break;
+                }
+            }
+            if (seen && !bad) {
+                out.put(rec.entryKey, agree);
+                long stripped =
+                    isa.stripInstructionTag(rec.entryKey);
+                if (stripped != rec.entryKey) {
+                    out.put(stripped, agree);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** v8 retprop: extract one return summary per callee from the
+        current must-fixpoints. The summary is the return-register
+        value agreed on ALL RETURN ops: the same exact constant, or
+        the same BAR/BASE symbol at the same width. Any RETURN with
+        a null inState (unreached or unmodelled path), an unknown
+        or partial value, or a value disagreeing with another RETURN
+        blocks the summary (unknown, never a guess). A callee with
+        no RETURN ops (noreturn, or tail-called away) has no
+        summary. Argument dependence needs no separate check: the
+        fixpoint ran under the constprop entry, so a value depending
+        on a non-agreed argument is unknown here (or
+        argument-independent, which is valid at every site). The
+        result is dual-keyed (entry key + stripped entry key, like
+        funcByEntry) so the CALL branch can apply it from the raw
+        call target alone. */
+    private Map<Long, Bits> extractRetSummaries(
+        List<FuncRec> funcRecs) {
+        Map<Long, Bits> out = new HashMap<Long, Bits>();
+        String retKey = isa.registerSpaceName() + ":" +
+            isa.returnRegisterOffset() + ":" + isa.pointerSize();
+        long mask = sizeMask(isa.pointerSize());
+        for (FuncRec rec : funcRecs) {
+            if (rec.fx == null || !rec.fx.converged ||
+                rec.fx.inStates == null) continue;
+            Bits agree = null;
+            boolean seen = false;
+            boolean bad = false;
+            List<OpRec> pops = rec.or.ops;
+            for (int i = 0; i < pops.size(); i++) {
+                if (!pops.get(i).mnem.equals("RETURN")) continue;
+                if (i >= rec.fx.inStates.length) {
+                    bad = true;
+                    break;
+                }
+                Map<String, Bits> st = rec.fx.inStates[i];
+                if (st == null) {
+                    bad = true;
+                    break;
+                }
+                Bits b = st.get(retKey);
+                Bits cand = null;
+                if (b != null && b.sym != null) {
+                    if (Bits.parseBarSym(b.sym) != null) {
+                        cand = Bits.symBits(b.sym, b.symW);
+                    }
+                } else if (b != null) {
+                    Long v = b.exactValue(mask);
+                    if (v != null) {
+                        cand = Bits.exact(v.longValue(), mask);
+                    }
+                }
+                if (cand == null) {
+                    bad = true;
+                    break;
+                }
+                if (!seen) {
+                    agree = cand;
+                    seen = true;
+                } else if (!sameBits(agree, cand)) {
+                    bad = true;
+                    break;
+                }
+            }
+            if (seen && !bad) {
+                out.put(rec.entryKey, agree);
+                long stripped =
+                    isa.stripInstructionTag(rec.entryKey);
+                if (stripped != rec.entryKey) {
+                    out.put(stripped, agree);
+                }
+            }
+        }
+        return out;
+    }
+
     /** Meet over ALL direct call sites of one callee: an argument
-        register is bound only when every site has it exact AND all
-        sites agree on the value. Anything else stays unknown
-        (absent from the returned map). */
+        register is bound only when every site agrees on the same
+        value -- the same exact constant (v2 item #2), or, since v8
+        retprop, the same BAR/BASE symbol (a symbol argument, e.g.
+        a BASE returned by one helper and passed to the next).
+        Anything else (unknown, partial, mixed kinds, disagreeing
+        values) stays unknown (absent from the returned map). */
     private Map<String, Bits> meetOverSites(long calleeKey,
         Map<Long, List<CallSite>> sitesByCallee,
         Map<Long, long[]> argRegsByCallee) {
@@ -5693,30 +5968,62 @@ public class ExtractIR extends GhidraScript {
         for (long off : argRegs) {
             Varnode vn = regVarnode(off, ptrSize);
             if (vn == null) continue;
-            Long agreed = null;
-            boolean allExact = true;
+            Long agreedVal = null;
+            String agreedSym = null;
+            int agreedSymW = 0;
+            boolean isSym = false;
+            boolean first = true;
+            boolean allAgree = true;
             for (CallSite s : sites) {
                 FixResult fx = s.caller.fx;
-                Long v = null;
+                Bits b = null;
                 if (fx != null && fx.inStates != null &&
                     s.opIdx < fx.inStates.length &&
                     fx.inStates[s.opIdx] != null) {
-                    v = resolveExact(vn, fx.inStates[s.opIdx]);
+                    b = resolveBits(vn, fx.inStates[s.opIdx]);
                 }
-                if (v == null) {
-                    allExact = false;
+                if (b == null || (b.sym == null &&
+                    b.exactValue(mask) == null)) {
+                    allAgree = false;
                     break;
                 }
-                if (agreed == null) {
-                    agreed = v;
-                } else if (!agreed.equals(v)) {
-                    allExact = false;
-                    break;
+                if (b.sym != null) {
+                    if (Bits.parseBarSym(b.sym) == null) {
+                        allAgree = false;
+                        break;
+                    }
+                    if (first) {
+                        isSym = true;
+                        agreedSym = b.sym;
+                        agreedSymW = b.symW;
+                        first = false;
+                    } else if (!isSym ||
+                        !agreedSym.equals(b.sym) ||
+                        agreedSymW != b.symW) {
+                        allAgree = false;
+                        break;
+                    }
+                } else {
+                    Long v = b.exactValue(mask);
+                    if (first) {
+                        agreedVal = v;
+                        first = false;
+                    } else if (isSym || !agreedVal.equals(v)) {
+                        allAgree = false;
+                        break;
+                    }
                 }
             }
-            if (allExact && agreed != null) {
-                out.put(isa.registerSpaceName() + ":" + off + ":" +
-                    ptrSize, Bits.exact(agreed.longValue(), mask));
+            if (allAgree && !first) {
+                if (isSym) {
+                    out.put(isa.registerSpaceName() + ":" + off +
+                        ":" + ptrSize,
+                        Bits.symBits(agreedSym, agreedSymW));
+                } else {
+                    out.put(isa.registerSpaceName() + ":" + off +
+                        ":" + ptrSize,
+                        Bits.exact(agreedVal.longValue(), mask));
+                }
             }
         }
         return out;
@@ -6626,6 +6933,103 @@ public class ExtractIR extends GhidraScript {
                 ", functions with propagated entries=" + withEntries +
                 ", entry constants=" + totalConsts + ".");
         }
+        // ---- v8 retprop, Phase R: return-value propagation ----
+        // A callee's return summary is the return-register value
+        // agreed on ALL its RETURN ops (extractRetSummaries), and
+        // the CALL branch applies it to the caller's return register
+        // after the clobber. Iteration is JOINT over entries and
+        // summaries: a summary applied in a caller creates a new
+        // agreed argument at the next callee's sites (e.g. a BASE
+        // symbol returned by one helper and passed to the next),
+        // so each round refreshes constprop entries from the
+        // current fixpoints (same eligibility filter as Phase B)
+        // AND re-extracts summaries, then re-runs all functions.
+        // Nested returns need a second round (a caller of a
+        // summarized callee gains a summary only once the callee's
+        // summary is applied), and recursion never yields an
+        // unsound summary (a recursive call's return is unknown
+        // until the callee has a summary, so a recursive callee's
+        // RETURNs disagree and no summary forms -- the loop then
+        // converges on unknown). Entries and summaries only gain
+        // precision across rounds (the transfer is monotone in
+        // input precision, same argument as constprop), so the
+        // round cap is a safety bound; non-convergence drops ALL
+        // summaries AND restores the Phase B entries, then re-runs,
+        // so no unstable summary or entry ever reaches emission.
+        // No constprop-eligibility filter on summaries themselves:
+        // a summary is a property of the callee's own fixpoint, and
+        // the agree discipline already covers argument dependence
+        // (see extractRetSummaries). Phase M's re-runs below apply
+        // the final summaries automatically (same instance field)
+        // and use the (possibly refined) entries map.
+        Map<Long, Map<String, Bits>> entriesBeforeR =
+            new HashMap<Long, Map<String, Bits>>();
+        for (Map.Entry<Long, Map<String, Bits>> e :
+            entries.entrySet()) {
+            entriesBeforeR.put(e.getKey(), e.getValue() == null ?
+                null : new HashMap<String, Bits>(e.getValue()));
+        }
+        boolean retConverged = false;
+        int retRounds = 0;
+        for (int round = 0; round < MAX_CONSTPROP_ROUNDS &&
+            !retConverged; round++) {
+            if (monitor.isCancelled()) break;
+            retRounds++;
+            boolean entriesChanged = false;
+            for (Long ck : sitesByCallee.keySet()) {
+                if (!Boolean.TRUE.equals(eligible.get(ck))) continue;
+                Map<String, Bits> m = meetOverSites(ck, sitesByCallee,
+                    argRegsByCallee);
+                if (!entrySame(entries.get(ck), m)) {
+                    entries.put(ck, m);
+                    entriesChanged = true;
+                }
+            }
+            Map<Long, Bits> next = extractRetSummaries(funcRecs);
+            boolean summariesChanged =
+                !sameRetSummaries(retSummaries, next);
+            if (!entriesChanged && !summariesChanged) {
+                retConverged = true;
+                break;
+            }
+            retSummaries = next;
+            for (FuncRec rec : funcRecs) {
+                FixResult nfx;
+                try {
+                    nfx = runFixpoint(rec.or.ops, memA,
+                        rec.branchTargets, entries.get(rec.entryKey));
+                } catch (Exception ex) {
+                    nfx = emptyFix(rec.or.ops.size());
+                }
+                if (nfx.converged || rec.fx == null ||
+                    !rec.fx.converged) {
+                    rec.fx = nfx;
+                }
+            }
+        }
+        if (!retConverged && !monitor.isCancelled()) {
+            retSummaries = new HashMap<Long, Bits>();
+            entries.clear();
+            entries.putAll(entriesBeforeR);
+            for (FuncRec rec : funcRecs) {
+                try {
+                    FixResult nfx = runFixpoint(rec.or.ops, memA,
+                        rec.branchTargets, entries.get(rec.entryKey));
+                    if (nfx.converged || rec.fx == null ||
+                        !rec.fx.converged) {
+                        rec.fx = nfx;
+                    }
+                } catch (Exception ex) {
+                    // Keep the previous fixpoint.
+                }
+            }
+            println("[!] retprop: stopped after " +
+                MAX_CONSTPROP_ROUNDS +
+                " rounds without convergence; summaries dropped.");
+        }
+        println("[*] retprop: " + retRounds + " rounds, converged=" +
+            retConverged + ", summaries=" + retSummaries.size() +
+            ".");
         // ---- v2 item #3, Phase P: protocol-aware points-to ----
         // Gated to x86-64 (UEFI Boot Services + protocol tables
         // are x86-64 ABI facts; other ISAs keep v3.9 behaviour
@@ -6832,6 +7236,62 @@ public class ExtractIR extends GhidraScript {
             println("[*] proto: " + provRounds + " rounds, converged=" +
                 provConverged + ", functions with propagated entries=" +
                 withProvEntries + ".");
+            // ---- v8 retprop (Prov), Phase P2: interface returns ----
+            // A second, separate iteration AFTER Phase P's loop (the
+            // loop above is untouched, so its behaviour cannot
+            // regress): extract interface summaries from the final
+            // provenance fixpoints, apply them at direct CALLs via
+            // the provSummaries field, and re-run all provenance
+            // fixpoints until summaries stabilize. A caller that
+            // receives an interface through a CALL return can then
+            // resolve a member CALLIND (and its Pci.Read/Write port
+            // attribution) exactly as if it had acquired the
+            // interface itself. Non-convergence drops ALL summaries
+            // and re-runs with provEntries only, so no unstable
+            // summary ever reaches emission. provEntries are NOT
+            // refreshed here (Phase P already converged them; a
+            // summary is a property of the callee's own fixpoint).
+            boolean provRetConverged = false;
+            int provRetRounds = 0;
+            for (int round = 0; round < MAX_CONSTPROP_ROUNDS &&
+                !provRetConverged; round++) {
+                if (monitor.isCancelled()) break;
+                provRetRounds++;
+                Map<Long, Prov> next =
+                    extractProvSummaries(funcRecs);
+                if (sameProvSummaries(provSummaries, next)) {
+                    provRetConverged = true;
+                    break;
+                }
+                provSummaries = next;
+                for (FuncRec rec : funcRecs) {
+                    try {
+                        rec.pv = runProvFixpoint(rec.or.ops,
+                            rec.branchTargets,
+                            provEntries.get(rec.entryKey), provCtx);
+                    } catch (Exception ex) {
+                        // Keep the previous Prov result.
+                    }
+                }
+            }
+            if (!provRetConverged && !monitor.isCancelled()) {
+                provSummaries = new HashMap<Long, Prov>();
+                for (FuncRec rec : funcRecs) {
+                    try {
+                        rec.pv = runProvFixpoint(rec.or.ops,
+                            rec.branchTargets,
+                            provEntries.get(rec.entryKey), provCtx);
+                    } catch (Exception ex) {
+                        // Keep the previous Prov result.
+                    }
+                }
+                println("[!] provret: stopped after " +
+                    MAX_CONSTPROP_ROUNDS +
+                    " rounds without convergence; summaries dropped.");
+            }
+            println("[*] provret: " + provRetRounds + " rounds, converged=" +
+                provRetConverged + ", summaries=" + provSummaries.size() +
+                ".");
         }
 
         // ---- Memory/global propagation, Phase M ----
