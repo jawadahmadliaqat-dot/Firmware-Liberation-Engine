@@ -5072,6 +5072,154 @@ public class ExtractIR extends GhidraScript {
         return Long.parseLong(s, 16);
     }
 
+    // ---------------- v2 item #4: ACPI-derived bands (MCFG only) ----------------
+    // Bands affect CLASSIFICATION (known/suspect) and the Lean window
+    // check; they do NOT create accesses. Real UEFI MMIO lives in
+    // BAR-mapped regions, which the fixed x86 bands (legacy + APIC
+    // ranges) do not cover; the MCFG table's ECAM window is the one
+    // BAR-adjacent band with a fully specified, checkable format.
+    //
+    // WHY SIGNATURE-SCAN, NOT RSDP-CHASING: an RSDP points at
+    // RSDT/XSDT by PHYSICAL address, and the physical-address to
+    // file-offset translation of a flash image is platform
+    // dependent (it depends on where the platform maps the ROM).
+    // Chasing pointers would therefore bake in a mapping
+    // assumption. Scanning the raw image bytes for a table that is
+    // actually present, and validating it, tests presence without
+    // any mapping assumption. DSDT/SSDT OperationRegions are NOT
+    // attempted here: they need an AML parser (its own work), and
+    // no DSDT/SSDT exists in the OVMF image at all (see the v4
+    // survey: tables are QEMU runtime artifacts via fw_cfg).
+    //
+    // MCFG LAYOUT (ACPI spec): 36-byte standard header (signature
+    // "MCFG" at 0, length LE u32 at 4, revision at 8, checksum at 9),
+    // then an 8-byte reserved field (offsets 36..43), then N
+    // 16-byte allocations starting at offset 44: base address LE
+    // u64 at +0, segment group u16 at +8, start bus u8 at +10,
+    // end bus u8 at +11, reserved u32 at +12. Length must equal
+    // exactly 44 + 16*N. Per bus: 32 devices * 8 functions * 4KB
+    // = 1MB, so one allocation covers [base, base + nBuses*1MB).
+    //
+    // VALIDATION (a band from a misparsed table is worse than no
+    // band): signature, exact length arithmetic, table fits in the
+    // image, ACPI checksum (sum of all length bytes mod 256 == 0),
+    // every allocation non-zero base, startBus <= endBus, no
+    // 64-bit wrap. A candidate failing ANY check is skipped, never
+    // partially used (allocations from one table are collected in
+    // a temp list and committed only if the whole table passes).
+    // Never throws: any problem yields an empty list and the caller
+    // falls back to the static bands. No QEMU default is ever
+    // assumed: 0xB0000000 appears nowhere in this code; a band
+    // exists only if a valid MCFG table was read from the image.
+    private static List<long[]> findAcpiMcfgBands(byte[] img) {
+        List<long[]> bands = new ArrayList<long[]>();
+        if (img == null) return bands;
+        for (int off = 0; off + 4 <= img.length; ) {
+            int idx = -1;
+            for (int i = off; i + 4 <= img.length; i++) {
+                if (img[i] == 'M' && img[i + 1] == 'C' &&
+                    img[i + 2] == 'F' && img[i + 3] == 'G') {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx < 0) break;
+            off = idx + 1;
+            if (idx + 44 > img.length) continue;
+            long len = (img[idx + 4] & 0xffL) |
+                ((img[idx + 5] & 0xffL) << 8) |
+                ((img[idx + 6] & 0xffL) << 16) |
+                ((img[idx + 7] & 0xffL) << 24);
+            if (len < 44 + 16 || (len - 44) % 16 != 0) continue;
+            if (idx + len > img.length) continue;
+            int sum = 0;
+            for (long k = 0; k < len; k++) {
+                sum += img[idx + (int) k] & 0xff;
+            }
+            if ((sum & 0xff) != 0) continue;
+            int nAlloc = (int) ((len - 44) / 16);
+            List<long[]> tableBands = new ArrayList<long[]>();
+            boolean ok = true;
+            for (int a = 0; a < nAlloc; a++) {
+                int ao = idx + 44 + 16 * a;
+                long base = 0;
+                for (int b = 0; b < 8; b++) {
+                    base |= (img[ao + b] & 0xffL) << (8 * b);
+                }
+                int startBus = img[ao + 10] & 0xff;
+                int endBus = img[ao + 11] & 0xff;
+                if (base <= 0 || startBus > endBus) {
+                    ok = false;
+                    break;
+                }
+                long size = (long) (endBus - startBus + 1) *
+                    0x100000L;
+                if (size <= 0 || base + size < base) {
+                    ok = false;
+                    break;
+                }
+                tableBands.add(new long[] {base, base + size});
+            }
+            if (ok) bands.addAll(tableBands);
+        }
+        return bands;
+    }
+
+    /** Union valid MCFG-derived ECAM bands from the input image
+        into the x86 default band list (x86 branch only; other
+        adapters never call this, so their outputs are structurally
+        unchanged). Falls back silently to the static bands when
+        the executable path is unavailable, the file is missing or
+        over the 64MB scan cap, or no valid MCFG table is present.
+        An explicit mmio= override suppresses augmentation: the
+        override replaces all bands by user choice. */
+    private void augmentX86WindowsWithAcpi(List<long[]> windows) {
+        String exePath = null;
+        try {
+            exePath = currentProgram.getExecutablePath();
+        } catch (Exception e) {
+            exePath = null;
+        }
+        if (exePath == null || exePath.isEmpty()) {
+            println("[*] acpi: no executable path; " +
+                "static x86 bands only.");
+            return;
+        }
+        try {
+            java.io.File f = new java.io.File(exePath);
+            if (!f.isFile() ||
+                f.length() > 64L * 1024L * 1024L) {
+                println("[*] acpi: input file unavailable or " +
+                    ">64MB; static x86 bands only.");
+                return;
+            }
+            byte[] img =
+                java.nio.file.Files.readAllBytes(f.toPath());
+            List<long[]> derived = findAcpiMcfgBands(img);
+            if (derived.isEmpty()) {
+                println("[*] acpi: no valid MCFG table in input " +
+                    "image; static x86 bands only.");
+                return;
+            }
+            for (long[] b : derived) {
+                boolean dup = false;
+                for (long[] w : windows) {
+                    if (w[0] == b[0] && w[1] == b[1]) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) windows.add(b);
+                println("[*] acpi: MCFG ECAM band added [0x" +
+                    Long.toHexString(b[0]) + ", 0x" +
+                    Long.toHexString(b[1]) + ").");
+            }
+        } catch (Exception e) {
+            println("[*] acpi: scan failed (" + e.getMessage() +
+                "); static x86 bands only.");
+        }
+    }
+
     // ---------------- v2 item #2: inter-procedural constant propagation ----------------
     // SOUND SLICE, not a redesign: constants flow through DIRECT calls
     // with constant arguments, into callees whose EVERY call site is
@@ -5332,12 +5480,14 @@ public class ExtractIR extends GhidraScript {
                 // Fall through to System V.
             }
             List<long[]> windows = defaultX86MmioWindows();
+            boolean mmioOverridden = false;
             for (String a : getScriptArgs()) {
                 if (a.startsWith("mmio=")) {
                     List<long[]> parsed = parseMmioWindows(
                         a.substring(5));
                     if (parsed != null && !parsed.isEmpty()) {
                         windows = parsed;
+                        mmioOverridden = true;
                     } else {
                         println("[!] Bad mmio= window spec, using " +
                             "x86 defaults.");
@@ -5354,6 +5504,16 @@ public class ExtractIR extends GhidraScript {
                             "or sysv), using binary default.");
                     }
                 }
+            }
+            // v2 item #4: union MCFG-derived ECAM bands from the
+            // input image into the DEFAULT band set only; an
+            // explicit mmio= override replaces all bands by user
+            // choice and suppresses augmentation.
+            if (!mmioOverridden) {
+                augmentX86WindowsWithAcpi(windows);
+            } else {
+                println("[*] acpi: mmio= override supplied; " +
+                    "ACPI bands not added.");
             }
             isa = new X86Isa(is64, windows, windowsDefault);
             println("[*] ISA adapter: X86 (" + (is64 ? "X86-64" :
