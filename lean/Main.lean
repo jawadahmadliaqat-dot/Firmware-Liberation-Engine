@@ -3,7 +3,11 @@
   Usage: lake exe ingest_check <report.json> [blink|generic|bmp]
   Default mode is blink (the PA5 spec); generic runs only the
   firmware-agnostic invariants (non-empty trace, consistent masks,
-  MMIO addresses inside the bands, port/MSR sanity).
+  MMIO addresses inside the bands, port/MSR sanity, port/MSR
+  confinement against the architectural allowlist for the report's
+  language). Bmp and blink modes are untouched by confinement: their
+  reports (ARM) carry no port/MSR entries, so the check would be
+  vacuous there, and their code paths do not call it.
   The trace is unified: "trace ops" counts MMIO + port + MSR ops
   (the breakdown line right after it splits the count by kind).
   Reports without port/MSR fields (pre-v3.8) yield the same trace
@@ -31,16 +35,23 @@ def printBlink (trace : List MmioAccess) : IO Bool := do
   IO.println s!"mode clear-then-set before LED: {mode}"
   pure (order && led && clock && mode)
 
-def printGeneric (windows : List (Nat × Nat)) (trace : List MmioAccess) : IO Bool := do
+def printGeneric (lang : Option String) (windows : List (Nat × Nat)) (trace : List MmioAccess) : IO Bool := do
   let nonempty := !trace.isEmpty
   let masks := checkMasksConsistent trace
   let window := checkWindowBands windows trace
   let sanity := checkPortMsrSanity trace
+  let confined := checkPortMsrConfinement lang trace
   IO.println s!"trace non-empty: {nonempty}"
   IO.println s!"masks consistent (ones & zeroes == 0): {masks}"
   IO.println s!"all addresses in MMIO window: {window}"
   IO.println s!"port/MSR sanity (port ≤ 0xFFFF, MSR index < 2^32): {sanity}"
-  pure (nonempty && masks && window && sanity)
+  IO.println s!"port/MSR confinement (every port/MSR in the architectural allowlist): {confined}"
+  let violations := portMsrConfinementViolations lang trace
+  if !violations.isEmpty then
+    let names := violations.map fun a =>
+      s!"{a.func} {kindName a.kind} {natToHex a.addr}"
+    IO.println s!"confinement violations: {names}"
+  pure (nonempty && masks && window && sanity && confined)
 
 def printBmp (trace : List MmioAccess) (mayTrace : List MmioAccess) : IO Bool := do
   let generic := checkGeneric trace
@@ -73,7 +84,8 @@ def main (args : List String) : IO UInt32 := do
         match extractMmioWindows j with
         | .error e => IO.println s!"mmio windows extract failed: {e}"; pure 1
         | .ok windows => do
-          let ok ← if mode == "generic" then printGeneric windows trace
+          let lang := extractLanguage j
+          let ok ← if mode == "generic" then printGeneric lang windows trace
             else if mode == "bmp" then printBmp trace mayTrace
             else printBlink trace
           if ok then IO.println "VERDICT: PASS"; pure 0

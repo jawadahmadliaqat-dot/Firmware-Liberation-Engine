@@ -204,8 +204,9 @@ def checkWindowBands (windows : List (Nat × Nat)) (trace : List MmioAccess) : B
 /-- Sanity for non-MMIO ops: a port number must fit the 16-bit I/O
     port space, an MSR index must fit 32 bits. MMIO ops pass vacuously
     (their window check is checkWindowBands). This is a sanity bound,
-    NOT a confinement check: port/MSR confinement (which ports/MSRs a
-    driver may touch) is future work, deliberately not added here. -/
+    NOT a confinement check: which ports/MSRs a driver may touch is
+    checkPortMsrConfinement below (the v2-deferred item, added after
+    the sanity check shipped). -/
 def checkPortMsrSanity (trace : List MmioAccess) : Bool :=
   trace.all fun a =>
     if a.kind = .port then decide (a.addr ≤ 0xFFFF)
@@ -244,6 +245,100 @@ def checkGeneric (trace : List MmioAccess) : Bool :=
 
 def inRange (addr lo hi : Nat) : Bool :=
   decide (lo ≤ addr) && decide (addr < hi)
+
+/-- Architectural x86 port allowlist: the PC platform's fixed I/O map
+    entries that platform firmware touches during init and bring-up.
+    PCI configuration mechanism 1 (0xCF8-0xCFF, address + data bytes);
+    legacy interrupt/timer/DMA/keyboard/CMOS (PIC, PIT, DMA pages,
+    keyboard controller, RTC); serial UARTs COM1-COM4. Device registers
+    (parallel, VGA, IDE, floppy) are deliberately NOT included: firmware
+    touching them extends this list with a justification comment (the
+    allowlist path), it does not get a silent pass. -/
+def x86PortAllowed (p : Nat) : Bool :=
+  inRange p 0xCF8 0xD00 ||
+  inRange p 0x20 0x22 || inRange p 0xA0 0xA2 ||
+  inRange p 0x40 0x44 ||
+  inRange p 0x00 0x10 || inRange p 0x80 0x90 || inRange p 0xC0 0xE0 ||
+  p == 0x60 || p == 0x64 ||
+  inRange p 0x70 0x72 ||
+  inRange p 0x3F8 0x400 || inRange p 0x2F8 0x300 ||
+  inRange p 0x3E8 0x3F0 || inRange p 0x2E8 0x2F0
+
+/-- Architectural x86 MSR allowlist: the firmware-init-relevant core.
+    Intel SDM Vol 4 architectural MSRs (TSC, APIC_BASE, BIOS_SIGN_ID,
+    MTRRCAP, SYSENTER, MISC_ENABLE, MTRR phys/fixed, PAT,
+    MTRR_DEF_TYPE, EFER, STAR/LSTAR/CSTAR/FMASK, FS/GS bases, TSC_AUX)
+    and AMD APM (SYSCFG, HWCR, GHCB, SEV_STATUS). Any MSR outside this
+    list fails confinement until added here with a justification
+    comment (the allowlist path). -/
+def x86MsrAllowed (m : Nat) : Bool :=
+  m == 0x10 || m == 0x1B || m == 0x8B || m == 0xFE ||
+  inRange m 0x174 0x177 ||
+  m == 0x1A0 ||
+  inRange m 0x200 0x210 ||
+  m == 0x250 || m == 0x258 || m == 0x259 || inRange m 0x268 0x270 ||
+  m == 0x277 || m == 0x2FF ||
+  inRange m 0xC0000080 0xC0000085 ||
+  inRange m 0xC0000100 0xC0000104 ||
+  m == 0xC0010010 || m == 0xC0010015 ||
+  m == 0xC0010130 || m == 0xC0010131
+
+/-- One trace op's confinement verdict under an architecture's
+    allowlist. MMIO ops pass vacuously (their check is
+    checkWindowBands). For x86 ("x86:..." language) the architectural
+    sets above decide; for any other architecture — and for unknown
+    architecture — there is no port/MSR allowlist, so a port/MSR op
+    fails. There is deliberately no "everything passes" default. -/
+def portMsrAllowed (lang : Option String) (a : MmioAccess) : Bool :=
+  if a.kind = .mmio then true
+  else match lang with
+  | some l => if l.startsWith "x86" then
+      if a.kind = .port then x86PortAllowed a.addr else x86MsrAllowed a.addr
+    else false
+  | none => false
+
+/-- Port/MSR confinement: every non-MMIO op in the architectural
+    allowlist for the report's architecture. This is the check
+    checkPortMsrSanity deliberately deferred: sanity bounds the space
+    (port ≤ 0xFFFF, MSR < 2^32); confinement bounds the set. A
+    violation is a verification failure, reported by name in
+    portMsrConfinementViolations — never silently dropped, never
+    silently passed. Protocol-attributed ports need no exemption:
+    Pci.Read/Write's CF8/CFC pass by the architectural PCI range,
+    which is stronger than a kind-based exemption (a mis-attributed
+    entry cannot ride it; and the trace carries no
+    protocol-attributed marker on port entries, so an exemption could
+    not even be implemented from the trace alone). -/
+def checkPortMsrConfinement (lang : Option String) (trace : List MmioAccess) : Bool :=
+  trace.all fun a => portMsrAllowed lang a
+
+/-- Short kind name for the confinement-failure line. -/
+def kindName : TraceKind → String
+  | .mmio => "mmio"
+  | .port => "port"
+  | .msr => "msr"
+
+def natToHex (n : Nat) : String :=
+  if n == 0 then "0x0"
+  else "0x" ++ ((Nat.toDigits 16 n).foldl (fun s d => s.push d) "")
+
+/-- The offending entries, for the distinct confinement-failure line:
+    (function, kind, address) of every op outside the allowlist. -/
+def portMsrConfinementViolations (lang : Option String) (trace : List MmioAccess) : List MmioAccess :=
+  trace.filter fun a => !portMsrAllowed lang a
+
+/-- The report's "language" field (e.g. "x86:LE:64:default"), if
+    present and well-formed. Absent or malformed means unknown
+    architecture — the sound default for confinement (no allowlist),
+    NOT an error: old reports carry no port/MSR entries, so the choice
+    is vacuous for them, and a new report with port/MSR entries but
+    no language must fail confinement rather than pass by default. -/
+def extractLanguage (j : Json) : Option String :=
+  match j.getObjVal? "language" with
+  | .ok v => match Json.getStr? v with
+    | .ok s => some s
+    | .error _ => none
+  | .error _ => none
 
 /-- BMP confinement profile, OBSERVED from the v2.0.0 report (not assumed):
     every driver family touches only its own peripherals. This is the
