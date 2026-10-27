@@ -252,12 +252,53 @@ public class ExtractIR extends GhidraScript {
             AND-~1 from jr/jalr P-Code). ARM/RISC-V return the input
             def unchanged. Never returns -1 for a valid input def. */
         int unwrapIndirectDef(List<OpRec> ops, int brIdx, int cur);
+        /** True when this ISA has overlapping register views (x86:
+            al/ax/eax/rax share storage, so a write to one view must
+            invalidate the others). ARM/RISC-V/MIPS return false. */
+        boolean hasOverlappingRegisters();
+        /** Caller-saved register offsets for a callee whose Ghidra
+            calling-convention name is conv (null = unknown callee:
+            the conservative union). Single-convention adapters ignore
+            conv and return callerSavedRegisterOffsets(); x86 maps
+            the name to its ABI set (System V / Windows) and falls back
+            to the binary default for unknown names. */
+        long[] clobberForConvention(String conv);
     }
 
     // Selected in run() from the program's processor (default ARM:
     // the pre-step-1 behaviour). RISC-V programs get a RiscVIsa,
-    // MIPS programs a MipsIsa.
+    // MIPS programs a MipsIsa, x86 programs an X86Isa.
     private IsaAdapter isa = new ArmIsa();
+
+    /** Per-callee Ghidra calling-convention names, keyed by
+        function entry-point offset (ram space only). Built in
+        run() before the function loop. A missing entry means
+        "unknown callee" and falls back to the conservative union
+        via clobberForConvention(null), never a guess. For
+        single-convention adapters the name is ignored, so the
+        map is semantically inert for ARM/RISC-V/MIPS. */
+    private Map<Long, String> callConvMap =
+        new HashMap<Long, String>();
+
+    /** Caller-saved set for a CALL/CALLIND op: for direct CALLs
+        to a known function, the per-callee Ghidra convention
+        (signature-driven, x86); otherwise the conservative union
+        (clobberForConvention(null)). For ARM/RISC-V/MIPS this
+        is behaviour-identical to callerSavedRegisterOffsets(). */
+    private long[] clobberForCall(OpRec op) {
+        if (op.mnem.equals("CALL") && op.ins.length >= 1) {
+            Varnode t = op.ins[0];
+            if (t != null && t.getAddress() != null &&
+                "ram".equals(t.getAddress().getAddressSpace().
+                    getName())) {
+                String conv = callConvMap.get(t.getOffset());
+                if (conv != null) {
+                    return isa.clobberForConvention(conv);
+                }
+            }
+        }
+        return isa.clobberForConvention(null);
+    }
 
     /** ARM (Cortex-M, Thumb) adapter: holds every ARM-specific fact. */
     private class ArmIsa implements IsaAdapter {
@@ -303,6 +344,10 @@ public class ExtractIR extends GhidraScript {
         }
         public int unwrapIndirectDef(List<OpRec> ops, int brIdx, int cur) {
             return cur;
+        }
+        public boolean hasOverlappingRegisters() { return false; }
+        public long[] clobberForConvention(String conv) {
+            return callerSavedRegisterOffsets();
         }
         /** ARM TBB/TBH jump-table recovery (v3.3), implementing
         IsaAdapter.recoverJumpTableTargets.
@@ -514,6 +559,10 @@ public class ExtractIR extends GhidraScript {
         }
         public int unwrapIndirectDef(List<OpRec> ops, int brIdx, int cur) {
             return cur;
+        }
+        public boolean hasOverlappingRegisters() { return false; }
+        public long[] clobberForConvention(String conv) {
+            return callerSavedRegisterOffsets();
         }
         public Map<Integer, List<Integer>> recoverJumpTableTargets(
             List<OpRec> ops, Memory mem) {
@@ -752,6 +801,10 @@ public class ExtractIR extends GhidraScript {
         public int unwrapIndirectDef(List<OpRec> ops, int brIdx, int cur) {
             return unwrapJrChain(ops, brIdx, cur);
         }
+        public boolean hasOverlappingRegisters() { return false; }
+        public long[] clobberForConvention(String conv) {
+            return callerSavedRegisterOffsets();
+        }
         public Map<Integer, List<Integer>> recoverJumpTableTargets(
             List<OpRec> ops, Memory mem) {
             Map<Integer, List<Integer>> result =
@@ -789,6 +842,234 @@ public class ExtractIR extends GhidraScript {
                     } else {
                         t = stripInstructionTag(entry);
                     }
+                    Integer j = firstAt.get(formatCodeAddress(t));
+                    if (j == null) break;
+                    if (!targets.contains(j)) targets.add(j);
+                }
+                if (!targets.isEmpty()) result.put(i, targets);
+            }
+            return result;
+        }
+    }
+
+    /** x86 adapter (v3.8, 64-bit first; 32-bit structural only,
+        untested): holds every x86-specific fact. Register offsets
+        are from the empirical Ghidra 11.4.2 probe
+        (~/workspace/x86-probe/probe_x86.log, language
+        x86:LE:64:default): rax 0x0, rcx 0x8, rdx 0x10, rbx 0x18,
+        rsp 0x20, rbp 0x28, rsi 0x30, rdi 0x38, r8 0x80, r9 0x88,
+        r10 0x90, r11 0x98, r12 0xa0, r13 0xa8, r14 0xb0, r15 0xb8.
+        Sub-registers share the parent offset (eax/ax/al 0x0, ah
+        0x1, ...), which is why hasOverlappingRegisters() is true.
+        32-bit uses the same base offsets with width 4 (the legacy
+        registers live in the same register space); the 32-bit
+        layout is NOT probe-verified, so 32-bit results are
+        best-effort until a 32-bit test binary exists. */
+    private class X86Isa implements IsaAdapter {
+        private final boolean is64;
+        private final int ptrSize;
+        private final int ptrShift;
+        private final long addrMask;
+        private final List<long[]> windows;
+        private final boolean windowsDefault;
+
+        X86Isa(boolean is64, List<long[]> windows,
+            boolean windowsDefault) {
+            this.is64 = is64;
+            this.ptrSize = is64 ? 8 : 4;
+            this.ptrShift = is64 ? 3 : 2;
+            this.addrMask = is64 ? -1L : 0xffffffffL;
+            this.windows = windows;
+            this.windowsDefault = windowsDefault;
+        }
+
+        public String name() { return "X86"; }
+        public String registerSpaceName() { return "register"; }
+
+        /** System V AMD64 volatile set (default for ELF). */
+        private long[] sysvClobber() {
+            return new long[] {0x0L, 0x8L, 0x10L, 0x30L, 0x38L,
+                0x80L, 0x88L, 0x90L, 0x98L};
+        }
+
+        /** Windows x64 volatile set (default for PE). */
+        private long[] windowsClobber() {
+            return new long[] {0x0L, 0x8L, 0x10L,
+                0x80L, 0x88L, 0x90L, 0x98L};
+        }
+
+        /** 32-bit volatile set. All 32-bit conventions share it:
+            they differ in stack cleanup, not register volatility. */
+        private long[] x86_32Clobber() {
+            return new long[] {0x0L, 0x8L, 0x10L};
+        }
+
+        public long[] callerSavedRegisterOffsets() {
+            if (!is64) return x86_32Clobber();
+            return windowsDefault ? windowsClobber() : sysvClobber();
+        }
+
+        /** Signature-driven clobbers (locked decision, v1). The
+            convention name comes from Ghidra's per-function
+            signature (see callConvMap in run()); null = unknown
+            callee (CALLIND, thunk, missing entry) -> the
+            conservative union, which for 64-bit IS the System V
+            set (SysV volatile superset of Windows volatile), so
+            the fallback is sound and simple. A name mentioning
+            "win" maps to the Windows set; any other known name
+            falls back to the binary default (PE -> Windows,
+            ELF -> System V, abi= overrides). Vector registers
+            (xmm) are out of scope for v1 and ignored, not
+            crashed on. */
+        public long[] clobberForConvention(String conv) {
+            if (!is64) return x86_32Clobber();
+            if (conv == null) return sysvClobber();
+            String c = conv.toLowerCase();
+            if (c.contains("win")) return windowsClobber();
+            return windowsDefault ? windowsClobber() : sysvClobber();
+        }
+
+        /** x86 has NO link register: CALL pushes the return
+            address on the stack (ram space) and RET pops it. The
+            -1 sentinel is never compared against a real register
+            offset; isReturnAddressRegister() is false for every
+            varnode, so the tail-call classification that uses it
+            simply does not apply to x86. */
+        public long returnAddressRegisterOffset() { return -1L; }
+        public boolean isReturnAddressRegister(Varnode v) {
+            return false;
+        }
+        public long stripInstructionTag(long addr) { return addr; }
+        public boolean isInstructionTagMask(long constValue) {
+            return false;
+        }
+        public int pointerSize() { return ptrSize; }
+        public int pointerIndexShift() { return ptrShift; }
+        public long readPointer(Memory mem, Address addr)
+            throws Exception {
+            if (ptrSize == 8) return mem.getLong(addr);
+            return mem.getInt(addr) & 0xffffffffL;
+        }
+        public String formatCodeAddress(long addr) {
+            return String.format("%08x", addr);
+        }
+        public boolean isMmioAddress(long addr) {
+            for (long[] w : windows) {
+                if (addr >= w[0] && addr < w[1]) return true;
+            }
+            return false;
+        }
+        public List<long[]> mmioWindows() { return windows; }
+        public int fallthroughIndex(List<OpRec> ops, int i) {
+            return i + 1 < ops.size() ? i + 1 : -1;
+        }
+        public int unwrapIndirectDef(List<OpRec> ops, int brIdx,
+            int cur) {
+            return cur;
+        }
+        public boolean hasOverlappingRegisters() { return true; }
+
+        /** Follow a COPY / INT_SEXT / INT_ZEXT chain to the
+            underlying LOAD def index, or -1. The x86 switch shape
+            puts an INT_SEXT between the ADD and the 4-byte LOAD
+            (MOVSXD), which the shared matchBranchTableFrom does
+            not handle (it requires the LOAD to be a direct ADD
+            input with size == pointerSize). */
+        private int unwrapLoadThroughExt(List<OpRec> ops, Varnode v,
+            int beforeIdx) {
+            int cur = findDef(ops, vkey(v), beforeIdx);
+            for (int hop = 0; hop < 8 && cur >= 0; hop++) {
+                OpRec d = ops.get(cur);
+                if (d.mnem.equals("LOAD") && d.ins.length >= 2) {
+                    return cur;
+                }
+                if ((d.mnem.equals("COPY") ||
+                    d.mnem.equals("INT_SEXT") ||
+                    d.mnem.equals("INT_ZEXT")) && d.ins.length == 1 &&
+                    !d.ins[0].isConstant()) {
+                    cur = findDef(ops, vkey(d.ins[0]), cur);
+                    continue;
+                }
+                return -1;
+            }
+            return -1;
+        }
+
+        /** x86-64 relative-offset jump-table recovery ONLY.
+            Shape (probe-verified, dispatch_switch): LEA base (Ghidra
+            folds RIP-relative LEA to a constant) + index*4 +
+            LOAD 4 bytes + INT_SEXT + INT_ADD(base, sext) +
+            BRANCHIND. Entries are 4-byte SIGNED offsets; target =
+            base + sext32(entry). Absolute pointer-table BRANCHINDs
+            (call_via_ptr: LOAD 8 bytes, no ADD) are DELIBERATELY
+            not claimed here: recoverIndirect already handles them
+            (function entries -> edges, same-function starts ->
+            successors), and claiming them here would LOSE the
+            led_on/led_off edges (jump-table application only adds
+            same-function instruction starts). 4-byte absolute
+            switch tables are a 32-bit idiom, out of v1. */
+        public Map<Integer, List<Integer>> recoverJumpTableTargets(
+            List<OpRec> ops, Memory mem) {
+            Map<Integer, List<Integer>> result =
+                new HashMap<Integer, List<Integer>>();
+            if (ops.isEmpty()) return result;
+            Map<String, Integer> firstAt = new HashMap<String, Integer>();
+            for (int i = 0; i < ops.size(); i++) {
+                String a = ops.get(i).instrAddr.toString();
+                if (!firstAt.containsKey(a)) firstAt.put(a, i);
+            }
+            for (int i = 0; i < ops.size(); i++) {
+                OpRec br = ops.get(i);
+                if (!br.mnem.equals("BRANCHIND") || br.ins.length < 1) {
+                    continue;
+                }
+                int cur = findDef(ops, vkey(br.ins[0]), i);
+                for (int hop = 0; hop < 8 && cur >= 0; hop++) {
+                    OpRec d = ops.get(cur);
+                    if (d.mnem.equals("COPY") && d.ins.length == 1 &&
+                        !d.ins[0].isConstant()) {
+                        cur = findDef(ops, vkey(d.ins[0]), cur);
+                        continue;
+                    }
+                    break;
+                }
+                if (cur < 0) continue;
+                OpRec d = ops.get(cur);
+                if (!d.mnem.equals("INT_ADD") || d.ins.length != 2) {
+                    continue;
+                }
+                Long base = null;
+                for (int s = 0; s < 2; s++) {
+                    int ldIdx = unwrapLoadThroughExt(ops, d.ins[s],
+                        cur);
+                    if (ldIdx < 0) continue;
+                    OpRec ld = ops.get(ldIdx);
+                    if (ld.out == null || ld.out.getSize() != 4) {
+                        continue;
+                    }
+                    Long b = matchAddr(ops, vkey(ld.ins[1]), ldIdx,
+                        0L, 8, addrMask, 4, 2);
+                    if (b == null) continue;
+                    Long side = constFold(ops, vkey(d.ins[1 - s]),
+                        cur, 16, addrMask);
+                    if (side != null &&
+                        side.longValue() == b.longValue()) {
+                        base = b;
+                        break;
+                    }
+                }
+                if (base == null) continue;
+                List<Integer> targets = new ArrayList<Integer>();
+                for (int k = 0; k < 64; k++) {
+                    long entryAddr = base.longValue() + 4L * k;
+                    int entry;
+                    try {
+                        entry = mem.getInt(toAddr(entryAddr));
+                    } catch (Exception e) {
+                        break;
+                    }
+                    long t = (base.longValue() + (long) entry) &
+                        addrMask;
                     Integer j = firstAt.get(formatCodeAddress(t));
                     if (j == null) break;
                     if (!targets.contains(j)) targets.add(j);
@@ -868,7 +1149,87 @@ public class ExtractIR extends GhidraScript {
             return Bits.exact(v.getOffset(), sizeMask(v.getSize()));
         }
         Bits b = bvals.get(vkey(v));
-        return b != null ? b : Bits.unknown();
+        if (b != null && (b.ones != 0 || b.zeroes != 0)) return b;
+        // Sub-register view of a wider known value (x86: reading
+        // EAX after RAX was written, or DX after RDX). Writes only
+        // create the written view, so the narrower view's exact key
+        // is often missing; slice the smallest containing register
+        // key. Sound: known bits of the wider value imply known
+        // bits of the slice. Restricted to the register space:
+        // ARM/RISC-V/MIPS never have overlapping register keys, so
+        // this is a no-op for them (no containing key exists), and
+        // unique-space temporaries are never sliced (their offsets
+        // are not views of one another).
+        if (v.getAddress() == null) return Bits.unknown();
+        String space = v.getAddress().getAddressSpace().getName();
+        if (!space.equals("register")) return Bits.unknown();
+        long off = v.getOffset();
+        int sz = v.getSize();
+        Bits best = null;
+        int bestSize = Integer.MAX_VALUE;
+        for (Map.Entry<String, Bits> e : bvals.entrySet()) {
+            String k = e.getKey();
+            if (!k.startsWith(space + ":")) continue;
+            String[] p = k.split(":");
+            if (p.length != 3) continue;
+            try {
+                long o = Long.parseLong(p[1]);
+                int s = Integer.parseInt(p[2]);
+                if (o <= off && off + sz <= o + s && s < bestSize) {
+                    int sh = (int) (off - o) * 8;
+                    long m = sizeMask(sz);
+                    Bits sl = new Bits((e.getValue().ones >>> sh) & m,
+                        (e.getValue().zeroes >>> sh) & m);
+                    best = sl;
+                    bestSize = s;
+                }
+            } catch (Exception ex) {
+                // Non-numeric key: not a register view, skip it.
+            }
+        }
+        return best != null ? best : Bits.unknown();
+    }
+
+    /** State keys in a register space whose [offset, offset+size)
+        range intersects [off, off+size), except keepKey. Used only
+        when the adapter has overlapping registers (x86): a write
+        to al must invalidate the eax/rax keys, and a CALL clobber
+        of rax must invalidate eax/ax/al/ah keys. Returns the keys
+        to drop; the caller removes them (so the same helper serves
+        must maps, may maps, and the taint key set). */
+    private static List<String> overlappingKeys(
+        java.util.Collection<String> keys, String space, long off,
+        int size, String keepKey) {
+        List<String> drop = new ArrayList<String>();
+        for (String k : keys) {
+            if (keepKey != null && k.equals(keepKey)) continue;
+            if (!k.startsWith(space + ":")) continue;
+            String[] p = k.split(":");
+            if (p.length != 3) continue;
+            try {
+                long o = Long.parseLong(p[1]);
+                int s = Integer.parseInt(p[2]);
+                if (o < off + size && off < o + s) drop.add(k);
+            } catch (Exception e) {
+                // Non-numeric key: not a register view, keep it.
+            }
+        }
+        return drop;
+    }
+
+    /** Port/MSR recording's sub-register resolver. resolveBits now
+        does exact-key + register-space slicing itself, so this
+        just delegates (kept as a named entry point so the
+        recording code reads as "sub-register aware"). */
+    private static Bits resolveBitsSlice(Varnode v,
+        Map<String, Bits> bvals) {
+        return resolveBits(v, bvals);
+    }
+
+    private static Long resolveExactSlice(Varnode v,
+        Map<String, Bits> bvals) {
+        Bits b = resolveBitsSlice(v, bvals);
+        return b.exactValue(sizeMask(v.getSize()));
     }
 
     private static Long resolveExact(Varnode v, Map<String, Bits> bvals) {
@@ -961,7 +1322,20 @@ public class ExtractIR extends GhidraScript {
         String mnem = op.mnem;
         Varnode[] ins = op.ins;
         Varnode out = op.out;
-        if (mnem.equals("COPY") && ins.length == 1) {
+        if ((mnem.equals("INT_XOR") || mnem.equals("INT_SUB")) &&
+            ins.length == 2 && out != null &&
+            vkey(ins[0]).equals(vkey(ins[1]))) {
+            // Zeroing idiom (x86 xor eax,eax / sub eax,eax; ARM
+            // eor rX,rX): x^x and x-x are 0 for EVERY x, even
+            // when x is unknown. The generic formulas treat the
+            // two inputs as independent values and lose this,
+            // which dropped real x86 MSR values (EDX zeroed via
+            // xor esi,esi, then moved to EDX, then shifted into
+            // the WRMSR value). Taint deliberately keeps the
+            // conservative behaviour here (keeping taint is sound).
+            putKnown(bvals, vkey(out),
+                Bits.exact(0, sizeMask(out.getSize())));
+        } else if (mnem.equals("COPY") && ins.length == 1) {
             if (out != null) {
                 putKnown(bvals, vkey(out), copyBits(ins[0], mem, bvals, isa));
             }
@@ -1095,14 +1469,22 @@ public class ExtractIR extends GhidraScript {
         } else if (mnem.equals("LOAD") && out != null) {
             putKnown(bvals, vkey(out), loadBits(ins, out, bvals, mem));
         } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
-            // Caller-saved registers are dead after the call (the set
-            // comes from the ISA adapter; ARM: AAPCS r0-r3, r12).
-            long[] clobber = isa.callerSavedRegisterOffsets();
+            // Caller-saved registers are dead after the call (the
+            // set comes from clobberForCall: the per-callee Ghidra
+            // signature for x86, the adapter's single set otherwise).
+            long[] clobber = clobberForCall(op);
             Set<String> drop = new HashSet<String>();
-            for (String k : bvals.keySet()) {
-                for (long off : clobber) {
-                    if (k.startsWith(isa.registerSpaceName() + ":" + off + ":")) {
-                        drop.add(k);
+            for (long off : clobber) {
+                if (isa.hasOverlappingRegisters()) {
+                    drop.addAll(overlappingKeys(bvals.keySet(),
+                        isa.registerSpaceName(), off,
+                        isa.pointerSize(), null));
+                } else {
+                    for (String k : bvals.keySet()) {
+                        if (k.startsWith(isa.registerSpaceName() +
+                            ":" + off + ":")) {
+                            drop.add(k);
+                        }
                     }
                 }
             }
@@ -1110,6 +1492,61 @@ public class ExtractIR extends GhidraScript {
             if (out != null) putKnown(bvals, vkey(out), Bits.unknown());
         } else {
             if (out != null) putKnown(bvals, vkey(out), Bits.unknown());
+        }
+        // Overlapping-register invalidation (x86 only; a no-op
+        // gate for ARM/RISC-V/MIPS). x86 register views are
+        // nested (al ⊂ ax ⊂ eax ⊂ rax, ah ⊂ ax ⊂ ...), so a
+        // write to view V has two cases: views that CONTAIN V
+        // hold partly-stale values -> delete them (a stale wider
+        // value surviving a sub-register write, e.g. SETZ AL
+        // leaving a stale EAX, would corrupt must-analysis);
+        // views CONTAINED in V are fully determined by V's new
+        // value -> slice it into them (deleting them would break
+        // real chains: WRMSR reads EDX after a ZEXT wrote RDX).
+        // If V's new value is unknown, contained views are
+        // dropped too (unknown sliced is unknown). The
+        // may-transfer keeps the simpler delete-all (sound there:
+        // a missing may key means TOP).
+        if (isa.hasOverlappingRegisters() && out != null &&
+            out.getAddress() != null &&
+            isa.registerSpaceName().equals(out.getAddress().
+                getAddressSpace().getName())) {
+            String outKey = vkey(out);
+            Bits outBits = bvals.get(outKey);
+            long outOff = out.getOffset();
+            int outSize = out.getSize();
+            List<String> drop = new ArrayList<String>();
+            Map<String, Bits> derive = new HashMap<String, Bits>();
+            for (String k : bvals.keySet()) {
+                if (k.equals(outKey)) continue;
+                if (!k.startsWith(isa.registerSpaceName() + ":")) {
+                    continue;
+                }
+                String[] p = k.split(":");
+                if (p.length != 3) continue;
+                try {
+                    long o = Long.parseLong(p[1]);
+                    int s = Integer.parseInt(p[2]);
+                    if (o < outOff + outSize && outOff < o + s) {
+                        if (outBits != null && o >= outOff &&
+                            o + s <= outOff + outSize) {
+                            int sh = (int) (o - outOff) * 8;
+                            long m = sizeMask(s);
+                            derive.put(k, new Bits(
+                                (outBits.ones >>> sh) & m,
+                                (outBits.zeroes >>> sh) & m));
+                        } else {
+                            drop.add(k);
+                        }
+                    }
+                } catch (Exception e) {
+                    // Non-numeric key: not a register view.
+                }
+            }
+            for (String k : drop) bvals.remove(k);
+            for (Map.Entry<String, Bits> e : derive.entrySet()) {
+                bvals.put(e.getKey(), e.getValue());
+            }
         }
     }
 
@@ -1190,6 +1627,25 @@ public class ExtractIR extends GhidraScript {
                         j = firstAt.get(isa.formatCodeAddress(isa.stripInstructionTag(t)));
                     }
                     if (j != null) succ.get(i).add(j);
+                    else if (mnem.equals("BRANCH") &&
+                        op.ins[0].isConstant()) {
+                        // Intra-instruction sleigh label (x86 CPUID
+                        // cascade): the BRANCH target is a P-Code
+                        // label constant, not a code address, so no
+                        // firstAt entry exists. The instruction
+                        // completes and execution continues at the
+                        // next op; without this, an unresolvable
+                        // BRANCH kills the whole rest of the
+                        // function (276 ops lost in PciHostBridgeDxe,
+                        // including its RDMSR). CBRANCH already
+                        // falls through below, so only plain BRANCH
+                        // needs this. ARM/RISC-V/MIPS never emit
+                        // constant-target BRANCHes, so this is a
+                        // no-op for them. KEEP IN SYNC between
+                        // runFixpoint and buildSucc.
+                        int f = isa.fallthroughIndex(ops, i);
+                        if (f >= 0) succ.get(i).add(f);
+                    }
                 }
                 if (mnem.equals("CBRANCH")) {
                     // Fallthrough is the NEXT OP, not the next instruction:
@@ -1394,7 +1850,16 @@ public class ExtractIR extends GhidraScript {
         String mnem = op.mnem;
         Varnode[] ins = op.ins;
         Varnode out = op.out;
-        if (mnem.equals("COPY") && ins.length == 1) {
+        if ((mnem.equals("INT_XOR") || mnem.equals("INT_SUB")) &&
+            ins.length == 2 && out != null &&
+            vkey(ins[0]).equals(vkey(ins[1]))) {
+            // Zeroing idiom, as in applyTransfer: the result is
+            // exactly 0 with empty (unconditional) provenance.
+            Map<Long, Set<Integer>> r =
+                new HashMap<Long, Set<Integer>>();
+            r.put(0L, new HashSet<Integer>());
+            mayPut(m, vkey(out), r);
+        } else if (mnem.equals("COPY") && ins.length == 1) {
             if (out != null) {
                 mayPut(m, vkey(out), mayCopyBits(ins[0], m, mem, curOp, isa));
             }
@@ -1548,17 +2013,39 @@ public class ExtractIR extends GhidraScript {
             }
             mayPut(m, vkey(out), r);
         } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
-            long[] clobber = isa.callerSavedRegisterOffsets();
+            long[] clobber = clobberForCall(op);
             Set<String> drop = new HashSet<String>();
-            for (String k : m.keySet()) {
-                for (long off : clobber) {
-                    if (k.startsWith(isa.registerSpaceName() + ":" + off + ":")) drop.add(k);
+            for (long off : clobber) {
+                if (isa.hasOverlappingRegisters()) {
+                    drop.addAll(overlappingKeys(m.keySet(),
+                        isa.registerSpaceName(), off,
+                        isa.pointerSize(), null));
+                } else {
+                    for (String k : m.keySet()) {
+                        if (k.startsWith(isa.registerSpaceName() +
+                            ":" + off + ":")) {
+                            drop.add(k);
+                        }
+                    }
                 }
             }
             for (String k : drop) m.remove(k);
             if (out != null) mayPut(m, vkey(out), null);
         } else {
             if (out != null) mayPut(m, vkey(out), null);
+        }
+        // Overlapping-register invalidation, as in applyTransfer
+        // (x86 only). Stale may values are sound (a superset) but
+        // would cause false may entries, so invalidate them too.
+        if (isa.hasOverlappingRegisters() && out != null &&
+            out.getAddress() != null &&
+            isa.registerSpaceName().equals(out.getAddress().
+                getAddressSpace().getName())) {
+            for (String k : overlappingKeys(m.keySet(),
+                isa.registerSpaceName(), out.getOffset(),
+                out.getSize(), vkey(out))) {
+                m.remove(k);
+            }
         }
     }
 
@@ -1643,6 +2130,13 @@ public class ExtractIR extends GhidraScript {
                         j = firstAt.get(isa.formatCodeAddress(isa.stripInstructionTag(t)));
                     }
                     if (j != null) succ.get(i).add(j);
+                    else if (mnem.equals("BRANCH") &&
+                        op.ins[0].isConstant()) {
+                        // Intra-instruction sleigh label (x86 CPUID
+                        // cascade): see runFixpoint. KEEP IN SYNC.
+                        int f = isa.fallthroughIndex(ops, i);
+                        if (f >= 0) succ.get(i).add(f);
+                    }
                 }
                 if (mnem.equals("CBRANCH")) {
                     // Fallthrough goes through the ISA adapter (see
@@ -1806,12 +2300,27 @@ public class ExtractIR extends GhidraScript {
                     if (anyIn) nt.add(vkey(oj.out));
                 }
             } else if (mn.equals("CALL") || mn.equals("CALLIND")) {
-                long[] clobber = isa.callerSavedRegisterOffsets();
+                // A call destroys the WHOLE clobbered register, so
+                // all views go (x86: clobbering rax kills eax/ax/
+                // al/ah taint too). This is the only overlap
+                // invalidation taint gets: a partial write does NOT
+                // kill taint on the wider register (the other bytes
+                // still carry the old value), and taint removal is
+                // a "proven dead" claim, so keeping it is the sound
+                // direction there.
+                long[] clobber = clobberForCall(oj);
                 java.util.Set<String> drop = new java.util.HashSet<String>();
-                for (String k : nt) {
-                    for (long off : clobber) {
-                        if (k.startsWith(isa.registerSpaceName() + ":" + off + ":")) {
-                            drop.add(k);
+                for (long off : clobber) {
+                    if (isa.hasOverlappingRegisters()) {
+                        drop.addAll(overlappingKeys(nt,
+                            isa.registerSpaceName(), off,
+                            isa.pointerSize(), null));
+                    } else {
+                        for (String k : nt) {
+                            if (k.startsWith(isa.registerSpaceName() +
+                                ":" + off + ":")) {
+                                drop.add(k);
+                            }
                         }
                     }
                 }
@@ -2986,6 +3495,26 @@ public class ExtractIR extends GhidraScript {
         return w;
     }
 
+    /** Default x86 platform bands (see X86Isa.isMmioAddress).
+        x86 has no fixed peripheral window: PCI BAR space is
+        platform-discovered (ACPI), so these bands cover only the
+        architecturally fixed regions. BAR-discovered MMIO is NOT
+        covered in v1: addresses there fail the generic window
+        check until a profile-derived band or an mmio= override
+        supplies them (OVMF drivers will hit this; that is an
+        expected, documented limitation, not an extraction defect).
+        The SVD-profile classifier remains the authority on
+        known-vs-suspect. */
+    private static List<long[]> defaultX86MmioWindows() {
+        List<long[]> w = new ArrayList<long[]>();
+        w.add(new long[] {0xA0000L, 0xC0000L}); // VGA
+        w.add(new long[] {0xC0000L, 0x100000L}); // BIOS/option ROM
+        w.add(new long[] {0xFEC00000L, 0xFED00000L}); // IOAPIC
+        w.add(new long[] {0xFED00000L, 0xFEE00000L}); // HPET
+        w.add(new long[] {0xFEE00000L, 0xFEF00000L}); // LAPIC
+        return w;
+    }
+
     /** Parse "start-end,start-end,..." (hex, optional 0x) into
         windows. Null on any parse failure. */
     private static List<long[]> parseMmioWindows(String spec) {
@@ -3072,6 +3601,95 @@ public class ExtractIR extends GhidraScript {
             isa = new MipsIsa(is64, windows);
             println("[*] ISA adapter: MIPS (" + (is64 ? "MIPS64" : "MIPS32") +
                 ")");
+        } else if ("x86".equals(proc)) {
+            boolean is64 = false;
+            boolean is16 = false;
+            try {
+                String langId = currentProgram.getLanguage()
+                    .getLanguageID().getIdAsString();
+                String[] parts = langId.split(":");
+                is64 = parts.length >= 3 && "64".equals(parts[2]);
+                is16 = parts.length >= 3 && "16".equals(parts[2]);
+            } catch (Exception e) {
+                // Fall through to x86-32.
+            }
+            if (is16) {
+                println("[!] x86-16 real mode is NOT implemented " +
+                    "in v1: analysis proceeds with the 32-bit " +
+                    "adapter as a best effort and results are " +
+                    "NOT reliable (segmented addressing is " +
+                    "unmodelled).");
+            }
+            // Binary default convention: PE -> Windows, ELF ->
+            // System V. The format string is the loader's name
+            // (e.g. "Portable Executable (PE)" for PE, "ELF"
+            // for ELF, which contains no "PE" substring).
+            boolean windowsDefault = false;
+            try {
+                String fmt = currentProgram.getExecutableFormat();
+                if (fmt != null &&
+                    fmt.toUpperCase().contains("PE")) {
+                    windowsDefault = true;
+                }
+            } catch (Exception e) {
+                // Fall through to System V.
+            }
+            List<long[]> windows = defaultX86MmioWindows();
+            for (String a : getScriptArgs()) {
+                if (a.startsWith("mmio=")) {
+                    List<long[]> parsed = parseMmioWindows(
+                        a.substring(5));
+                    if (parsed != null && !parsed.isEmpty()) {
+                        windows = parsed;
+                    } else {
+                        println("[!] Bad mmio= window spec, using " +
+                            "x86 defaults.");
+                    }
+                } else if (a.startsWith("abi=")) {
+                    String v = a.substring(4).trim();
+                    if (v.equalsIgnoreCase("windows")) {
+                        windowsDefault = true;
+                    } else if (v.equalsIgnoreCase("sysv") ||
+                        v.equalsIgnoreCase("systemv")) {
+                        windowsDefault = false;
+                    } else {
+                        println("[!] Bad abi= value (want windows " +
+                            "or sysv), using binary default.");
+                    }
+                }
+            }
+            isa = new X86Isa(is64, windows, windowsDefault);
+            println("[*] ISA adapter: X86 (" + (is64 ? "X86-64" :
+                (is16 ? "X86-16 (best effort)" : "X86-32")) + ")");
+        }
+        // Per-callee calling conventions for signature-driven
+        // clobbers (x86 v1). Built from Ghidra's per-function
+        // signature; a function with no recovered convention
+        // simply has no entry (unknown callee -> union fallback).
+        // For single-convention adapters the map is inert
+        // (clobberForConvention ignores the name), so building it
+        // unconditionally costs one cheap function iteration.
+        try {
+            FunctionIterator convFns =
+                currentProgram.getFunctionManager().getFunctions(true);
+            while (convFns.hasNext() && !monitor.isCancelled()) {
+                Function gf = convFns.next();
+                try {
+                    Address ep = gf.getEntryPoint();
+                    if (ep == null || ep.getAddressSpace() == null ||
+                        !"ram".equals(ep.getAddressSpace().getName())) {
+                        continue;
+                    }
+                    String cn = gf.getCallingConventionName();
+                    if (cn != null) {
+                        callConvMap.put(ep.getOffset(), cn);
+                    }
+                } catch (Exception e) {
+                    // Skip this function; unknown-callee fallback.
+                }
+            }
+        } catch (Exception e) {
+            // Map stays partial/empty; fallbacks cover it.
         }
         PrintWriter w = new PrintWriter(new FileWriter(outputJson));
 
@@ -3079,7 +3697,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.7-mayfp\",");
+        w.println("  \"extractor_version\": \"v3.8\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -3105,6 +3723,8 @@ public class ExtractIR extends GhidraScript {
         int fnCount = 0;
         int totalMmio = 0;
         int totalMay = 0;
+        int totalPortIo = 0;
+        int totalMsr = 0;
         int totalIndirect = 0;
         int totalIndSucc = 0;
         int totalMayCallSites = 0;
@@ -3262,6 +3882,8 @@ public class ExtractIR extends GhidraScript {
             boolean firstOp = true;
             List<String> mmio = new ArrayList<String>();
             List<String> may = new ArrayList<String>();
+            List<String> portIo = new ArrayList<String>();
+            List<String> msr = new ArrayList<String>();
             Memory mem = currentProgram.getMemory();
             // Successors for the recording-time feasibility filter.
             List<List<Integer>> maySucc = buildSucc(ops, branchTargets);
@@ -3279,6 +3901,10 @@ public class ExtractIR extends GhidraScript {
                 w.print("], \"output\": " + varnodeJson(op.out) + "}");
 
                 // ---- MMIO recording from the FINAL fixpoint state ----
+                // Masks and exact values print UNSIGNED (v3.8): a
+                // 64-bit mask/value with the high bit set prints
+                // negative as a Java long, which Lean's Nat parser
+                // rejects. 32-bit values print identically either way.
                 boolean mustRecorded = false;
                 if (op.mnem.equals("LOAD") || op.mnem.equals("STORE")) {
                     Map<String, Bits> bvals = fx.inStates[i];
@@ -3301,9 +3927,9 @@ public class ExtractIR extends GhidraScript {
                                 "\", \"address\": \"0x" + Long.toHexString(addr) +
                                 "\", \"size\": " + sz +
                                 ", \"value\": " +
-                                (exact == null ? "null" : exact.toString()) +
-                                ", \"value_known_ones\": " + valBits.ones +
-                                ", \"value_known_zeroes\": " + valBits.zeroes + "}");
+                                (exact == null ? "null" : Long.toUnsignedString(exact)) +
+                                ", \"value_known_ones\": " + Long.toUnsignedString(valBits.ones) +
+                                ", \"value_known_zeroes\": " + Long.toUnsignedString(valBits.zeroes) + "}");
                             mustRecorded = true;
                         }
                     }
@@ -3376,9 +4002,112 @@ public class ExtractIR extends GhidraScript {
                                 "\", \"addresses\": [" + ab.toString() +
                                 "], \"size\": " + sz +
                                 ", \"value\": " +
-                                (exact == null ? "null" : exact.toString()) +
-                                ", \"value_known_ones\": " + valBits.ones +
-                                ", \"value_known_zeroes\": " + valBits.zeroes + "}");
+                                (exact == null ? "null" : Long.toUnsignedString(exact)) +
+                                ", \"value_known_ones\": " + Long.toUnsignedString(valBits.ones) +
+                                ", \"value_known_zeroes\": " + Long.toUnsignedString(valBits.zeroes) + "}");
+                        }
+                    }
+                }
+                // ---- Port I/O + MSR recording (x86 CALLOTHER) ----
+                // Ghidra lifts IN/OUT/RDMSR/WRMSR to CALLOTHER
+                // userops; the instruction mnemonic (op.instrAsm)
+                // is the signal, NOT the userop index (a Ghidra
+                // internal). Port/MSR spaces are disjoint from
+                // memory, so they get their own JSON classes (v3.8
+                // shape change) instead of polluting mmio_accesses.
+                // Port numbers are masked to the 16-bit port space.
+                // IN/RDMSR values are hardware inputs -> null.
+                // PCI config ports 0xCF8/0xCFC fall out raw here;
+                // BDF decoding is v2.
+                if (op.mnem.equals("CALLOTHER") &&
+                    op.ins.length >= 1) {
+                    Map<String, Bits> bvals = fx.inStates[i];
+                    if (bvals != null) {
+                        String am = op.instrAsm;
+                        if (am.equalsIgnoreCase("OUT") &&
+                            op.ins.length >= 3) {
+                            Long port = resolveExactSlice(op.ins[1],
+                                bvals);
+                            if (port != null) {
+                                Bits vb = resolveBitsSlice(op.ins[2],
+                                    bvals);
+                                int sz = op.ins[2].getSize();
+                                Long exact = vb.exactValue(
+                                    sizeMask(sz));
+                                portIo.add("{\"instr\": \"" +
+                                    op.instrAddr + "\", \"op\": \"OUT\"" +
+                                    ", \"direction\": \"OUT\"" +
+                                    ", \"port\": \"0x" +
+                                    Long.toHexString(port & 0xFFFFL) +
+                                    "\", \"size\": " + sz +
+                                    ", \"value\": " +
+                                    (exact == null ? "null" :
+                                        Long.toUnsignedString(exact)) +
+                                    ", \"value_known_ones\": " +
+                                    Long.toUnsignedString(vb.ones) +
+                                    ", \"value_known_zeroes\": " +
+                                    Long.toUnsignedString(vb.zeroes) + "}");
+                            }
+                        } else if (am.equalsIgnoreCase("IN") &&
+                            op.ins.length >= 2) {
+                            Long port = resolveExactSlice(op.ins[1],
+                                bvals);
+                            if (port != null) {
+                                int sz = op.out != null ?
+                                    op.out.getSize() : 0;
+                                portIo.add("{\"instr\": \"" +
+                                    op.instrAddr + "\", \"op\": \"IN\"" +
+                                    ", \"direction\": \"IN\"" +
+                                    ", \"port\": \"0x" +
+                                    Long.toHexString(port & 0xFFFFL) +
+                                    "\", \"size\": " + sz +
+                                    ", \"value\": null" +
+                                    ", \"value_known_ones\": 0" +
+                                    ", \"value_known_zeroes\": 0}");
+                            }
+                        } else if (am.equalsIgnoreCase("WRMSR") &&
+                            op.ins.length >= 3) {
+                            Long idx = resolveExactSlice(op.ins[1],
+                                bvals);
+                            if (idx != null) {
+                                // Combined 64-bit value (EDX:EAX):
+                                // an intra-instruction unique, so
+                                // exact-key lookup resolves it.
+                                Bits vb = resolveBits(op.ins[2],
+                                    bvals);
+                                Long exact = vb.exactValue(
+                                    sizeMask(8));
+                                msr.add("{\"instr\": \"" +
+                                    op.instrAddr +
+                                    "\", \"op\": \"WRMSR\"" +
+                                    ", \"direction\": \"WR\"" +
+                                    ", \"index\": \"0x" +
+                                    Long.toHexString(idx) +
+                                    "\", \"size\": 8" +
+                                    ", \"value\": " +
+                                    (exact == null ? "null" :
+                                        Long.toUnsignedString(exact)) +
+                                    ", \"value_known_ones\": " +
+                                    Long.toUnsignedString(vb.ones) +
+                                    ", \"value_known_zeroes\": " +
+                                    Long.toUnsignedString(vb.zeroes) + "}");
+                            }
+                        } else if (am.equalsIgnoreCase("RDMSR") &&
+                            op.ins.length >= 2) {
+                            Long idx = resolveExactSlice(op.ins[1],
+                                bvals);
+                            if (idx != null) {
+                                msr.add("{\"instr\": \"" +
+                                    op.instrAddr +
+                                    "\", \"op\": \"RDMSR\"" +
+                                    ", \"direction\": \"RD\"" +
+                                    ", \"index\": \"0x" +
+                                    Long.toHexString(idx) +
+                                    "\", \"size\": 8" +
+                                    ", \"value\": null" +
+                                    ", \"value_known_ones\": 0" +
+                                    ", \"value_known_zeroes\": 0}");
+                            }
                         }
                     }
                 }
@@ -3404,6 +4133,22 @@ public class ExtractIR extends GhidraScript {
             w.println();
             w.println("      ],");
             w.println("      \"may_access_count\": " + may.size() + ",");
+            w.println("      \"port_io_accesses\": [");
+            for (int i = 0; i < portIo.size(); i++) {
+                if (i > 0) w.println(",");
+                w.print("        " + portIo.get(i));
+            }
+            w.println();
+            w.println("      ],");
+            w.println("      \"port_io_access_count\": " + portIo.size() + ",");
+            w.println("      \"msr_accesses\": [");
+            for (int i = 0; i < msr.size(); i++) {
+                if (i > 0) w.println(",");
+                w.print("        " + msr.get(i));
+            }
+            w.println();
+            w.println("      ],");
+            w.println("      \"msr_access_count\": " + msr.size() + ",");
             w.println("      \"may_fixpoint_converged\": " + my.converged + ",");
             w.println("      \"indirect_calls\": [");
             for (int i = 0; i < ind.sites.size(); i++) {
@@ -3473,6 +4218,8 @@ public class ExtractIR extends GhidraScript {
             totalUnresolvedTail += tc.unresolved;
             totalMmio += mmio.size();
             totalMay += may.size();
+            totalPortIo += portIo.size();
+            totalMsr += msr.size();
             w.print("    }");
         }
 
@@ -3560,6 +4307,8 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"function_count\": " + fnCount + ",");
         w.println("  \"mmio_access_total\": " + totalMmio + ",");
         w.println("  \"may_access_total\": " + totalMay + ",");
+        w.println("  \"port_io_access_total\": " + totalPortIo + ",");
+        w.println("  \"msr_access_total\": " + totalMsr + ",");
         w.println("  \"indirect_call_edges_total\": " + totalIndirect + ",");
         w.println("  \"indirect_successor_total\": " + totalIndSucc + ",");
         w.println("  \"may_call_site_total\": " + totalMayCallSites + ",");
