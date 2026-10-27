@@ -286,6 +286,21 @@ public class ExtractIR extends GhidraScript {
     // MIPS programs a MipsIsa, x86 programs an X86Isa.
     private IsaAdapter isa = new ArmIsa();
 
+    /** Memory-propagation stack registers (set in run() before any
+        fixpoint runs; -1 = that leg disabled). The stack pointer
+        (RSP/SP) is never a general register on any supported ISA;
+        the frame pointer leg is enabled only for unambiguous names
+        (RBP/FP) -- R11/S0 double as general registers, so they are
+        deliberately NOT used as frame pointers here. A store whose
+        address def-chain reaches SP/FP is a stack store and can
+        never alias a global (same assumption as Prov's rbpSlotOf:
+        RBP is the frame pointer, stable after the prologue). */
+    private long memSpOff = -1L;
+    private long memFpOff = -1L;
+    /** Program endianness (for memState byte slicing on loads
+        whose size differs from the stored size). */
+    private boolean memBigEndian = false;
+
     /** Per-callee Ghidra calling-convention names, keyed by
         function entry-point offset (ram space only). Built in
         run() before the function loop. A missing entry means
@@ -1314,6 +1329,16 @@ public class ExtractIR extends GhidraScript {
         if (ins.length < 2 || out == null) return Bits.unknown();
         Long addr = resolveExact(ins[1], bvals);
         if (addr == null) return Bits.unknown();
+        // Memory propagation: a memState entry covering the load
+        // range wins over image bytes (the entry proves a
+        // dominating store wrote this range on every path, so the
+        // image bytes are stale there). No covering entry ->
+        // exactly today's behaviour (image bytes). MMIO loads
+        // never consult memState (hardware state, not a value).
+        if (!isa.isMmioAddress(addr.longValue())) {
+            Bits m = memLookup(bvals, addr.longValue(), out.getSize());
+            if (m != null) return m;
+        }
         try {
             Address a = toAddr(addr.longValue());
             int sz = out.getSize();
@@ -1338,6 +1363,10 @@ public class ExtractIR extends GhidraScript {
         final String mnem;
         final Varnode[] ins;
         final Varnode out;
+        /** Memory-propagation: true when a LOAD/STORE address is
+            provably stack-derived (def-chain to SP/FP), computed
+            once in buildOps. Stack stores can never alias globals. */
+        boolean addrIsStack = false;
         OpRec(Address a, String asm, String mnem, Varnode[] ins, Varnode out) {
             this.instrAddr = a;
             this.instrAsm = asm;
@@ -1388,7 +1417,49 @@ public class ExtractIR extends GhidraScript {
                 Bits.exact(0, sizeMask(out.getSize())));
         } else if (mnem.equals("COPY") && ins.length == 1) {
             if (out != null) {
-                putKnown(bvals, vkey(out), copyBits(ins[0], mem, bvals, isa));
+                if (isRamSpace(out)) {
+                    // COPY-to-ram: Ghidra's x86-64 form of an
+                    // absolute store (RIP-relative globals and
+                    // absolute MMIO addresses do NOT become STORE
+                    // ops on x86-64; they become COPY ops with a
+                    // ram destination). Without this branch the
+                    // globals slice would be vacuous on x86-64
+                    // -- including OVMF, whose globals are all
+                    // RIP-relative. Same store rule as STORE:
+                    // MMIO never enters memState; overlapping
+                    // cells drop; the cell is set only when the
+                    // value has known bits. Deliberately NOT
+                    // putKnown into bvals: a ram key there would
+                    // survive CALLs (the CALL branch drops only
+                    // registers + mem: keys), a latent staleness
+                    // hole that must not be left live. Any stale
+                    // ram key from an earlier path is purged.
+                    bvals.remove(vkey(out));
+                    long a = out.getOffset();
+                    if (!isa.isMmioAddress(a)) {
+                        dropMemRange(bvals, a, out.getSize(), true);
+                        Bits vb = resolveBits(ins[0], bvals);
+                        if (vb.ones != 0 || vb.zeroes != 0) {
+                            bvals.put(memKey(a, out.getSize()), vb);
+                        }
+                    }
+                } else if (isRamSpace(ins[0]) &&
+                    !isa.isMmioAddress(ins[0].getOffset())) {
+                    // COPY-from-ram: a global load. memState
+                    // wins when it covers the range (a dominating
+                    // store wrote it on every path); otherwise
+                    // exactly today's behaviour (image bytes via
+                    // copyBits). MMIO loads keep today's behaviour
+                    // unconditionally (hardware, not a stored
+                    // value).
+                    Bits m = memLookup(bvals, ins[0].getOffset(),
+                        ins[0].getSize());
+                    putKnown(bvals, vkey(out), m != null ? m :
+                        copyBits(ins[0], mem, bvals, isa));
+                } else {
+                    putKnown(bvals, vkey(out),
+                        copyBits(ins[0], mem, bvals, isa));
+                }
             }
         } else if (mnem.equals("INT_AND") || mnem.equals("INT_OR") ||
             mnem.equals("INT_XOR")) {
@@ -1519,6 +1590,34 @@ public class ExtractIR extends GhidraScript {
             }
         } else if (mnem.equals("LOAD") && out != null) {
             putKnown(bvals, vkey(out), loadBits(ins, out, bvals, mem));
+        } else if (mnem.equals("STORE") && ins.length >= 3) {
+            // Memory propagation, stage 1 (intra-procedural):
+            // a store to a known non-MMIO address records the
+            // value in memState ("mem:" keys in this same map, so
+            // the must-meet's agree-or-drop discipline applies to
+            // cells exactly as it does to registers: a cell
+            // survives a join only when every incoming path agrees
+            // on it). A store to an unknown non-stack address
+            // clears all of memState (it may alias any global).
+            // Stack stores are ignored entirely: they can never
+            // alias a global (proven-stack via def-chain to SP/FP).
+            // MMIO stores are hardware state, never memState: a
+            // later load from the same MMIO address does NOT
+            // return the stored value.
+            if (!op.addrIsStack) {
+                Long addr = resolveExact(ins[1], bvals);
+                if (addr != null &&
+                    !isa.isMmioAddress(addr.longValue())) {
+                    int sz = ins[2].getSize();
+                    dropMemRange(bvals, addr.longValue(), sz, true);
+                    Bits vb = resolveBits(ins[2], bvals);
+                    if (vb.ones != 0 || vb.zeroes != 0) {
+                        bvals.put(memKey(addr.longValue(), sz), vb);
+                    }
+                } else if (addr == null) {
+                    dropAllMem(bvals);
+                }
+            }
         } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
             // Caller-saved registers are dead after the call (the
             // set comes from clobberForCall: the per-callee Ghidra
@@ -1540,6 +1639,12 @@ public class ExtractIR extends GhidraScript {
                 }
             }
             for (String k : drop) bvals.remove(k);
+            // A callee may store to any global: intra-procedural
+            // memState dies at the call. Seeded globals ("gmem:"
+            // keys, Phase M) survive: the seed rule guarantees
+            // every store program-wide agrees on their value, so
+            // no callee can change one to a different value.
+            dropAllMem(bvals);
             if (out != null) putKnown(bvals, vkey(out), Bits.unknown());
         } else {
             if (out != null) putKnown(bvals, vkey(out), Bits.unknown());
@@ -2915,6 +3020,19 @@ public class ExtractIR extends GhidraScript {
             }
         } catch (Exception e) {
             // keep JSON valid even if P-Code walk fails for a function
+        }
+        // Memory-propagation: annotate stack-derived LOAD/STORE
+        // addresses once here -- def-chain walks are too expensive
+        // to repeat per fixpoint round, and the annotation is a
+        // static property of the op (it never changes across
+        // rounds). If the SP/FP legs were not resolved, every flag
+        // stays false (sound: unknown stores clear memState).
+        for (int i = 0; i < ops.size(); i++) {
+            OpRec op = ops.get(i);
+            if ((op.mnem.equals("LOAD") || op.mnem.equals("STORE")) &&
+                op.ins.length >= 2) {
+                op.addrIsStack = isStackAddr(ops, op.ins[1], i);
+            }
         }
         return new OpsResult(ops, truncated);
     }
@@ -5384,6 +5502,369 @@ public class ExtractIR extends GhidraScript {
         return new FixResult(empty, false);
     }
 
+    // ---------------- memory/global propagation helpers ----------------
+
+    /** True when the varnode lives in the ram address space
+        (absolute memory: globals on x86-64, where Ghidra models
+        RIP-relative access as COPY-to/from-ram rather than
+        LOAD/STORE). */
+    private static boolean isRamSpace(Varnode v) {
+        return v != null && v.getAddress() != null &&
+            "ram".equals(v.getAddress().getAddressSpace().getName());
+    }
+
+    private static String memKey(long addr, int size) {
+        return "mem:" + addr + ":" + size;
+    }
+
+    private static String gmemKey(long addr, int size) {
+        return "gmem:" + addr + ":" + size;
+    }
+
+    /** Parse a mem:/gmem: key into {addr, size}; null when malformed. */
+    private static long[] parseMemKey(String k) {
+        if (k == null) return null;
+        if (!k.startsWith("mem:") && !k.startsWith("gmem:")) return null;
+        String[] p = k.split(":");
+        if (p.length != 3) return null;
+        try {
+            return new long[] { Long.parseLong(p[1]), Long.parseLong(p[2]) };
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Drop memState entries overlapping [addr, addr+size).
+        includeGmem also drops seeded globals (an intra-procedural
+        store overlapping a seed wins over the seed on
+        contradiction); calls and unknown stores drop "mem:" only. */
+    private static void dropMemRange(Map<String, Bits> m, long addr,
+        int size, boolean includeGmem) {
+        long end = addr + size;
+        List<String> drop = new ArrayList<String>();
+        for (String k : m.keySet()) {
+            if (!k.startsWith("mem:") &&
+                !(includeGmem && k.startsWith("gmem:"))) continue;
+            long[] as = parseMemKey(k);
+            if (as == null) continue;
+            if (as[0] < end && addr < as[0] + as[1]) drop.add(k);
+        }
+        for (String k : drop) m.remove(k);
+    }
+
+    /** Drop intra-procedural memState only (never seeded globals). */
+    private static void dropAllMem(Map<String, Bits> m) {
+        List<String> drop = new ArrayList<String>();
+        for (String k : m.keySet()) {
+            if (k.startsWith("mem:")) drop.add(k);
+        }
+        for (String k : drop) m.remove(k);
+    }
+
+    /** Covering memState lookup for a load of [addr, addr+size).
+        "mem:" entries win over "gmem:" entries; within one prefix,
+        entries never overlap (store rule + meet discipline), so
+        combination is unambiguous. Returns null unless the union
+        of entries covers the whole range. Values wider than 8
+        bytes are unrepresentable in Bits and never enter memState,
+        so larger loads fall back to image bytes, as before. */
+    private Bits memLookup(Map<String, Bits> m, long addr, int size) {
+        Bits r = memLookupPrefix(m, addr, size, "mem:");
+        if (r != null) return r;
+        return memLookupPrefix(m, addr, size, "gmem:");
+    }
+
+    private Bits memLookupPrefix(Map<String, Bits> m, long addr,
+        int size, String pfx) {
+        if (size <= 0 || size > 8) return null;
+        long end = addr + size;
+        long cov = 0;
+        long ones = 0, zeroes = 0;
+        for (Map.Entry<String, Bits> e : m.entrySet()) {
+            String k = e.getKey();
+            if (!k.startsWith(pfx)) continue;
+            long[] as = parseMemKey(k);
+            if (as == null) continue;
+            long b = as[0], t = as[1];
+            if (t <= 0 || t > 8) continue;
+            long is = Math.max(addr, b), ie = Math.min(end, b + t);
+            if (is >= ie) continue;
+            Bits eb = e.getValue();
+            for (long p = is; p < ie; p++) {
+                long ej = p - b;
+                long lb = p - addr;
+                long srcShift = memBigEndian ? (t - 1 - ej) * 8 : ej * 8;
+                long dstShift = memBigEndian ? (size - 1 - lb) * 8 : lb * 8;
+                ones |= ((eb.ones >>> srcShift) & 0xffL) << dstShift;
+                zeroes |= ((eb.zeroes >>> srcShift) & 0xffL) << dstShift;
+                cov |= (1L << lb);
+            }
+        }
+        if (cov != ((1L << size) - 1)) return null;
+        return new Bits(ones, zeroes);
+    }
+
+    /** True when a LOAD/STORE address varnode is provably
+        stack-derived: its def chain (COPY / INT_ADD / INT_SUB,
+        bounded hops) reaches the stack-pointer or frame-pointer
+        register. A register that is neither is followed through
+        its def (it may be COPY(SP)); a constant, a memory cell,
+        or a non-arithmetic def ends the walk as not-stack. The
+        frame-pointer leg uses the same assumption as Prov's
+        rbpSlotOf (RBP is the frame pointer, stable after the
+        prologue); only unambiguous FP names (RBP/FP) enable it. */
+    private boolean isStackAddr(List<OpRec> ops, Varnode v, int pos) {
+        Varnode cur = v;
+        for (int hop = 0; hop < 6; hop++) {
+            if (cur == null) return false;
+            if (cur.isConstant()) return false;
+            if (cur.getAddress() != null) {
+                String sp = cur.getAddress().getAddressSpace().getName();
+                if (isa.registerSpaceName().equals(sp)) {
+                    long off = cur.getOffset();
+                    if (off == memSpOff) return true;
+                    if (memFpOff >= 0 && off == memFpOff) return true;
+                } else if (!"unique".equals(sp)) {
+                    return false;
+                }
+            }
+            int d = findDefWide(ops, vkey(cur), pos);
+            if (d < 0) return false;
+            OpRec dd = ops.get(d);
+            if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
+                cur = dd.ins[0];
+                pos = d;
+                continue;
+            }
+            if ((dd.mnem.equals("INT_ADD") || dd.mnem.equals("INT_SUB")) &&
+                dd.ins.length == 2) {
+                Varnode next = null;
+                for (int s = 0; s < 2; s++) {
+                    if (!dd.ins[s].isConstant()) {
+                        next = dd.ins[s];
+                        break;
+                    }
+                }
+                if (next == null) return false;
+                cur = next;
+                pos = d;
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /** One collected store for seed computation: val == null means
+        the stored value was unknown or partial (not exact). */
+    private static class MemStore {
+        final long addr;
+        final int size;
+        final Long val;
+        MemStore(long a, int s, Long v) { addr = a; size = s; val = v; }
+    }
+
+    private static class MemSeedResult {
+        final Map<String, Bits> seeds = new HashMap<String, Bits>();
+        int cells = 0;
+        boolean hasUnknownStore = false;
+        int blockedLeak = 0;
+        int blockedConflict = 0;
+        int nonConvergedFns = 0;
+    }
+
+    /** Scan a must-state's register values for leaked candidate
+        addresses (used for unknown-convention calls, indirect
+        calls, and returns: over-blocking is sound here). */
+    private static void leakScanRegs(Map<String, Bits> st,
+        Set<Long> candAddrs, Set<Long> leaked, String regSpace) {
+        for (Map.Entry<String, Bits> e : st.entrySet()) {
+            String k = e.getKey();
+            if (!k.startsWith(regSpace + ":")) continue;
+            String[] p = k.split(":");
+            if (p.length != 3) continue;
+            try {
+                int sz = Integer.parseInt(p[2]);
+                Long v = e.getValue().exactValue(sizeMask(sz));
+                if (v != null && candAddrs.contains(v.longValue())) {
+                    leaked.add(v.longValue());
+                }
+            } catch (Exception ex) {
+                // Non-numeric key: not a register view.
+            }
+        }
+    }
+
+    /** Program-wide global-seed computation from the current
+        fixpoints. See the Phase M header for the rule: a cell is
+        seeded only when every overlapping store in the whole
+        program targets exactly that cell with the same exact
+        value, at least one such store exists, no unknown non-stack
+        store exists anywhere, and the address never leaks (call
+        argument, stored value, return register). */
+    private MemSeedResult collectMemSeeds(List<FuncRec> funcRecs,
+        Map<Long, FuncRec> funcByEntry) {
+        MemSeedResult res = new MemSeedResult();
+        List<MemStore> allStores = new ArrayList<MemStore>();
+        // Pass A: stores + unknown-store flag. STORE ops cover
+        // register-indirect stores (all ISAs); COPY-to-ram ops
+        // cover absolute stores (x86-64 RIP-relative globals --
+        // their address is exact by construction, so they never
+        // set the unknown-store flag).
+        for (FuncRec rec : funcRecs) {
+            if (rec.fx == null || !rec.fx.converged) {
+                res.nonConvergedFns++;
+            }
+            List<OpRec> ops = rec.or.ops;
+            for (int i = 0; i < ops.size(); i++) {
+                OpRec op = ops.get(i);
+                boolean isCopyRam = op.mnem.equals("COPY") &&
+                    op.ins.length == 1 && op.out != null &&
+                    isRamSpace(op.out);
+                boolean isStore = op.mnem.equals("STORE") &&
+                    op.ins.length >= 3;
+                if (!isCopyRam && !isStore) continue;
+                if (isStore && op.addrIsStack) continue;
+                Map<String, Bits> st = (rec.fx == null ||
+                    rec.fx.inStates == null ||
+                    i >= rec.fx.inStates.length) ? null : rec.fx.inStates[i];
+                if (st == null) continue; // unreachable op: never executes
+                long a;
+                int sz;
+                Bits vb;
+                if (isCopyRam) {
+                    a = op.out.getOffset();
+                    sz = op.out.getSize();
+                    vb = resolveBits(op.ins[0], st);
+                } else {
+                    Long addr = resolveExact(op.ins[1], st);
+                    if (addr == null) {
+                        res.hasUnknownStore = true;
+                        continue;
+                    }
+                    a = addr.longValue();
+                    sz = op.ins[2].getSize();
+                    vb = resolveBits(op.ins[2], st);
+                }
+                if (isa.isMmioAddress(a)) continue;
+                Long exact = (sz > 0 && sz <= 8) ?
+                    vb.exactValue(sizeMask(sz)) : null;
+                allStores.add(new MemStore(a, sz, exact));
+            }
+        }
+        // Candidate cells: distinct (addr, size) with >=1 store.
+        Set<String> cells = new HashSet<String>();
+        for (MemStore s : allStores) {
+            cells.add(s.addr + ":" + s.size);
+        }
+        res.cells = cells.size();
+        // For each cell: every overlapping store must target exactly
+        // this cell with the same exact value.
+        Map<String, Long> agreed = new HashMap<String, Long>();
+        Set<Long> candAddrs = new HashSet<Long>();
+        for (String key : cells) {
+            String[] parts = key.split(":");
+            long A = Long.parseLong(parts[0]);
+            int S = Integer.parseInt(parts[1]);
+            Long v = null;
+            boolean ok = true;
+            for (MemStore s : allStores) {
+                if (s.addr < A + S && A < s.addr + s.size) {
+                    if (s.addr != A || s.size != S || s.val == null) {
+                        ok = false;
+                        break;
+                    }
+                    if (v == null) v = s.val;
+                    else if (!v.equals(s.val)) { ok = false; break; }
+                }
+            }
+            if (ok && v != null) {
+                agreed.put(key, v);
+                candAddrs.add(A);
+            } else {
+                res.blockedConflict++;
+            }
+        }
+        if (res.hasUnknownStore) {
+            // No seed at all: an unknown store may alias any global.
+            return res;
+        }
+        // Pass B: leaks. An address that escapes (call argument,
+        // stored value, return register) can be written through
+        // invisible paths, so it is never seeded.
+        Set<Long> leaked = new HashSet<Long>();
+        int ptrSize = isa.pointerSize();
+        String regSpace = isa.registerSpaceName();
+        for (FuncRec rec : funcRecs) {
+            List<OpRec> ops = rec.or.ops;
+            for (int i = 0; i < ops.size(); i++) {
+                OpRec op = ops.get(i);
+                Map<String, Bits> st = (rec.fx == null ||
+                    rec.fx.inStates == null ||
+                    i >= rec.fx.inStates.length) ? null : rec.fx.inStates[i];
+                if (st == null) continue;
+                if (op.mnem.equals("CALL") && op.ins.length >= 1) {
+                    long[] argRegs = null;
+                    Varnode t = op.ins[0];
+                    if (t != null && t.getAddress() != null &&
+                        "ram".equals(t.getAddress().getAddressSpace()
+                            .getName())) {
+                        FuncRec callee = funcByEntry.get(t.getOffset());
+                        if (callee == null) callee = funcByEntry.get(
+                            isa.stripInstructionTag(t.getOffset()));
+                        if (callee != null) {
+                            argRegs = isa.argumentRegisterOffsets(
+                                callConvMap.get(callee.entryKey));
+                        }
+                    }
+                    if (argRegs == null) {
+                        leakScanRegs(st, candAddrs, leaked, regSpace);
+                    } else {
+                        for (long off : argRegs) {
+                            Varnode vn = regVarnode(off, ptrSize);
+                            if (vn == null) continue;
+                            Long v = resolveExact(vn, st);
+                            if (v != null &&
+                                candAddrs.contains(v.longValue())) {
+                                leaked.add(v.longValue());
+                            }
+                        }
+                    }
+                } else if (op.mnem.equals("CALLIND")) {
+                    leakScanRegs(st, candAddrs, leaked, regSpace);
+                } else if (op.mnem.equals("STORE") && op.ins.length >= 3) {
+                    Long v = resolveExact(op.ins[2], st);
+                    if (v != null && candAddrs.contains(v.longValue())) {
+                        leaked.add(v.longValue());
+                    }
+                } else if (op.mnem.equals("COPY") && op.ins.length == 1 &&
+                    op.out != null && isRamSpace(op.out)) {
+                    // COPY-to-ram store of a candidate address
+                    // leaks it (storing &global into another
+                    // global is an escape, same as a STORE).
+                    Long v = resolveExact(op.ins[0], st);
+                    if (v != null && candAddrs.contains(v.longValue())) {
+                        leaked.add(v.longValue());
+                    }
+                } else if (op.mnem.equals("RETURN")) {
+                    leakScanRegs(st, candAddrs, leaked, regSpace);
+                }
+            }
+        }
+        for (Map.Entry<String, Long> e : agreed.entrySet()) {
+            String[] parts = e.getKey().split(":");
+            long A = Long.parseLong(parts[0]);
+            int S = Integer.parseInt(parts[1]);
+            if (leaked.contains(A)) {
+                res.blockedLeak++;
+                continue;
+            }
+            res.seeds.put(gmemKey(A, S),
+                Bits.exact(e.getValue().longValue(), sizeMask(S)));
+        }
+        return res;
+    }
+
     @Override
     public void run() throws Exception {
         if (getScriptArgs().length < 1) {
@@ -5638,6 +6119,29 @@ public class ExtractIR extends GhidraScript {
         // The may-fixpoint, points-to and emission code below are
         // unchanged (may still starts all-unknown).
         Memory memA = currentProgram.getMemory();
+        // Memory-propagation stack registers, resolved by name
+        // (absent = that leg disabled, never guessed).
+        try {
+            if (currentProgram.getRegister("RSP") != null) {
+                memSpOff = currentProgram.getRegister("RSP")
+                    .getOffset();
+            } else if (currentProgram.getRegister("SP") != null) {
+                memSpOff = currentProgram.getRegister("SP")
+                    .getOffset();
+            }
+            if (currentProgram.getRegister("RBP") != null) {
+                memFpOff = currentProgram.getRegister("RBP")
+                    .getOffset();
+            } else if (currentProgram.getRegister("FP") != null) {
+                memFpOff = currentProgram.getRegister("FP")
+                    .getOffset();
+            }
+            memBigEndian = currentProgram.getLanguage()
+                .isBigEndian();
+        } catch (Exception e) {
+            // Legs stay disabled; memState then treats stack
+            // stores as unknown (sound, less precise).
+        }
         FunctionManager fmA = currentProgram.getFunctionManager();
         List<FuncRec> funcRecs = new ArrayList<FuncRec>();
         Map<Long, FuncRec> funcByEntry = new HashMap<Long, FuncRec>();
@@ -6097,6 +6601,153 @@ public class ExtractIR extends GhidraScript {
             println("[*] proto: " + provRounds + " rounds, converged=" +
                 provConverged + ", functions with propagated entries=" +
                 withProvEntries + ".");
+        }
+
+        // ---- Memory/global propagation, Phase M ----
+        // SOUND SLICES, not a redesign. Two layers, both feeding
+        // the existing must-fixpoint (so recording picks them up
+        // with no JSON shape change and no emission change):
+        //
+        // STAGE 1 (intra-procedural memState): "mem:" keys in the
+        // must-state map. A STORE to a known non-MMIO address
+        // records the value (dropping overlapping cells); a store
+        // to an unknown non-stack address clears all of memState
+        // (it may alias any global); a CALL clears memState (a
+        // callee may store anywhere); stack stores are ignored
+        // (proven-stack via def-chain to SP/FP -- they can never
+        // alias a global). COPY-to/from-ram ops are the SAME
+        // operations in x86-64 dress: Ghidra models absolute
+        // (RIP-relative) global access as COPY, not LOAD/STORE,
+        // so COPY-to-ram stores update memState and COPY-from-ram
+        // loads consult it -- without this the globals slice
+        // would be vacuous on x86-64, including OVMF. A LOAD
+        // consults memState before image
+        // bytes: a covering entry proves a dominating store wrote
+        // the range on every path, so the image bytes are stale
+        // there; no covering entry keeps exactly today's behaviour.
+        // The must-meet's agree-or-drop discipline applies to cells
+        // exactly as to registers (a cell survives a join only when
+        // every incoming path agrees on it).
+        //
+        // STAGE 2 (program-wide global seeds): "gmem:" keys injected
+        // at every function entry, computed by collectMemSeeds from
+        // the current fixpoints and iterated like constprop (seeds
+        // only shrink, so the loop terminates; the cap is a safety
+        // bound, and non-convergence drops all seeds and re-runs
+        // with constprop entries only, so no unstable seed ever
+        // reaches emission). A cell (addr, size) is seeded ONLY when
+        // (a) every overlapping store in the whole program targets
+        // exactly that cell with the same exact value, (b) at least
+        // one such store exists, (c) NO unknown non-stack store
+        // exists anywhere in the program, and (d) the address never
+        // leaks: it never appears as a call-argument value, a
+        // stored value, or a return-register value. Seeded cells
+        // survive CALLs (the seed rule guarantees no callee can
+        // change one to a different value); an intra-procedural
+        // store overlapping a seed drops it (defensive: a seed
+        // contradicting a fresh store is dropped, never trusted).
+        //
+        // EXPLICITLY OUT OF THIS SLICE: heap memory with unknown
+        // base (a heap struct field needs object identity, which
+        // provenance alone does not provide -- two devices' PciIo
+        // pointers share a protocol provenance but are different
+        // objects, so conflating them would be unsound); struct
+        // fields whose base is a KNOWN global ARE covered (the
+        // field address is exact, so it is just a global cell);
+        // stack values that escape (covered by the leak guards
+        // above when they pass through a call/store/return).
+        //
+        // DOCUMENTED RESIDUAL RISK (narrow, same honesty policy as
+        // v2 item #2's address-taken hole): an external function
+        // writing a FIELD of a caller-provided struct/buffer that
+        // coincides with a seeded global, where the global's own
+        // address was never passed to it. Direct flows are all
+        // guarded (call-arg, store-value, return); only a callee
+        // that knows the caller's private layout and writes
+        // through a struct pointer could break a seed, and UEFI
+        // Boot Services / protocol methods do not write
+        // driver-private globals that way (they write out-params
+        // and their own device state, both guarded above).
+        Map<String, Bits> memSeeds = new HashMap<String, Bits>();
+        boolean memConverged = false;
+        int memRounds = 0;
+        MemSeedResult lastSeedRes = null;
+        for (int round = 0; round < MAX_CONSTPROP_ROUNDS &&
+            !memConverged; round++) {
+            if (monitor.isCancelled()) break;
+            memRounds++;
+            MemSeedResult sr = collectMemSeeds(funcRecs, funcByEntry);
+            lastSeedRes = sr;
+            if (sameState(memSeeds, sr.seeds)) {
+                memConverged = true;
+                break;
+            }
+            memSeeds = sr.seeds;
+            for (FuncRec rec : funcRecs) {
+                Map<String, Bits> e = entries.get(rec.entryKey);
+                Map<String, Bits> merged = new HashMap<String, Bits>();
+                if (e != null) merged.putAll(e);
+                merged.putAll(memSeeds);
+                FixResult nfx;
+                try {
+                    nfx = runFixpoint(rec.or.ops, memA,
+                        rec.branchTargets, merged);
+                } catch (Exception ex) {
+                    nfx = emptyFix(rec.or.ops.size());
+                }
+                if (nfx.converged || rec.fx == null ||
+                    !rec.fx.converged) {
+                    rec.fx = nfx;
+                }
+            }
+        }
+        if (!memConverged) {
+            memSeeds = new HashMap<String, Bits>();
+            for (FuncRec rec : funcRecs) {
+                try {
+                    FixResult nfx = runFixpoint(rec.or.ops, memA,
+                        rec.branchTargets, entries.get(rec.entryKey));
+                    if (nfx.converged || rec.fx == null ||
+                        !rec.fx.converged) {
+                        rec.fx = nfx;
+                    }
+                } catch (Exception ex) {
+                    // Keep the previous fixpoint.
+                }
+            }
+            println("[!] memprop: stopped after " +
+                MAX_CONSTPROP_ROUNDS +
+                " rounds without convergence; seeds dropped.");
+        }
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.append("[*] memprop: ").append(memRounds)
+                .append(" rounds, converged=").append(memConverged)
+                .append(", seeds=").append(memSeeds.size());
+            if (lastSeedRes != null) {
+                sb.append(", cells=").append(lastSeedRes.cells)
+                    .append(", hasUnknownStore=")
+                    .append(lastSeedRes.hasUnknownStore)
+                    .append(", blockedLeak=")
+                    .append(lastSeedRes.blockedLeak)
+                    .append(", blockedConflict=")
+                    .append(lastSeedRes.blockedConflict);
+            }
+            println(sb.toString());
+            int shown = 0;
+            for (Map.Entry<String, Bits> e : memSeeds.entrySet()) {
+                if (shown >= 20) {
+                    println("    ... and " + (memSeeds.size() - shown) +
+                        " more seeds.");
+                    break;
+                }
+                long[] as = parseMemKey(e.getKey());
+                Long v = (as == null) ? null : e.getValue()
+                    .exactValue(sizeMask((int) as[1]));
+                println("    seed " + e.getKey() + " = " +
+                    (v == null ? "?" : ("0x" + Long.toHexString(v))));
+                shown++;
+            }
         }
         for (FuncRec rec : funcRecs) {
             Function f = rec.f;
