@@ -376,6 +376,325 @@ public class ExtractIR extends GhidraScript {
         return isa.clobberForConvention(null);
     }
 
+    // ---------------- v13 clobber refinement ----------------
+    // Until v12, every CALL killed the whole caller-saved set,
+    // even when the callee never touches most of it. That killed
+    // real values: QemuVideoDxe's generic helper (per-site clones
+    // for CF8/CFC) lost its config address in RCX across an inner
+    // CALL, so its IN stayed unknown. This slice refines the kill
+    // to what the callee provably may write.
+    //
+    // MECHANISM (i): per-callee may-write sets. For each function,
+    // the union of its own register-writing op outputs, plus the
+    // may-write sets of its direct-call and resolved tail-call
+    // targets, iterated to a fixpoint over the call graph. A
+    // caller-saved register is preserved across a direct CALL iff
+    // NO written interval overlaps the register's whole interval
+    // [c, c+pointerSize): a partial (sub-register) write still
+    // clobbers the whole register -- preserving a partially
+    // written register would keep stale bytes, so the rule is
+    // whole-register or nothing. (A future sub-view refinement
+    // could preserve untouched bytes; not this slice.)
+    //
+    // SOUNDNESS: the may-write set is a may-analysis (union over
+    // all ops, all paths). If a register is absent from it, NO
+    // path through the callee writes it, so the caller's value
+    // provably survives. Anything unknown TAINTS the function
+    // (may write everything): external/empty callees, CALLIND
+    // inside, direct calls to unknown addresses, unresolved tail
+    // calls, ambiguous tail-target names. Taint propagates along
+    // call edges. Indirect calls at the CALL site itself stay
+    // fully conservative (no callee, no refinement).
+    //
+    // MECHANISM (ii) (callee-saved preservation) is NOT built
+    // here: the convention sets already exclude callee-saved
+    // registers, so they already survive calls. What is NOT
+    // modeled: balanced push/pop of a CALLER-saved register
+    // inside the callee -- the pop IS a write, so the register
+    // still counts as may-written and stays clobbered. That is a
+    // documented completeness loss (sound direction), not a bug:
+    // a future save/restore analysis could recover it.
+    //
+    // SCOPE: must transfer only (applyTransfer). The may and
+    // taint transfers keep the full conservative kill: growing
+    // may sets could break Lean may-confinement verdicts, and
+    // that interaction needs its own slice. Per-site clones use
+    // the same applyTransfer, so refinement composes with
+    // per-site automatically (the QemuVideo case IS a clone's
+    // value surviving an inner CALL). The stack pointer, return
+    // address, config latch and memState are untouched by this
+    // slice: a callee may still reprogram config space and store
+    // globals, so those die at calls exactly as before.
+    //
+    // RESIDUAL (same honesty policy as the rest of the engine):
+    // refinement trusts Ghidra's lift completeness -- an
+    // instruction Ghidra fails to lift contributes no output to
+    // the may-write set. That trust is shared by every other
+    // analysis in this file.
+    private static class ClobberRef {
+        // Callee address (dual-keyed raw + stripped entry offset,
+        // like retSummaries) -> written register intervals, each
+        // encoded as (off << 32) | (size & 0xffffffffL).
+        Map<Long, Set<Long>> writes = new HashMap<Long, Set<Long>>();
+        // Callee addresses that may write anything.
+        Set<Long> tainted = new HashSet<Long>();
+    }
+    private ClobberRef clobberRef = null;
+
+    /** v13: refined caller-saved set for a CALL op: the convention
+        set minus registers the callee provably never writes (no
+        written interval overlaps the register's whole interval).
+        CALLIND, unknown callees, tainted callees, and a null map
+        all fall back to the full conservative set. */
+    private long[] refinedClobberForCall(OpRec op) {
+        long[] base = clobberForCall(op);
+        if (clobberRef == null) return base;
+        if (!op.mnem.equals("CALL") || op.ins.length < 1) return base;
+        Varnode t = op.ins[0];
+        if (t == null || t.getAddress() == null ||
+            !"ram".equals(t.getAddress().getAddressSpace().
+                getName())) {
+            return base;
+        }
+        Set<Long> w = clobberRef.writes.get(t.getOffset());
+        if (w == null) {
+            w = clobberRef.writes.get(
+                isa.stripInstructionTag(t.getOffset()));
+        }
+        if (w == null || clobberRef.tainted.contains(t.getOffset()) ||
+            clobberRef.tainted.contains(
+                isa.stripInstructionTag(t.getOffset()))) {
+            return base;
+        }
+        int ps = isa.pointerSize();
+        List<Long> kept = new ArrayList<Long>();
+        for (long c : base) {
+            boolean hit = false;
+            for (Long enc : w) {
+                long o = enc.longValue() >>> 32;
+                long s = enc.longValue() & 0xffffffffL;
+                if (o < c + ps && c < o + s) { hit = true; break; }
+            }
+            if (hit) kept.add(c);
+        }
+        long[] r = new long[kept.size()];
+        for (int i = 0; i < kept.size(); i++) r[i] = kept.get(i);
+        return r;
+    }
+
+    /** v13: true when a BRANCHIND is a return through the ISA's
+        return-address register (directly, or through one COPY
+        hop), mirroring recoverTailCalls' isReturn classification.
+        Other BRANCHIND shapes fall through to the taint rule in
+        computeClobberRef (sound: an unclassified branch may leave
+        the function). */
+    private boolean isReturnBranch(OpRec op, List<OpRec> pops,
+        int opIdx) {
+        if (op.ins.length < 1) return false;
+        Varnode dest = op.ins[0];
+        if (isa.isReturnAddressRegister(dest)) return true;
+        int def = findDef(pops, vkey(dest), opIdx);
+        if (def >= 0) {
+            OpRec dd = pops.get(def);
+            if (dd.mnem.equals("COPY") && dd.ins.length == 1 &&
+                isa.isReturnAddressRegister(dd.ins[0])) return true;
+        }
+        return false;
+    }
+
+    /** v13: parse a function's TailCallResult.sites JSON strings
+        into instr-string -> target-name lists. Unparseable sites
+        are absent from the map (callers treat absence as
+        unresolvable, i.e. taint). An empty target list also
+        counts as unresolvable at the use site. */
+    private static Map<String, List<String>> parseTailSites(
+        TailCallResult tc) {
+        Map<String, List<String>> m =
+            new HashMap<String, List<String>>();
+        if (tc == null || tc.sites == null) return m;
+        for (String s : tc.sites) {
+            try {
+                int ii = s.indexOf("\"instr\": \"");
+                if (ii < 0) continue;
+                int a = ii + 10;
+                int b = s.indexOf("\"", a);
+                if (b < 0) continue;
+                String instr = s.substring(a, b);
+                int ti = s.indexOf("\"targets\": [", b);
+                if (ti < 0) continue;
+                List<String> names = new ArrayList<String>();
+                int p = ti + 12;
+                while (true) {
+                    int cb = s.indexOf("]", p);
+                    int q1 = s.indexOf("\"", p);
+                    if (q1 < 0 || (cb >= 0 && cb < q1)) break;
+                    int q2 = s.indexOf("\"", q1 + 1);
+                    if (q2 < 0) break;
+                    names.add(s.substring(q1 + 1, q2).
+                        replace("\\\"", "\"").
+                        replace("\\\\", "\\"));
+                    p = q2 + 1;
+                }
+                m.put(instr, names);
+            } catch (Exception e) {
+                // Absent from the map -> taint. Sound.
+            }
+        }
+        return m;
+    }
+
+    /** v13: compute per-callee may-write register sets over the
+        whole program. Direct writes come from raw op outputs
+        (complete w.r.t. lifted P-Code, not w.r.t. modeled
+        transfers); edges come from direct CALLs and resolved
+        tail calls; taint covers everything unknown. The result
+        is stored in the instance field before Phase B, so every
+        fixpoint (merged and per-site clones alike) refines its
+        CALL kills through refinedClobberForCall. */
+    private ClobberRef computeClobberRef(List<FuncRec> funcRecs,
+        Map<Long, FuncRec> funcByEntry) {
+        ClobberRef ref = new ClobberRef();
+        String space = isa.registerSpaceName();
+        Map<String, FuncRec> byName = new HashMap<String, FuncRec>();
+        Set<String> ambiguousNames = new HashSet<String>();
+        for (FuncRec rec : funcRecs) {
+            String n;
+            try { n = rec.f.getName(); } catch (Exception e) {
+                continue;
+            }
+            if (byName.containsKey(n)) ambiguousNames.add(n);
+            else byName.put(n, rec);
+        }
+        Map<Long, Set<Long>> direct = new HashMap<Long, Set<Long>>();
+        Map<Long, Set<Long>> edges = new HashMap<Long, Set<Long>>();
+        Set<Long> tainted = new HashSet<Long>();
+        for (FuncRec rec : funcRecs) {
+            long ek = rec.entryKey;
+            List<OpRec> pops = rec.or.ops;
+            Set<Long> dw = new HashSet<Long>();
+            Set<Long> ed = new HashSet<Long>();
+            boolean taint = false;
+            try {
+                if (rec.f.isExternal()) taint = true;
+            } catch (Exception e) {
+                taint = true;
+            }
+            if (pops == null || pops.isEmpty()) taint = true;
+            Map<String, List<String>> tailSites =
+                parseTailSites(rec.tc);
+            for (int i = 0; pops != null && i < pops.size(); i++) {
+                OpRec op = pops.get(i);
+                if (op.out != null && op.out.getAddress() != null &&
+                    space.equals(op.out.getAddress().
+                        getAddressSpace().getName())) {
+                    dw.add((op.out.getOffset() << 32) |
+                        (op.out.getSize() & 0xffffffffL));
+                }
+                if (op.mnem.equals("CALL")) {
+                    if (op.ins.length < 1) { taint = true; continue; }
+                    Varnode tt = op.ins[0];
+                    if (tt == null || tt.getAddress() == null ||
+                        !"ram".equals(tt.getAddress().
+                            getAddressSpace().getName())) {
+                        taint = true; continue;
+                    }
+                    FuncRec callee = funcByEntry.get(tt.getOffset());
+                    if (callee == null) {
+                        callee = funcByEntry.get(
+                            isa.stripInstructionTag(tt.getOffset()));
+                    }
+                    if (callee == null) taint = true;
+                    else ed.add(callee.entryKey);
+                } else if (op.mnem.equals("CALLIND")) {
+                    taint = true;
+                } else if (op.mnem.equals("BRANCHIND")) {
+                    if (rec.ind != null &&
+                        rec.ind.resolvedBranchInds != null &&
+                        rec.ind.resolvedBranchInds.contains(i)) {
+                        continue;
+                    }
+                    if (rec.branchTargets != null &&
+                        rec.branchTargets.containsKey(i)) {
+                        continue;
+                    }
+                    if (isReturnBranch(op, pops, i)) continue;
+                    List<String> names =
+                        tailSites.get(op.instrAddr.toString());
+                    if (names == null || names.isEmpty()) {
+                        taint = true; continue;
+                    }
+                    boolean ok = true;
+                    for (String nm : names) {
+                        if (ambiguousNames.contains(nm)) {
+                            ok = false; break;
+                        }
+                        FuncRec g = byName.get(nm);
+                        if (g == null) { ok = false; break; }
+                        ed.add(g.entryKey);
+                    }
+                    if (!ok) taint = true;
+                }
+            }
+            direct.put(ek, dw);
+            edges.put(ek, ed);
+            if (taint) tainted.add(ek);
+        }
+        Map<Long, Set<Long>> writes = new HashMap<Long, Set<Long>>();
+        for (Long ek : direct.keySet()) {
+            writes.put(ek, new HashSet<Long>(direct.get(ek)));
+        }
+        boolean changed = true;
+        int rounds = 0;
+        while (changed && rounds < 1000) {
+            changed = false;
+            rounds++;
+            for (Long ek : direct.keySet()) {
+                Set<Long> w = writes.get(ek);
+                for (Long g : edges.get(ek)) {
+                    if (tainted.contains(g) &&
+                        !tainted.contains(ek)) {
+                        tainted.add(ek);
+                        changed = true;
+                    }
+                    if (w.addAll(writes.get(g))) changed = true;
+                }
+            }
+        }
+        if (rounds >= 1000) {
+            // Safety fallback, should never trigger: taint all.
+            for (Long ek : direct.keySet()) tainted.add(ek);
+        }
+        for (Long ek : direct.keySet()) {
+            ref.writes.put(ek, writes.get(ek));
+            long st = isa.stripInstructionTag(ek.longValue());
+            if (st != ek.longValue()) ref.writes.put(st, writes.get(ek));
+            if (tainted.contains(ek)) {
+                ref.tainted.add(ek);
+                if (st != ek.longValue()) ref.tainted.add(st);
+            }
+        }
+        // Publish before counting: the count itself refines calls.
+        clobberRef = ref;
+        int refinedCalls = 0;
+        int totalCalls = 0;
+        for (FuncRec rec : funcRecs) {
+            List<OpRec> pops = rec.or.ops;
+            if (pops == null) continue;
+            for (OpRec op : pops) {
+                if (!op.mnem.equals("CALL")) continue;
+                totalCalls++;
+                long[] b = clobberForCall(op);
+                long[] r = refinedClobberForCall(op);
+                if (r.length < b.length) refinedCalls++;
+            }
+        }
+        println("[*] clobber: funcs=" + direct.size() +
+            " tainted=" + tainted.size() +
+            " direct-calls=" + totalCalls +
+            " refined-calls=" + refinedCalls);
+        return ref;
+    }
+
     /** ARM (Cortex-M, Thumb) adapter: holds every ARM-specific fact. */
     private class ArmIsa implements IsaAdapter {
         public String name() { return "ARM"; }
@@ -2056,10 +2375,14 @@ public class ExtractIR extends GhidraScript {
                 }
             }
         } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
-            // Caller-saved registers are dead after the call (the
-            // set comes from clobberForCall: the per-callee Ghidra
-            // signature for x86, the adapter's single set otherwise).
-            long[] clobber = clobberForCall(op);
+            // Caller-saved registers are dead after the call, except
+            // registers the callee provably never writes (v13
+            // refinedClobberForCall; must transfer only -- the may
+            // and taint transfers keep the full conservative kill).
+            // The base set comes from clobberForCall: the per-callee
+            // Ghidra signature for x86, the adapter's single set
+            // otherwise.
+            long[] clobber = refinedClobberForCall(op);
             Set<String> drop = new HashSet<String>();
             for (long off : clobber) {
                 if (isa.hasOverlappingRegisters()) {
@@ -7678,7 +8001,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.11\",");
+        w.println("  \"extractor_version\": \"v3.12\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -7952,6 +8275,9 @@ public class ExtractIR extends GhidraScript {
             eligible.put(callee.entryKey, ok);
             if (ok) argRegsByCallee.put(callee.entryKey, argRegs);
         }
+        // ---- v13 clobber refinement: per-callee may-write sets
+        // (must-only; may/taint transfers stay conservative) ----
+        clobberRef = computeClobberRef(funcRecs, funcByEntry);
         // ---- v2 item #2, Phase B: worklist iteration over entries ----
         Map<Long, Map<String, Bits>> entries =
             new HashMap<Long, Map<String, Bits>>();
