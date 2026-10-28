@@ -369,3 +369,218 @@ def checkBmpConfinement (trace : List MmioAccess) : Bool :=
     else if a.func.startsWith "platform_" then
       inRange a.addr 0x40010800 0x40011400 || inRange a.addr 0x40012400 0x40012800
     else true
+
+/-- Clock-enable-before-use, v1 (generalization of the blink theorem).
+    WHAT IT CHECKS: every MUST access (LOAD or STORE — a gated
+    peripheral faults on any access) to a mapped peripheral's register
+    block requires a MUST STORE to that peripheral's clock-gate
+    register somewhere in the trace. The violation line names the
+    peripheral, its gate register, and its gate bit.
+    WHAT IT DOES NOT PROVE (honest limits, read before citing it):
+    (1) ORDER-FREE, not must-precede. The Lean trace is flat file
+    order, not execution order (Main's own comment: "no interleaved
+    order exists to preserve"), so no temporal claim is made. Proof
+    from BMP: a GPIOB use sits at flat position 4 while the first
+    gate touch sits at position 302 — file order is not execution
+    order, and any order claim over it would false-FAIL correct
+    firmware. True must-precede (gate STORE dominates the use in the
+    CFG) needs extractor dominance evidence that the report does not
+    carry; that is phase 2, specified in v21-clockenable/design.
+    (2) REGISTER granularity, not bit granularity. The gate bit is
+    recorded for the message and for phase 2, but v1 only requires the
+    gate REGISTER to be touched. Reason, measured on BMP: the
+    libopencm3 generic rcc_periph_clock_enable helper resolves only
+    3 gate bits in the must trace (AFIO, TIM3, DMA1) although the
+    firmware correctly enables GPIOA/B/C, TIM1, USB, ADC1 — a
+    bit-precise check would false-FAIL it. "Enabled the wrong bit in
+    the same register" is therefore NOT caught by v1.
+    (3) NO-RCC GAP: a firmware that uses STM32 blocks but never
+    touches any RCC gate register is vacuous PASS, because the maps
+    activate on gate touch (see below). The synthetic control works
+    around this honestly: it touches one family's gate (APB1) and uses
+    a peripheral from another family (APB2), which v1 does catch.
+    (4) COVERAGE-BOUNDED: a peripheral the extractor never recovers
+    (e.g. F4 USART2 via RAM handle-struct, the known Gap B) cannot
+    fail this check — the check sees only must-extracted uses.
+    CHIP ACTIVATION: reports carry no chip field (only language
+    "ARM:LE:32:v8" and binary_name), so a chip's map is active iff any
+    of its RCC gate registers is STORE-touched in the trace. This is
+    what keeps non-STM32 ARM targets safe: RP2040, nRF52, Zephyr
+    (nRF52840) and TinyUSB touch zero STM32 RCC gates, so they are
+    vacuous PASS — verified by sweep, not assumed. (Without this
+    gating, nRF52 UARTE0 at 0x40002000 would misread as F1 TIM14.)
+    If both families are touched (never seen in practice), both maps
+    apply and a use is covered if ANY matching gate is touched.
+    EXCLUDED AS GRAY: EXTI, RTC, IWDG, FLASH, RCC itself, DBGMCU,
+    ETH (multi-bit gates), USB OTG FS (AHB2 register) — their gating
+    is variant-dependent or multi-bit, so mapping them risks false
+    FAILs. They are unchecked, never failed. -/
+structure ClockGate where
+  name : String
+  blockLo : Nat
+  blockHi : Nat
+  gateAddr : Nat
+  gateBit : Nat
+  deriving Repr, DecidableEq, Inhabited
+
+/-- STM32F1 (RM0008) peripheral blocks and their RCC gates. -/
+def f1ClockGates : List ClockGate := [
+  { name := "AFIO",   blockLo := 0x40010000, blockHi := 0x40010400, gateAddr := 0x40021018, gateBit := 0 },
+  { name := "GPIOA",  blockLo := 0x40010800, blockHi := 0x40010C00, gateAddr := 0x40021018, gateBit := 2 },
+  { name := "GPIOB",  blockLo := 0x40010C00, blockHi := 0x40011000, gateAddr := 0x40021018, gateBit := 3 },
+  { name := "GPIOC",  blockLo := 0x40011000, blockHi := 0x40011400, gateAddr := 0x40021018, gateBit := 4 },
+  { name := "GPIOD",  blockLo := 0x40011400, blockHi := 0x40011800, gateAddr := 0x40021018, gateBit := 5 },
+  { name := "GPIOE",  blockLo := 0x40011800, blockHi := 0x40011C00, gateAddr := 0x40021018, gateBit := 6 },
+  { name := "ADC1",   blockLo := 0x40012400, blockHi := 0x40012800, gateAddr := 0x40021018, gateBit := 9 },
+  { name := "ADC2",   blockLo := 0x40012800, blockHi := 0x40012C00, gateAddr := 0x40021018, gateBit := 10 },
+  { name := "TIM1",   blockLo := 0x40012C00, blockHi := 0x40013000, gateAddr := 0x40021018, gateBit := 11 },
+  { name := "SPI1",   blockLo := 0x40013000, blockHi := 0x40013400, gateAddr := 0x40021018, gateBit := 12 },
+  { name := "TIM8",   blockLo := 0x40013400, blockHi := 0x40013800, gateAddr := 0x40021018, gateBit := 13 },
+  { name := "USART1", blockLo := 0x40013800, blockHi := 0x40013C00, gateAddr := 0x40021018, gateBit := 14 },
+  { name := "ADC3",   blockLo := 0x40014000, blockHi := 0x40014400, gateAddr := 0x40021018, gateBit := 15 },
+  { name := "TIM2",   blockLo := 0x40000000, blockHi := 0x40000400, gateAddr := 0x4002101C, gateBit := 0 },
+  { name := "TIM3",   blockLo := 0x40000400, blockHi := 0x40000800, gateAddr := 0x4002101C, gateBit := 1 },
+  { name := "TIM4",   blockLo := 0x40000800, blockHi := 0x40000C00, gateAddr := 0x4002101C, gateBit := 2 },
+  { name := "TIM5",   blockLo := 0x40000C00, blockHi := 0x40001000, gateAddr := 0x4002101C, gateBit := 3 },
+  { name := "TIM6",   blockLo := 0x40001000, blockHi := 0x40001400, gateAddr := 0x4002101C, gateBit := 4 },
+  { name := "TIM7",   blockLo := 0x40001400, blockHi := 0x40001800, gateAddr := 0x4002101C, gateBit := 5 },
+  { name := "TIM12",  blockLo := 0x40001800, blockHi := 0x40001C00, gateAddr := 0x4002101C, gateBit := 6 },
+  { name := "TIM13",  blockLo := 0x40001C00, blockHi := 0x40002000, gateAddr := 0x4002101C, gateBit := 7 },
+  { name := "TIM14",  blockLo := 0x40002000, blockHi := 0x40002400, gateAddr := 0x4002101C, gateBit := 8 },
+  { name := "WWDG",   blockLo := 0x40002C00, blockHi := 0x40003000, gateAddr := 0x4002101C, gateBit := 11 },
+  { name := "SPI2",   blockLo := 0x40003800, blockHi := 0x40003C00, gateAddr := 0x4002101C, gateBit := 14 },
+  { name := "SPI3",   blockLo := 0x40003C00, blockHi := 0x40004000, gateAddr := 0x4002101C, gateBit := 15 },
+  { name := "USART2", blockLo := 0x40004400, blockHi := 0x40004800, gateAddr := 0x4002101C, gateBit := 17 },
+  { name := "USART3", blockLo := 0x40004800, blockHi := 0x40004C00, gateAddr := 0x4002101C, gateBit := 18 },
+  { name := "UART4",  blockLo := 0x40004C00, blockHi := 0x40005000, gateAddr := 0x4002101C, gateBit := 19 },
+  { name := "UART5",  blockLo := 0x40005000, blockHi := 0x40005400, gateAddr := 0x4002101C, gateBit := 20 },
+  { name := "I2C1",   blockLo := 0x40005400, blockHi := 0x40005800, gateAddr := 0x4002101C, gateBit := 21 },
+  { name := "I2C2",   blockLo := 0x40005800, blockHi := 0x40005C00, gateAddr := 0x4002101C, gateBit := 22 },
+  { name := "USB",    blockLo := 0x40005C00, blockHi := 0x40006000, gateAddr := 0x4002101C, gateBit := 23 },
+  { name := "CAN1",   blockLo := 0x40006400, blockHi := 0x40006800, gateAddr := 0x4002101C, gateBit := 25 },
+  { name := "BKP",    blockLo := 0x40006C00, blockHi := 0x40007000, gateAddr := 0x4002101C, gateBit := 27 },
+  { name := "PWR",    blockLo := 0x40007000, blockHi := 0x40007400, gateAddr := 0x4002101C, gateBit := 28 },
+  { name := "DAC",    blockLo := 0x40007400, blockHi := 0x40007800, gateAddr := 0x4002101C, gateBit := 29 },
+  { name := "DMA1",   blockLo := 0x40020000, blockHi := 0x40020400, gateAddr := 0x40021014, gateBit := 0 },
+  { name := "DMA2",   blockLo := 0x40020400, blockHi := 0x40020800, gateAddr := 0x40021014, gateBit := 1 },
+  { name := "CRC",    blockLo := 0x40023000, blockHi := 0x40023400, gateAddr := 0x40021014, gateBit := 6 },
+  { name := "SDIO",   blockLo := 0x40018000, blockHi := 0x40018400, gateAddr := 0x40021014, gateBit := 10 }
+]
+
+/-- STM32F4 (RM0090) peripheral blocks and their RCC gates. -/
+def f4ClockGates : List ClockGate := [
+  { name := "TIM2",   blockLo := 0x40000000, blockHi := 0x40000400, gateAddr := 0x40023840, gateBit := 0 },
+  { name := "TIM3",   blockLo := 0x40000400, blockHi := 0x40000800, gateAddr := 0x40023840, gateBit := 1 },
+  { name := "TIM4",   blockLo := 0x40000800, blockHi := 0x40000C00, gateAddr := 0x40023840, gateBit := 2 },
+  { name := "TIM5",   blockLo := 0x40000C00, blockHi := 0x40001000, gateAddr := 0x40023840, gateBit := 3 },
+  { name := "TIM6",   blockLo := 0x40001000, blockHi := 0x40001400, gateAddr := 0x40023840, gateBit := 4 },
+  { name := "TIM7",   blockLo := 0x40001400, blockHi := 0x40001800, gateAddr := 0x40023840, gateBit := 5 },
+  { name := "TIM12",  blockLo := 0x40001800, blockHi := 0x40001C00, gateAddr := 0x40023840, gateBit := 6 },
+  { name := "TIM13",  blockLo := 0x40001C00, blockHi := 0x40002000, gateAddr := 0x40023840, gateBit := 7 },
+  { name := "TIM14",  blockLo := 0x40002000, blockHi := 0x40002400, gateAddr := 0x40023840, gateBit := 8 },
+  { name := "WWDG",   blockLo := 0x40002C00, blockHi := 0x40003000, gateAddr := 0x40023840, gateBit := 11 },
+  { name := "SPI2",   blockLo := 0x40003800, blockHi := 0x40003C00, gateAddr := 0x40023840, gateBit := 14 },
+  { name := "SPI3",   blockLo := 0x40003C00, blockHi := 0x40004000, gateAddr := 0x40023840, gateBit := 15 },
+  { name := "USART2", blockLo := 0x40004400, blockHi := 0x40004800, gateAddr := 0x40023840, gateBit := 17 },
+  { name := "USART3", blockLo := 0x40004800, blockHi := 0x40004C00, gateAddr := 0x40023840, gateBit := 18 },
+  { name := "UART4",  blockLo := 0x40004C00, blockHi := 0x40005000, gateAddr := 0x40023840, gateBit := 19 },
+  { name := "UART5",  blockLo := 0x40005000, blockHi := 0x40005400, gateAddr := 0x40023840, gateBit := 20 },
+  { name := "I2C1",   blockLo := 0x40005400, blockHi := 0x40005800, gateAddr := 0x40023840, gateBit := 21 },
+  { name := "I2C2",   blockLo := 0x40005800, blockHi := 0x40005C00, gateAddr := 0x40023840, gateBit := 22 },
+  { name := "I2C3",   blockLo := 0x40005C00, blockHi := 0x40006000, gateAddr := 0x40023840, gateBit := 23 },
+  { name := "CAN1",   blockLo := 0x40006400, blockHi := 0x40006800, gateAddr := 0x40023840, gateBit := 25 },
+  { name := "CAN2",   blockLo := 0x40006800, blockHi := 0x40006C00, gateAddr := 0x40023840, gateBit := 26 },
+  { name := "PWR",    blockLo := 0x40007000, blockHi := 0x40007400, gateAddr := 0x40023840, gateBit := 28 },
+  { name := "DAC",    blockLo := 0x40007400, blockHi := 0x40007800, gateAddr := 0x40023840, gateBit := 29 },
+  { name := "TIM1",   blockLo := 0x40010000, blockHi := 0x40010400, gateAddr := 0x40023844, gateBit := 0 },
+  { name := "TIM8",   blockLo := 0x40010400, blockHi := 0x40010800, gateAddr := 0x40023844, gateBit := 1 },
+  { name := "USART1", blockLo := 0x40011000, blockHi := 0x40011400, gateAddr := 0x40023844, gateBit := 4 },
+  { name := "USART6", blockLo := 0x40011400, blockHi := 0x40011800, gateAddr := 0x40023844, gateBit := 5 },
+  { name := "ADC1",   blockLo := 0x40012000, blockHi := 0x40012400, gateAddr := 0x40023844, gateBit := 8 },
+  { name := "ADC2",   blockLo := 0x40012400, blockHi := 0x40012800, gateAddr := 0x40023844, gateBit := 9 },
+  { name := "ADC3",   blockLo := 0x40012800, blockHi := 0x40012C00, gateAddr := 0x40023844, gateBit := 10 },
+  { name := "SDIO",   blockLo := 0x40012C00, blockHi := 0x40013000, gateAddr := 0x40023844, gateBit := 11 },
+  { name := "SPI1",   blockLo := 0x40013000, blockHi := 0x40013400, gateAddr := 0x40023844, gateBit := 12 },
+  { name := "SYSCFG", blockLo := 0x40013800, blockHi := 0x40013C00, gateAddr := 0x40023844, gateBit := 14 },
+  { name := "TIM9",   blockLo := 0x40014000, blockHi := 0x40014400, gateAddr := 0x40023844, gateBit := 16 },
+  { name := "TIM10",  blockLo := 0x40014400, blockHi := 0x40014800, gateAddr := 0x40023844, gateBit := 17 },
+  { name := "TIM11",  blockLo := 0x40014800, blockHi := 0x40014C00, gateAddr := 0x40023844, gateBit := 18 },
+  { name := "GPIOA",  blockLo := 0x40020000, blockHi := 0x40020400, gateAddr := 0x40023830, gateBit := 0 },
+  { name := "GPIOB",  blockLo := 0x40020400, blockHi := 0x40020800, gateAddr := 0x40023830, gateBit := 1 },
+  { name := "GPIOC",  blockLo := 0x40020800, blockHi := 0x40020C00, gateAddr := 0x40023830, gateBit := 2 },
+  { name := "GPIOD",  blockLo := 0x40020C00, blockHi := 0x40021000, gateAddr := 0x40023830, gateBit := 3 },
+  { name := "GPIOE",  blockLo := 0x40021000, blockHi := 0x40021400, gateAddr := 0x40023830, gateBit := 4 },
+  { name := "GPIOF",  blockLo := 0x40021400, blockHi := 0x40021800, gateAddr := 0x40023830, gateBit := 5 },
+  { name := "GPIOG",  blockLo := 0x40021800, blockHi := 0x40021C00, gateAddr := 0x40023830, gateBit := 6 },
+  { name := "GPIOH",  blockLo := 0x40021C00, blockHi := 0x40022000, gateAddr := 0x40023830, gateBit := 7 },
+  { name := "CRC",    blockLo := 0x40023000, blockHi := 0x40023400, gateAddr := 0x40023830, gateBit := 12 },
+  { name := "DMA1",   blockLo := 0x40026000, blockHi := 0x40026400, gateAddr := 0x40023830, gateBit := 21 },
+  { name := "DMA2",   blockLo := 0x40026400, blockHi := 0x40026800, gateAddr := 0x40023830, gateBit := 22 }
+]
+
+/-- The RCC gate registers per chip (STOREs to these activate the map). -/
+def f1GateAddrs : List Nat := [0x40021014, 0x40021018, 0x4002101C]
+def f4GateAddrs : List Nat := [0x40023830, 0x40023840, 0x40023844]
+
+/-- A gate register counts as touched only by an MMIO STORE to it
+    (a LOAD of the gate register enables nothing). -/
+def gateTouched (trace : List MmioAccess) (gate : Nat) : Bool :=
+  trace.any fun a => a.isStore && decide (a.kind = .mmio) && a.addr == gate
+
+/-- Active maps, by gate touch (see the header comment for why this
+    gating exists and what it costs). -/
+def activeClockGates (trace : List MmioAccess) : List ClockGate :=
+  (if f1GateAddrs.any fun g => gateTouched trace g then f1ClockGates else []) ++
+  (if f4GateAddrs.any fun g => gateTouched trace g then f4ClockGates else [])
+
+/-- All mapped gates covering one address (usually exactly one; more
+    only when both chips' maps are active). -/
+def gatesFor (gates : List ClockGate) (addr : Nat) : List ClockGate :=
+  gates.filter fun g => decide (g.blockLo ≤ addr) && decide (addr < g.blockHi)
+
+/-- One clock-enable violation: the first use of a peripheral whose
+    gate register is never STORE-touched, with the gate that should
+    have been touched. Only the first use per (peripheral, block) is
+    reported, so the line stays readable when a peripheral is used
+    hundreds of times. -/
+structure ClockViolation where
+  access : MmioAccess
+  gate : ClockGate
+  deriving Repr, DecidableEq, Inhabited
+
+def clockViolationsGo : List MmioAccess → List MmioAccess → List (String × Nat) → List ClockGate → List ClockViolation
+  | [], _, _, _ => []
+  | a :: rest, trace, seen, gates =>
+    if decide (a.kind = .mmio) then
+      match gatesFor gates a.addr with
+      | [] => clockViolationsGo rest trace seen gates
+      | g :: gs =>
+        if (g :: gs).any fun gg => gateTouched trace gg.gateAddr then
+          clockViolationsGo rest trace seen gates
+        else if seen.contains (g.name, g.blockLo) then
+          clockViolationsGo rest trace seen gates
+        else
+          { access := a, gate := g } ::
+            clockViolationsGo rest trace ((g.name, g.blockLo) :: seen) gates
+    else clockViolationsGo rest trace seen gates
+
+/-- The clock-enable violations of a must trace (empty = pass). -/
+def clockEnableViolations (trace : List MmioAccess) : List ClockViolation :=
+  clockViolationsGo trace trace [] (activeClockGates trace)
+
+/-- Clock-enable check: true iff no violation. -/
+def checkClockEnable (trace : List MmioAccess) : Bool :=
+  (clockEnableViolations trace).isEmpty
+
+/-- Non-vacuity: a GPIOA use with only an APB1 gate touched (APB2 never
+    touched) fails — the synthetic-control shape. -/
+example : checkClockEnable [
+  { isStore := true, func := "main", addr := 0x4002101C, ones := 2, zeroes := 0 },
+  { isStore := true, func := "main", addr := 0x4001080C, ones := 1, zeroes := 0 }
+] = false := rfl
+
+/-- ... and the same use with its own family's gate touched passes. -/
+example : checkClockEnable [
+  { isStore := true, func := "main", addr := 0x40021018, ones := 4, zeroes := 0 },
+  { isStore := true, func := "main", addr := 0x4001080C, ones := 1, zeroes := 0 }
+] = true := rfl

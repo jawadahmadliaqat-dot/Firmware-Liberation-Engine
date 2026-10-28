@@ -5,7 +5,10 @@
   firmware-agnostic invariants (non-empty trace, consistent masks,
   MMIO addresses inside the bands, port/MSR sanity, port/MSR
   confinement against the architectural allowlist for the report's
-  language). Bmp and blink modes are untouched by confinement: their
+  language) plus the clock-enable check (every used STM32
+  peripheral's gate register touched; vacuous unless an STM32 RCC
+  gate register is STORE-touched, so non-STM32 reports are
+  unaffected). Bmp and blink modes are untouched by confinement: their
   reports (ARM) carry no port/MSR entries, so the check would be
   vacuous there, and their code paths do not call it.
   The trace is unified: "trace ops" counts MMIO + port + MSR ops
@@ -51,7 +54,14 @@ def printGeneric (lang : Option String) (windows : List (Nat × Nat)) (trace : L
     let names := violations.map fun a =>
       s!"{a.func} {kindName a.kind} {natToHex a.addr}"
     IO.println s!"confinement violations: {names}"
-  pure (nonempty && masks && window && sanity && confined)
+  let clock := checkClockEnable trace
+  IO.println s!"clock-enable (every used peripheral's gate register touched): {clock}"
+  let clockVios := clockEnableViolations trace
+  if !clockVios.isEmpty then
+    let names := clockVios.map fun v =>
+      s!"{v.access.func} {kindName v.access.kind} {natToHex v.access.addr} ({v.gate.name} needs {natToHex v.gate.gateAddr} bit {v.gate.gateBit})"
+    IO.println s!"clock-enable violations: {names}"
+  pure (nonempty && masks && window && sanity && confined && clock)
 
 def printBmp (trace : List MmioAccess) (mayTrace : List MmioAccess) : IO Bool := do
   let generic := checkGeneric trace
