@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STM32F4 UART — Firmware Liberation Engine</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<p class="back"><a href="index.html">&larr; All reports</a></p>
+<h2>STM32F4 UART <span class="badge pass">PASS</span></h2>
+<p>UART two-boards polling example from STM32CubeF4 (STM32F4-Discovery, STM32F407VG), transmitter build, built from public source. Canonical numbers below are the -O0 build.</p>
+<table class="stats">
+<tr><th>Fixed MMIO (-O0)</th><td>150</td></tr>
+<tr><th>Fixed MMIO (-O2 diagnostic)</th><td>169</td></tr>
+<tr><th>May accesses</th><td>0 sites / 0 addresses</td></tr>
+<tr><th>Port / MSR</th><td>0 / 0</td></tr>
+<tr><th>Extractor version</th><td>v3.12</td></tr>
+<tr><th>Lean mode</th><td>generic (STM32F4 has no bmp driver families)</td></tr>
+<tr><th>Classifier (-O0, SVD profile)</th><td>143 known / 7 suspect (bit-band aliases, all explained)</td></tr>
+</table>
+<h3>Lean log (verdict lines, -O0)</h3>
+<pre>trace ops: 150
+may trace ops: 0
+VERDICT: PASS</pre>
+<p>Diagnostic -O2 build: trace 169, VERDICT: PASS.</p>
+<h3>Ground truth</h3>
+<p>150/150 code-true, 0 unexplained extras. Per-peripheral (-O0): RCC 116, on-chip memory-interface 12, PWR 7, EXTI 8 (interrupt-mode branch only), RCC bit-band aliases 7. The -O2 build additionally recovers GPIOA 11 + GPIOD 11.</p>
+<div class="note"><b>Named misses, stated plainly.</b> (1) GPIO data plane at -O0: parameters spilled to stack slots defeat the must-transfer; recovered at -O2. (2) USART2 data plane at BOTH builds: the HAL handle-struct pattern (handle instance stored to RAM in main, loaded back in every UART function) defeats global seeding. Generic PASS means only that what was found stayed in-window.</div>
+<h3>Provenance</h3>
+<p>Source: STM32CubeF4, UART_TwoBoards_ComPolling (superproject HEAD 60c8abe0; HAL 1f6451c3, BSP 49fcaf44, CMSIS-Device 9192c7b9). SVD: Keil STM32F4xx_DFP 3.1.1 pack, STM32F407.svd (SHA-256 58787085&hellip;), 76 blocks via pure SVD import. Toolchain: arm-none-eabi-gcc 13.2.1, -O0 -g. Built ELF MD5: b17aa045ed2465a46611fe80e709192b.</p>
+</main>
+<footer class="disclaimer"><div>This is a static proof tool. It does not execute firmware and does not claim to find all vulnerabilities. PASS does not mean firmware is secure.</div></footer>
+</body>
+</html>

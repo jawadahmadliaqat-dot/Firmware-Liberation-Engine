@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Black Magic Probe v2.0.0 — Firmware Liberation Engine</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<p class="back"><a href="index.html">&larr; All reports</a></p>
+<h2>Black Magic Probe v2.0.0 <span class="badge pass">PASS</span></h2>
+<p>The canonical real firmware for this engine: the official v2.0.0 release binary for the STM32F1-based Black Magic Probe, analyzed end to end and checked against its public source.</p>
+<table class="stats">
+<tr><th>Fixed MMIO</th><td>423</td></tr>
+<tr><th>May accesses</th><td>7 sites / 13 addresses</td></tr>
+<tr><th>Port / MSR</th><td>0 / 0</td></tr>
+<tr><th>Extractor version</th><td>v3.12</td></tr>
+<tr><th>Lean mode</th><td>bmp</td></tr>
+<tr><th>Classifier (STM32F1 profile)</th><td>423 known / 0 suspects; may 13 known / 0 suspects</td></tr>
+<tr><th>Unresolved indirect calls</th><td>19 (classified: libc/stdio, parameter callbacks, vector table)</td></tr>
+</table>
+<h3>Lean log (verdict lines)</h3>
+<pre>trace ops: 423
+trace ops by kind (mmio, port, msr): (423, 0, 0)
+may trace ops: 13
+driver confinement (each family touches only its own peripherals): true
+may confinement (every possible address within its family): true
+VERDICT: PASS</pre>
+<h3>Ground truth</h3>
+<p>Source cross-check against the public BMP v2.0.0 source and libopencm3: at the v3.6 stage, field truth was 116/116 (100%). Later additions were spot-checked against source, including libopencm3 parameter helpers (for example DMA channel-5 registers via <code>dma_channel_reset</code>) and the ADC1_CR2 read in <code>adc_is_calibrating</code> added by callee clobber refinement in v3.12. No finding has been lost across versions; counts moved 235 &rarr; 346 &rarr; 422 &rarr; 423 as analyses improved.</p>
+<h3>Provenance</h3>
+<p>Binary: official Black Magic Probe v2.0.0 release ELF (1,230,888 bytes, MD5 fa07d791edffdaec79be3c92d5d8373a). ARM Cortex-M, not stripped, with debug info. Profiles: hand-written STM32F1 profile, reproduced by the CMSIS-SVD importer (53 blocks). Source: public BMP repository (v2.0.0) and libopencm3.</p>
+<div class="note"><b>Known limits.</b> Stripped builds of this binary must use generic mode only: bmp mode passes vacuously on stripped input (function names are lost) and proves nothing. The engine reports what code can touch, not only what runs.</div>
+</main>
+<footer class="disclaimer"><div>This is a static proof tool. It does not execute firmware and does not claim to find all vulnerabilities. PASS does not mean firmware is secure.</div></footer>
+</body>
+</html>

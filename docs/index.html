@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Firmware Liberation Engine — Reports</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="hero">
+<h1>Formal proof of what your firmware really touches.</h1>
+<p>Ghidra lifts firmware to P-Code. ExtractIR extracts MMIO, port, MSR, protocol and BAR facts. A Lean 4 verifier checks whether every recovered access stays inside its allowed window and peripheral family. This site shows only real, trimmed reports. It does not run firmware.</p>
+</header>
+<main>
+<p>How to read a card: <b>fixed</b> = accesses the engine is certain about; <b>may</b> = accesses that are possible but not certain; <b>verdict</b> = the Lean checker's answer on the recovered accesses. A PASS means only that what was found stayed inside its allowed window. It is not proof the extraction is complete.</p>
+<p>Real firmware, real violations: none so far.</p>
+
+<h2>Real firmware</h2>
+<div class="grid">
+<div class="card">
+<h3><a href="bmp.html">Black Magic Probe v2.0.0</a></h3>
+<p><span class="badge pass">PASS</span> bmp mode</p>
+<p>Fixed MMIO: <b>423</b> &middot; May: <b>13 addresses</b></p>
+<p>Extractor v3.12 &middot; STM32F1, ARM Cortex-M</p>
+<p>The canonical real firmware: official v2.0.0 release, source cross-checked.</p>
+</div>
+<div class="card">
+<h3><a href="rp2040.html">RP2040 hello_uart</a></h3>
+<p><span class="badge pass">PASS</span> generic mode</p>
+<p>Fixed MMIO: <b>198</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; pico-examples, built from source</p>
+<p>Ground truth 198/198 code-true, with two named blind spots.</p>
+</div>
+<div class="card">
+<h3><a href="stm32f4.html">STM32F4 UART</a></h3>
+<p><span class="badge pass">PASS</span> generic mode</p>
+<p>Fixed MMIO: <b>150</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; STM32CubeF4, built from source (-O0)</p>
+<p>Diagnostic -O2 build: 169. GPIO and USART2 misses documented.</p>
+</div>
+<div class="card">
+<h3><a href="nrf52.html">nRF52 UART</a></h3>
+<p><span class="badge pass">PASS</span> generic mode</p>
+<p>Fixed MMIO: <b>182</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; nRF5 SDK 17.1.0, nRF52832, built from source</p>
+<p>Ground truth 182/182 code-true. UART TX path missed (stack spill).</p>
+</div>
+<div class="card">
+<h3><a href="tinyusb.html">TinyUSB cdc_msc</a></h3>
+<p><span class="badge pass">PASS</span> generic mode</p>
+<p>Fixed MMIO: <b>224</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; TinyUSB on Raspberry Pi Pico, built from source</p>
+<p>CDC + MSC device example. SIO LED and DPRAM payload misses documented.</p>
+</div>
+<div class="card">
+<h3><a href="zephyr.html">Zephyr echo_bot</a></h3>
+<p><span class="badge pass">PASS</span> generic mode</p>
+<p>Fixed MMIO: <b>126</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; Zephyr v4.4.2, nRF52840 DK, built from source</p>
+<p>Ground truth 126/126 code-true. Entire UARTE driver layer missed — see detail page.</p>
+</div>
+</div>
+
+<h2>OVMF / EDK2 drivers (UEFI)</h2>
+<p>Fixed 0 because BAR is runtime, provenance recovered. These drivers reach hardware through protocols and runtime-discovered BAR bases, not fixed-band MMIO, so fixed-band MMIO is 0 by design. What the engine does recover is port I/O and protocol-call provenance.</p>
+<div class="grid">
+<div class="card">
+<h3><a href="ovmf-dxecore.html">DxeCore</a></h3>
+<p><span class="badge pass">PASS</span> generic mode</p>
+<p>Fixed MMIO: <b>0</b> &middot; Port: <b>11</b> &middot; MSR: <b>1</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; Trace 12</p>
+<p>Fixed 0 because BAR is runtime, provenance recovered.</p>
+</div>
+<div class="card">
+<h3><a href="ovmf-pcibus.html">PciBusDxe</a></h3>
+<p><span class="badge pass">PASS</span> generic mode</p>
+<p>Fixed MMIO: <b>0</b> &middot; Port: <b>2</b> &middot; MSR: <b>0</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; Trace 2 &middot; Protocol edges 50</p>
+<p>Fixed 0 because BAR is runtime, provenance recovered.</p>
+</div>
+<div class="card">
+<h3><a href="ovmf-pcihostbridge.html">PciHostBridgeDxe</a></h3>
+<p><span class="badge fail">FAIL</span> generic mode, confinement only</p>
+<p>Fixed MMIO: <b>0</b> &middot; Port: <b>7</b> &middot; MSR: <b>1</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; Trace 8</p>
+<p>FAIL names only ports 0x514 / 0x518, outside the architectural allowlist. Device unidentified.</p>
+</div>
+<div class="card">
+<h3><a href="ovmf-qemuvideo.html">QemuVideoDxe (PE)</a></h3>
+<p><span class="badge pass">PASS</span> generic mode</p>
+<p>Fixed MMIO: <b>0</b> &middot; Port: <b>3</b> &middot; MSR: <b>0</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; Trace 3</p>
+<p>Fixed 0 because BAR is runtime, provenance recovered.</p>
+</div>
+<div class="card">
+<h3><a href="ovmf-qemuvideo-te.html">QemuVideoDxe (TE)</a></h3>
+<p><span class="badge pass">PASS</span> generic mode</p>
+<p>Fixed MMIO: <b>0</b> &middot; Port: <b>3</b> &middot; MSR: <b>0</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; Trace 3 &middot; TE loader parity with PE</p>
+<p>Fixed 0 because BAR is runtime, provenance recovered.</p>
+</div>
+<div class="card">
+<h3><a href="ovmf-sata.html">SataControllerDxe</a></h3>
+<p><span class="badge fail">FAIL</span> genuinely-empty trace</p>
+<p>Fixed MMIO: <b>0</b> &middot; Port: <b>0</b> &middot; MSR: <b>0</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; Trace 0</p>
+<p>No fixed findings recovered. Not a bug report — an empty result, stated plainly.</p>
+</div>
+<div class="card">
+<h3><a href="ovmf-virtio.html">VirtioBlkDxe</a></h3>
+<p><span class="badge fail">FAIL</span> genuinely-empty trace</p>
+<p>Fixed MMIO: <b>0</b> &middot; Port: <b>0</b> &middot; MSR: <b>0</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; Trace 0</p>
+<p>No fixed findings recovered. Not a bug report — an empty result, stated plainly.</p>
+</div>
+</div>
+
+<h2>Synthetic Confinement Demo</h2>
+<p>Purpose-built synthetic firmware that demonstrates what a Lean FAIL looks like. These are demonstrations of the checker, not real firmware and not reports about any real product.</p>
+<div class="grid">
+<div class="card">
+<h3><a href="syndemo-driver.html">Shape 1: Driver confinement</a></h3>
+<p><span class="badge synth">SYNTHETIC</span> <span class="badge fail">FAIL by design</span></p>
+<p>Fixed MMIO: <b>4</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; bmp mode</p>
+<p>An rcc-family function touches GPIOA, outside its allowed range.</p>
+</div>
+<div class="card">
+<h3><a href="syndemo-port.html">Shape 2: Port confinement</a></h3>
+<p><span class="badge synth">SYNTHETIC</span> <span class="badge fail">FAIL by design</span></p>
+<p>Fixed port: <b>1</b> (0x1234) &middot; May: <b>0</b></p>
+<p>Extractor v3.12 &middot; generic mode</p>
+<p>Built firmware writes to port 0x1234, outside the architectural allowlist.</p>
+</div>
+</div>
+</main>
+<footer class="disclaimer"><div>This is a static proof tool. It does not execute firmware and does not claim to find all vulnerabilities. PASS does not mean firmware is secure.</div></footer>
+<footer>Source: <a href="https://github.com/jawadahmadliaqat-dot/firmware-liberation-engine">firmware-liberation-engine</a> (MIT). Reports on this site are trimmed summaries, not full analysis files.</footer>
+</body>
+</html>

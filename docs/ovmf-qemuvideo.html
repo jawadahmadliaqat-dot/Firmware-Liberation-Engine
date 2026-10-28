@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QemuVideoDxe (PE) — Firmware Liberation Engine</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<p class="back"><a href="index.html">&larr; All reports</a></p>
+<h2>QemuVideoDxe, PE image (OVMF) <span class="badge pass">PASS</span></h2>
+<p>UEFI QEMU video driver from the OVMF corpus (EDK2 2025.11), PE image. Fixed 0 because BAR is runtime, provenance recovered.</p>
+<table class="stats">
+<tr><th>Fixed MMIO</th><td>0</td></tr>
+<tr><th>Port</th><td>3</td></tr>
+<tr><th>MSR</th><td>0</td></tr>
+<tr><th>May accesses</th><td>0</td></tr>
+<tr><th>Protocol-call edges</th><td>4</td></tr>
+<tr><th>Unresolved indirect calls</th><td>2</td></tr>
+<tr><th>Extractor version</th><td>v3.12</td></tr>
+<tr><th>Lean mode</th><td>generic</td></tr>
+</table>
+<h3>Lean log (verdict lines)</h3>
+<pre>trace ops: 3
+trace ops by kind (mmio, port, msr): (0, 3, 0)
+may trace ops: 0
+port/MSR confinement (every port/MSR in the architectural allowlist): true
+VERDICT: PASS</pre>
+<h3>What was recovered</h3>
+<p>PCI config cycles: the generic helper's input at 000016d6 resolves per site to CF8 and CFC (two findings at one instruction, one per call-site value), plus the pre-existing CF8 output at 0000174a. This resolution needed two analyses together: per-site binding supplied the two values, and callee clobber refinement preserved the port argument across the intervening call (v3.12). Fixed-band MMIO is 0 because the driver's config addresses are parameter-computed and its BAR bases arrive at runtime.</p>
+<h3>Provenance</h3>
+<p>Source: Ubuntu package ovmf-generic 2025.11-3ubuntu7.3, EDK2 2025.11. PE image, 13 functions. No BAR-relative findings: BAR bases arrive at runtime as hardware inputs.</p>
+</main>
+<footer class="disclaimer"><div>This is a static proof tool. It does not execute firmware and does not claim to find all vulnerabilities. PASS does not mean firmware is secure.</div></footer>
+</body>
+</html>

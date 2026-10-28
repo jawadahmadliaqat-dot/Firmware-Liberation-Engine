@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synthetic Confinement Demo, Shape 1 — Firmware Liberation Engine</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<p class="back"><a href="index.html">&larr; All reports</a></p>
+<h2>Synthetic Confinement Demo, Shape 1: Driver confinement <span class="badge synth">SYNTHETIC</span> <span class="badge fail">FAIL by design</span></h2>
+<p><b>SYNTHETIC — read this first.</b> Everything on this page is purpose-built synthetic firmware, made only to demonstrate what a Lean FAIL looks like. It is not a real firmware, not a real driver, and not a vulnerability in any real product. No real violation has been found yet — this demo is synthetic.</p>
+<table class="stats">
+<tr><th>Fixed MMIO</th><td>4</td></tr>
+<tr><th>May accesses</th><td>0 sites / 0 addresses</td></tr>
+<tr><th>Port / MSR</th><td>0 / 0</td></tr>
+<tr><th>Extractor version</th><td>v3.12</td></tr>
+<tr><th>Lean mode</th><td>bmp</td></tr>
+</table>
+<h3>Lean log (verdict lines)</h3>
+<pre>trace ops: 4
+trace ops by kind (mmio, port, msr): (4, 0, 0)
+may trace ops: 0
+generic invariants: true
+driver confinement (each family touches only its own peripherals): false
+may confinement (every possible address within its family): true
+VERDICT: FAIL</pre>
+<h3>Why it fails</h3>
+<p>Lean bmp mode assigns a driver family by function-name prefix. A name starting with <code>rcc_</code> belongs to the rcc family, whose only allowed range is 0x40021000&ndash;0x40021400 (the STM32F1 RCC block). The synthetic function <code>rcc_syndemo_touch</code> loads and stores GPIOA output data at 0x4001080c — outside that range. Only driver confinement fails; the other two fixed entries (function <code>main</code>, 0x40021000) match no family prefix and are unconstrained. Control build (same firmware, address replaced with in-family 0x40021004): Lean bmp PASS, driver confinement true. The FAIL is therefore attributable to the out-of-family address alone.</p>
+<div class="note"><b>Display gap, not a proof gap.</b> Lean bmp prints only the boolean driver-confinement line, not the violating entry's name. The entry above is identified from the report JSON. The FAIL is decided by the confinement check alone.</div>
+<h3>Provenance</h3>
+<p>Source: purpose-built C (violation + control). Toolchain: arm-none-eabi-gcc, -mcpu=cortex-m3 -mthumb -g -O0 -nostdlib. Violation ELF MD5: 8dd99183f3f20f5b900f630b21e05cb1. Control ELF MD5: 7e34119a6a0a6fe35faa6bcd1b05c305. Fixture copies: <code>targets/arm_syndemo_driver/</code> in the repository.</p>
+</main>
+<footer class="disclaimer"><div>This is a static proof tool. It does not execute firmware and does not claim to find all vulnerabilities. PASS does not mean firmware is secure.</div></footer>
+</body>
+</html>

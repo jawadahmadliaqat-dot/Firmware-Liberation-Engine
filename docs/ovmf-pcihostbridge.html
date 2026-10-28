@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PciHostBridgeDxe — Firmware Liberation Engine</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<p class="back"><a href="index.html">&larr; All reports</a></p>
+<h2>PciHostBridgeDxe (OVMF) <span class="badge fail">FAIL</span></h2>
+<p>UEFI PCI host-bridge driver from the OVMF corpus (EDK2 2025.11). This card shows FAIL, and the reason is stated, not hidden. Fixed 0 because BAR is runtime, provenance recovered.</p>
+<table class="stats">
+<tr><th>Fixed MMIO</th><td>0</td></tr>
+<tr><th>Port</th><td>7</td></tr>
+<tr><th>MSR</th><td>1</td></tr>
+<tr><th>May accesses</th><td>0</td></tr>
+<tr><th>Protocol-call edges</th><td>9</td></tr>
+<tr><th>Unresolved indirect calls</th><td>23</td></tr>
+<tr><th>Extractor version</th><td>v3.12</td></tr>
+<tr><th>Lean mode</th><td>generic</td></tr>
+</table>
+<h3>Lean log (verdict lines)</h3>
+<pre>trace ops: 8
+trace ops by kind (mmio, port, msr): (0, 7, 1)
+may trace ops: 0
+port/MSR confinement (every port/MSR in the architectural allowlist): false
+confinement violations: [FUN_00001bac port 0x514, FUN_00001bac port 0x518]
+VERDICT: FAIL</pre>
+<h3>Why it fails — and what it does not mean</h3>
+<p>The FAIL is on confinement only, and it names exactly two ports: 0x514 and 0x518, both written by the generic I/O helper <code>FUN_00001bac</code>. The values are literal immediates at real call sites, faithfully recovered from the binary — not inferred. The other five ports pass: 0x0 (legacy DMA range), CF8/CFC (PCI config range), and the MSR read is SEV_STATUS (0xC0010131, allowlisted). The device behind ports 0x514/0x518 has <b>not</b> been identified from the binary, so the allowlist has <b>not</b> been extended to cover them. Extending it is a separate decision that requires identifying that device first. This FAIL is the confinement check doing its job on genuine new findings — it is not a claim that the driver is malicious, and it is not hidden to keep the page green.</p>
+<h3>Provenance</h3>
+<p>Source: Ubuntu package ovmf-generic 2025.11-3ubuntu7.3, EDK2 2025.11. PE image, 52 functions. No BAR-relative findings: BAR bases arrive at runtime as hardware inputs.</p>
+</main>
+<footer class="disclaimer"><div>This is a static proof tool. It does not execute firmware and does not claim to find all vulnerabilities. PASS does not mean firmware is secure.</div></footer>
+</body>
+</html>

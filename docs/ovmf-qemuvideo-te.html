@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QemuVideoDxe (TE) — Firmware Liberation Engine</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<p class="back"><a href="index.html">&larr; All reports</a></p>
+<h2>QemuVideoDxe, TE image (OVMF) <span class="badge pass">PASS</span></h2>
+<p>UEFI QEMU video driver from the OVMF corpus (EDK2 2025.11), TE ("VZ") image, loaded with the engine's custom TE loader. Fixed 0 because BAR is runtime, provenance recovered.</p>
+<table class="stats">
+<tr><th>Fixed MMIO</th><td>0</td></tr>
+<tr><th>Port</th><td>3</td></tr>
+<tr><th>MSR</th><td>0</td></tr>
+<tr><th>May accesses</th><td>0</td></tr>
+<tr><th>Protocol-call edges</th><td>4</td></tr>
+<tr><th>Unresolved indirect calls</th><td>2</td></tr>
+<tr><th>Extractor version</th><td>v3.12</td></tr>
+<tr><th>Lean mode</th><td>generic</td></tr>
+</table>
+<h3>Lean log (verdict lines)</h3>
+<pre>trace ops: 3
+trace ops by kind (mmio, port, msr): (0, 3, 0)
+may trace ops: 0
+port/MSR confinement (every port/MSR in the architectural allowlist): true
+VERDICT: PASS</pre>
+<h3>What was recovered</h3>
+<p>Full PE parity: 13 functions, the same 3 port findings (CF8/CFC input per site plus CF8 output), the same 4 protocol edges, the same 2 unresolved calls — access sets identical to the PE twin. The only difference is the entry function's name (loader-assigned vs PE's own name). The TE loader parses the TE header per the UEFI PI spec, maps sections exactly from file bytes, and applies no relocations.</p>
+<h3>Provenance</h3>
+<p>Source: Ubuntu package ovmf-generic 2025.11-3ubuntu7.3, EDK2 2025.11. TE image. No BAR-relative findings: BAR bases arrive at runtime as hardware inputs.</p>
+</main>
+<footer class="disclaimer"><div>This is a static proof tool. It does not execute firmware and does not claim to find all vulnerabilities. PASS does not mean firmware is secure.</div></footer>
+</body>
+</html>

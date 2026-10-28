@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synthetic Confinement Demo, Shape 2 — Firmware Liberation Engine</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<p class="back"><a href="index.html">&larr; All reports</a></p>
+<h2>Synthetic Confinement Demo, Shape 2: Port confinement <span class="badge synth">SYNTHETIC</span> <span class="badge fail">FAIL by design</span></h2>
+<p><b>SYNTHETIC — read this first.</b> Everything on this page is purpose-built synthetic firmware, made only to demonstrate what a Lean FAIL looks like. It is not a real firmware, not a real driver, and not a vulnerability in any real product. No real violation has been found yet — this demo is synthetic.</p>
+<table class="stats">
+<tr><th>Fixed MMIO</th><td>0</td></tr>
+<tr><th>Fixed port</th><td>1 (0x1234)</td></tr>
+<tr><th>May accesses</th><td>0 sites / 0 addresses</td></tr>
+<tr><th>Extractor version</th><td>v3.12</td></tr>
+<tr><th>Lean mode</th><td>generic</td></tr>
+</table>
+<h3>Lean log (verdict lines)</h3>
+<pre>trace non-empty: true
+masks consistent: true
+all addresses in MMIO window: true
+port/MSR sanity: true
+port/MSR confinement: false
+confinement violations: [syndemo_bad_port port 0x1234]
+VERDICT: FAIL</pre>
+<h3>Why it fails</h3>
+<p>Lean generic mode checks every port against an architectural allowlist keyed by the report's language (x86-64). Port 0x1234 is in no architectural range: not PCI config 0xCF8&ndash;0xCFF, not legacy PIC/PIT/DMA/keyboard/CMOS, not COM1&ndash;COM4. Port 0x1234 was previously proven only as a synthetic negative on a hand-built report; here it comes from BUILT firmware through the real pipeline (analyzed only, never executed). Control build (same firmware, port replaced with 0x3F8, COM1, inside the allowlist): Lean generic PASS, confinement true. The FAIL is therefore attributable to the out-of-allowlist port alone.</p>
+<h3>Provenance</h3>
+<p>Source: purpose-built C with inline assembly port I/O in its own noinline function (<code>syndemo_bad_port</code>). Toolchain: gcc, -O1 -fno-optimize-sibling-calls. Violation ELF MD5: 141a3abe2651a318097f186bfc0358f3. Control ELF MD5: 13222420078b9846227d59d8bd966adb. Fixture copies: <code>targets/x86_syndemo_port/</code> in the repository.</p>
+</main>
+<footer class="disclaimer"><div>This is a static proof tool. It does not execute firmware and does not claim to find all vulnerabilities. PASS does not mean firmware is secure.</div></footer>
+</body>
+</html>

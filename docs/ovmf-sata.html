@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SataControllerDxe — Firmware Liberation Engine</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<p class="back"><a href="index.html">&larr; All reports</a></p>
+<h2>SataControllerDxe (OVMF) <span class="badge fail">FAIL</span></h2>
+<p>UEFI SATA controller driver from the OVMF corpus (EDK2 2025.11). Fixed 0 because BAR is runtime, provenance recovered.</p>
+<table class="stats">
+<tr><th>Fixed MMIO</th><td>0</td></tr>
+<tr><th>Port</th><td>0</td></tr>
+<tr><th>MSR</th><td>0</td></tr>
+<tr><th>May accesses</th><td>0</td></tr>
+<tr><th>Protocol-call edges</th><td>0</td></tr>
+<tr><th>Unresolved indirect calls</th><td>2</td></tr>
+<tr><th>Extractor version</th><td>v3.12</td></tr>
+<tr><th>Lean mode</th><td>generic</td></tr>
+</table>
+<h3>Lean log (verdict lines)</h3>
+<pre>trace ops: 0
+trace ops by kind (mmio, port, msr): (0, 0, 0)
+may trace ops: 0
+port/MSR confinement (every port/MSR in the architectural allowlist): true
+VERDICT: FAIL</pre>
+<h3>What this FAIL means — and does not mean</h3>
+<p>This FAIL is on a genuinely-empty trace: the engine recovered no fixed findings from this 3-function driver. Its hardware access flows through protocols and runtime BAR bases that static fixed-address extraction does not see. An empty trace fails the check because there is nothing to verify — this is an honest empty result, not a bug report and not a claim about the driver.</p>
+<h3>Provenance</h3>
+<p>Source: Ubuntu package ovmf-generic 2025.11-3ubuntu7.3, EDK2 2025.11. PE image, 3 functions.</p>
+</main>
+<footer class="disclaimer"><div>This is a static proof tool. It does not execute firmware and does not claim to find all vulnerabilities. PASS does not mean firmware is secure.</div></footer>
+</body>
+</html>

@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RP2040 hello_uart — Firmware Liberation Engine</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<p class="back"><a href="index.html">&larr; All reports</a></p>
+<h2>RP2040 hello_uart <span class="badge pass">PASS</span></h2>
+<p>UART example from pico-examples, built from public source on the RP2040 (Cortex-M0+). Touches UART0, GPIO function select, and clocks.</p>
+<table class="stats">
+<tr><th>Fixed MMIO</th><td>198</td></tr>
+<tr><th>May accesses</th><td>0 sites / 0 addresses</td></tr>
+<tr><th>Port / MSR</th><td>0 / 0</td></tr>
+<tr><th>Extractor version</th><td>v3.12</td></tr>
+<tr><th>Lean mode</th><td>generic (RP2040 has no bmp driver families)</td></tr>
+<tr><th>Classifier (SVD profile)</th><td>136 known / 62 suspect (all 62 explained, see below)</td></tr>
+</table>
+<h3>Lean log (verdict lines)</h3>
+<pre>trace ops: 198
+trace ops by kind (mmio, port, msr): (198, 0, 0)
+may trace ops: 0
+all addresses in MMIO window: true
+port/MSR confinement: true
+VERDICT: PASS</pre>
+<h3>Ground truth</h3>
+<p>198/198 findings code-true against pico-sdk source (195 named SVD registers plus 3 clock-peripheral divider-slot writes that are real SDK writes but unnamed in the SVD). The 62 classifier suspects are RP2040 atomic-alias writes (CLR +0x1000, SET +0x2000, XOR +0x3000) — a profile-completeness gap, not extractor error. 15 findings are dead-linked but code-true: the engine reports what code can touch, not only what runs.</p>
+<div class="note"><b>Named blind spots, stated plainly.</b> (1) Boot stage 2: 34 MMIO instructions (PADS_QSPI + SSI) were never recovered, because Ghidra never recovered the second-stage boot code as a function. (2) SIO spinlocks: 32 stores at 0xd0000100&ndash;0xd0000180 were missed, because the ARM extractor window (0x40000000&ndash;0x60000000) excludes SIO at 0xd0000000. Generic PASS means only that what was found stayed in-window.</div>
+<h3>Provenance</h3>
+<p>Example: pico-examples <code>uart/hello_uart</code> (HEAD 0d62f75b). SDK: pico-sdk (HEAD 079c6f39). SVD: pico-sdk <code>src/rp2040/hardware_regs/RP2040.svd</code>, 37 blocks via pure SVD import, no hand blocks. Toolchain: arm-none-eabi-gcc 13.2.1, cmake 3.28.3, Release (-O3, -g). Built ELF MD5: b8b292d9828ef8d0587e905a387a9897.</p>
+</main>
+<footer class="disclaimer"><div>This is a static proof tool. It does not execute firmware and does not claim to find all vulnerabilities. PASS does not mean firmware is secure.</div></footer>
+</body>
+</html>
