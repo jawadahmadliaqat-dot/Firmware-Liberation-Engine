@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1019" height="643" font-family="DejaVu Sans Mono, monospace" font-size="13">
+<rect width="100%" height="100%" fill="#0d1117"/>
+<text x="18" y="20" fill="#e6edf3" font-weight="bold">PRE-FIX  (CVE-2026-11743, parent of 909eb56)  —  FAIL</text>
+<text x="18" y="38" fill="#79c0ff">$ lake exe ingest_check sf32lb_qspi_prefx.elf_report.json generic</text>
+<text x="18" y="57" fill="#e6edf3">trace ops: 89</text>
+<text x="18" y="76" fill="#e6edf3">trace ops by kind (mmio, port, msr): (89, 0, 0)</text>
+<text x="18" y="95" fill="#e6edf3">may trace ops: 0</text>
+<text x="18" y="114" fill="#e6edf3">trace non-empty: true</text>
+<text x="18" y="133" fill="#e6edf3">masks consistent (ones &amp; zeroes == 0): true</text>
+<text x="18" y="152" fill="#e6edf3">all addresses in MMIO window: true</text>
+<text x="18" y="171" fill="#e6edf3">port/MSR sanity (port ≤ 0xFFFF, MSR index &lt; 2^32): true</text>
+<text x="18" y="190" fill="#e6edf3">port/MSR confinement (every port/MSR in the architectural allowlist): true</text>
+<text x="18" y="209" fill="#e6edf3">clock-enable (every used peripheral's gate register touched): true</text>
+<text x="18" y="228" fill="#d2a8ff">bounds (no computed-pointer copy with unsound-only guard): false</text>
+<text x="18" y="247" fill="#d2a8ff">bounds copy sites: 1</text>
+<text x="18" y="266" fill="#d2a8ff">bounds violations: [flash_sf32lb_mpi_qspi_nor_read memcpy 0x1201d1d6 (role src, offset arg 1, base field 4, no sound guard)]</text>
+<text x="18" y="285" fill="#ff7b72" font-weight="bold">VERDICT: FAIL</text>
+<text x="18" y="338" fill="#e6edf3" font-weight="bold">FIXED  (909eb56)  —  PASS</text>
+<text x="18" y="356" fill="#79c0ff">$ lake exe ingest_check sf32lb_qspi_fixed.elf_report.json generic</text>
+<text x="18" y="375" fill="#e6edf3">trace ops: 89</text>
+<text x="18" y="394" fill="#e6edf3">trace ops by kind (mmio, port, msr): (89, 0, 0)</text>
+<text x="18" y="413" fill="#e6edf3">may trace ops: 0</text>
+<text x="18" y="432" fill="#e6edf3">trace non-empty: true</text>
+<text x="18" y="451" fill="#e6edf3">masks consistent (ones &amp; zeroes == 0): true</text>
+<text x="18" y="470" fill="#e6edf3">all addresses in MMIO window: true</text>
+<text x="18" y="489" fill="#e6edf3">port/MSR sanity (port ≤ 0xFFFF, MSR index &lt; 2^32): true</text>
+<text x="18" y="508" fill="#e6edf3">port/MSR confinement (every port/MSR in the architectural allowlist): true</text>
+<text x="18" y="527" fill="#e6edf3">clock-enable (every used peripheral's gate register touched): true</text>
+<text x="18" y="546" fill="#d2a8ff">bounds (no computed-pointer copy with unsound-only guard): true</text>
+<text x="18" y="565" fill="#d2a8ff">bounds copy sites: 1</text>
+<text x="18" y="584" fill="#3fb950" font-weight="bold">VERDICT: PASS</text>
+<text x="18" y="621" fill="#8b949e">ExtractIR v3.15 + Lean generic mode — output lines verbatim from the real runs.</text>
+</svg>

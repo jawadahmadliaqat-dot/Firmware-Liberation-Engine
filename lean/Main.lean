@@ -21,6 +21,9 @@
   Reports without the field (old reports) fall back to the historical
   ARM window 0x40000000-0x60000000, so old verdicts are unchanged.
   Bmp mode keeps its own hardcoded ARM window via checkGeneric.
+  Generic mode also runs the bounds check (v3.15): the report's
+  top-level "copy_sites" field, absent on pre-v3.15 reports (then the
+  bounds line passes vacuously with 0 sites -- visible, not hidden).
 -/
 
 import Verifier.Common
@@ -38,7 +41,7 @@ def printBlink (trace : List MmioAccess) : IO Bool := do
   IO.println s!"mode clear-then-set before LED: {mode}"
   pure (order && led && clock && mode)
 
-def printGeneric (lang : Option String) (windows : List (Nat × Nat)) (trace : List MmioAccess) : IO Bool := do
+def printGeneric (lang : Option String) (windows : List (Nat × Nat)) (trace : List MmioAccess) (sites : List BoundsSite) : IO Bool := do
   let nonempty := !trace.isEmpty
   let masks := checkMasksConsistent trace
   let window := checkWindowBands windows trace
@@ -61,7 +64,15 @@ def printGeneric (lang : Option String) (windows : List (Nat × Nat)) (trace : L
     let names := clockVios.map fun v =>
       s!"{v.access.func} {kindName v.access.kind} {natToHex v.access.addr} ({v.gate.name} needs {natToHex v.gate.gateAddr} bit {v.gate.gateBit})"
     IO.println s!"clock-enable violations: {names}"
-  pure (nonempty && masks && window && sanity && confined && clock)
+  let bounds := checkBounds sites
+  IO.println s!"bounds (no computed-pointer copy with unsound-only guard): {bounds}"
+  IO.println s!"bounds copy sites: {sites.length}"
+  let boundsVios := boundsViolations sites
+  if !boundsVios.isEmpty then
+    let names := boundsVios.map fun s =>
+      s!"{s.func} {s.kind} {natToHex s.instr} (role {s.role}, offset arg {s.offsetArg}, base field {s.baseField}, no sound guard)"
+    IO.println s!"bounds violations: {names}"
+  pure (nonempty && masks && window && sanity && confined && clock && bounds)
 
 def printBmp (trace : List MmioAccess) (mayTrace : List MmioAccess) : IO Bool := do
   let generic := checkGeneric trace
@@ -94,8 +105,11 @@ def main (args : List String) : IO UInt32 := do
         match extractMmioWindows j with
         | .error e => IO.println s!"mmio windows extract failed: {e}"; pure 1
         | .ok windows => do
+          match extractBoundsSites j with
+          | .error e => IO.println s!"bounds extract failed: {e}"; pure 1
+          | .ok sites => do
           let lang := extractLanguage j
-          let ok ← if mode == "generic" then printGeneric lang windows trace
+          let ok ← if mode == "generic" then printGeneric lang windows trace sites
             else if mode == "bmp" then printBmp trace mayTrace
             else printBlink trace
           if ok then IO.println "VERDICT: PASS"; pure 0

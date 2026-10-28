@@ -572,6 +572,77 @@ def clockEnableViolations (trace : List MmioAccess) : List ClockViolation :=
 def checkClockEnable (trace : List MmioAccess) : Bool :=
   (clockEnableViolations trace).isEmpty
 
+/-- Bounds (computed-pointer copy) evidence, v3.15. One entry per
+    memcpy/memmove call site whose dst or src argument the extractor
+    proved to be ADD(struct-field, function-argument offset).
+    `unsoundCheck` = the function also contains, before the call, an
+    unsigned comparison of (offset + size) against the same struct's
+    size field -- the CVE-2026-11743 check shape, which a negative
+    offset wraps past. `soundGuard` = the extractor found a candidate
+    sound guard before the call: "signed-check" (signed offset-vs-0
+    comparison), "wide-check" (ZEXT/SEXT-past-pointer-size range
+    check), or "guard-call" (a call to a helper containing a signed
+    ARG-vs-0 check, with a branch between it and the copy); "none"
+    otherwise. A site is FLAGGED iff unsoundCheck && soundGuard ==
+    "none": the function tried to validate and did it in exactly the
+    wrapping way, with no candidate sound guard anywhere before the
+    copy. PASS on this line means "no proven-bad shape in the traced
+    copies" -- never "all copies proven safe": copies the extractor
+    could not track (stack-spilled offsets, DMA, indirect calls) are
+    simply absent, and a site with no in-function check at all is
+    emitted unflagged because a caller-side validation cannot be
+    excluded. The top-level "copy_sites" field is optional: absent
+    (pre-v3.15 reports) means no bounds data, not an error -- the
+    line then passes vacuously and the site count (0) shows it. A
+    present-but-malformed field is an error, like port/MSR. -/
+structure BoundsSite where
+  func : String
+  instr : Nat
+  kind : String
+  role : String
+  offsetArg : Nat
+  baseField : Nat
+  sizeField : Option Nat
+  unsoundCheck : Bool
+  soundGuard : String
+  flagged : Bool
+deriving Repr
+
+def extractBoundsSite (j : Json) : Except String BoundsSite := do
+  let func ← j.getObjVal? "func" >>= Json.getStr?
+  let instrS ← j.getObjVal? "instr" >>= Json.getStr?
+  let instr ← parseHex instrS
+  let kind ← j.getObjVal? "kind" >>= Json.getStr?
+  let role ← j.getObjVal? "role" >>= Json.getStr?
+  let offsetArg ← j.getObjVal? "offset_arg" >>= Json.getNat?
+  let baseField ← j.getObjVal? "base_field" >>= Json.getNat?
+  let sizeField ← match j.getObjVal? "size_field" with
+    | .ok .null => pure none
+    | .ok v => some <$> Json.getNat? v
+    | .error _ => pure none
+  let unsoundCheck ← j.getObjVal? "unsound_check" >>= Json.getBool?
+  let soundGuard ← j.getObjVal? "sound_guard" >>= Json.getStr?
+  let flagged ← j.getObjVal? "flagged" >>= Json.getBool?
+  pure { func := func, instr := instr, kind := kind, role := role,
+         offsetArg := offsetArg, baseField := baseField,
+         sizeField := sizeField, unsoundCheck := unsoundCheck,
+         soundGuard := soundGuard, flagged := flagged }
+
+def extractBoundsSites (j : Json) : Except String (List BoundsSite) := do
+  match j.getObjVal? "copy_sites" with
+  | .ok v => do
+    let arr ← Json.getArr? v
+    arr.toList.mapM extractBoundsSite
+  | .error _ => pure []
+
+/-- The bounds violations: flagged copy sites (empty = pass). -/
+def boundsViolations (sites : List BoundsSite) : List BoundsSite :=
+  sites.filter fun s => s.flagged
+
+/-- Bounds check: true iff no flagged copy site. -/
+def checkBounds (sites : List BoundsSite) : Bool :=
+  (boundsViolations sites).isEmpty
+
 /-- Non-vacuity: a GPIOA use with only an APB1 gate touched (APB2 never
     touched) fails — the synthetic-control shape. -/
 example : checkClockEnable [

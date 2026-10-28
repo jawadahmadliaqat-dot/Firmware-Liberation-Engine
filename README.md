@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.14-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.15-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -70,6 +70,21 @@ and the loop join destroys per-pin values). Full regression exact on 36
 targets, Lean sweep zero flips. Corpus 1,352 -> 1,421. Version bumped
 v3.13 -> v3.14 because outputs changed on existing corpora.
 
+**v3.15 changes:** bounds property — a CFG must-fixpoint provenance scan
+records computed-pointer copy sites (memcpy/memmove where a pointer
+argument is `ADD(struct-field, function-argument offset)`), the
+unsound-check shape (unsigned `(offset + size)` vs the same struct's
+size field), and sound-guard evidence (signed offset-vs-0, wide
+ZEXT/SEXT, or guard-call). New JSON fields per function (`copy_sites`,
+`copy_site_count`, `bounds_flagged_count`) and top level (`copy_sites`,
+`copy_site_total`, `bounds_flagged_total`); Lean generic mode gains a
+bounds verdict line. Proof pair: CVE-2026-11743 pre-fix firmware FAILs
+on the read site (no sound guard), fixed firmware (909eb56) PASSes
+(same site, `signed-check` guard). The CVE write path (DMA/cache
+maintenance, not a CPU copy) is out of scope for v1. Version bumped
+v3.14 -> v3.15 because report JSON gains fields. (Full design notes are
+kept in local working notes, not in the repo.)
+
 **Clock-enable-before-use (Lean-side, generic mode; no extractor change, no
 JSON change, no new flags):** every MUST access to a mapped STM32 peripheral's
 register block requires a MUST STORE to that peripheral's clock-gate register
@@ -101,6 +116,9 @@ Computed from the v3.13 baseline and v3.14 Zephyr report JSONs (`python3 assets/
 
 ![v3.14 regression sweep](assets/screenshots/regression_sweep.svg)
 Fresh recount of the v3.14 regression log (`python3 assets/screenshots/regress_check.py`, run from the repo root): 36 targets checked, 0 mismatches.
+
+![BOUNDS pre-fix FAIL vs fixed PASS](assets/screenshots/bounds_screenshot.svg)
+v3.15 bounds verdict on CVE-2026-11743 firmware (`lake exe ingest_check <report> generic`, run from `lean/`): pre-fix FAILs naming the vulnerable read site (`flash_sf32lb_mpi_qspi_nor_read memcpy 0x1201d1d6, no sound guard`); fixed firmware (909eb56) PASSes with the same site guarded (`signed-check`).
 
 ## Honest zeros
 

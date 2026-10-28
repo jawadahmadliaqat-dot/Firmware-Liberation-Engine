@@ -188,6 +188,18 @@ import java.util.Set;
  * ARM-only concepts as requirements: no condition flags, no fixed
  * instruction size, no literal pools -- a RISC-V adapter returns
  * identity for the tag helpers and its own jump-table recovery.
+ *
+ * v3.15 adds BOUNDS evidence: a CFG must-fixpoint provenance scan per function
+ * that records computed-pointer copy sites (memcpy/memmove where a
+ * pointer argument is ADD(struct-field, function-argument offset)),
+ * the unsound-check shape (an unsigned comparison of offset+size
+ * against the same struct's size field), and sound-guard evidence
+ * (signed offset-vs-0 check, wide ZEXT/SEXT check, or guard-call).
+ * Emitted per function as "copy_sites" and top-level as "copy_sites"
+ * + "copy_site_total" + "bounds_flagged_total"; the Lean verifier
+ * gains a bounds verdict line in generic mode. See
+ * ~/workspace/v24-bounds/design.md for semantics and limits.
+ * Version bump v3.14 -> v3.15 because report JSON gains fields.
  */
 public class ExtractIR extends GhidraScript {
 
@@ -8167,6 +8179,633 @@ public class ExtractIR extends GhidraScript {
         return res;
     }
 
+    // ---------------- v3.15 bounds (computed-pointer copy) analysis ----
+    // One CFG must-fixpoint provenance scan per function over its
+    // P-Code ops (same successor rules as the value fixpoint, via
+    // buildSucc; a register keeps provenance only if EVERY
+    // predecessor agrees). It tracks a small symbolic expression per register /
+    // unique varnode, seeded at function entry with ARG tokens for the
+    // ISA's argument registers (ARM AAPCS r0-r3, RISC-V a0-a7, MIPS
+    // a0-a3; x86-64 needs a known convention and x86-32 passes args on
+    // the stack, so both yield no sites -- see design.md §5).
+    //   COPY propagates; INT_ADD folds constants (ADD(CONST,CONST) and
+    //   ADD(x,CONST 0)); LOAD through ADD(ptr,CONST off) yields
+    //   FIELD(ptr,off); INT_ZEXT/SEXT yields EXT(inner,size); CALL and
+    //   CALLIND kill the ISA's caller-saved registers; every other op
+    //   result is TOP. Memory is NOT tracked: a value spilled to the
+    //   stack and reloaded comes back TOP, so the scan can miss a site
+    //   (false negative) but cannot invent provenance it never saw.
+    // A copy site is a direct CALL (or tail BRANCH) to a function named
+    // memcpy/memmove where the dst or src argument register holds
+    // ADD(FIELD(structPtr,baseOff), ARG(n)) at the call. The site is
+    // FLAGGED iff the same function also contains, before the call,
+    // the unsound check shape -- an unsigned INT_LESS/INT_LESSEQUAL
+    // between ADD(ARG(n),X) and FIELD(structPtr,sizeOff) -- and no
+    // sound guard: no signed INT_SLESS/INT_SLESSEQUAL between ARG(n)
+    // and CONST 0, no wide (ZEXT/SEXT past pointer size) check of the
+    // same offset against the same struct's field, and no guard-call
+    // (a direct CALL before the copy to a function that itself
+    // contains a signed ARG-vs-0 comparison, with a CBRANCH between
+    // that call and the copy). Guard detection is deliberately
+    // over-approximate (any candidate signed check suppresses), so a
+    // FLAGGED site means not even a candidate sound guard exists in
+    // the function. Sites with a computed pointer but no unsound
+    // check are still emitted (flagged=false) for audit; the Lean
+    // verdict only counts flagged sites. Guard/check search is in
+    // listing order (a superset of path order -- over-approximate
+    // suppression, the safe direction for FAIL); provenance itself
+    // is CFG-correct via the must-fixpoint.
+
+    /** Symbolic provenance expression for the bounds scan. */
+    private static class BExpr {
+        final String kind; // TOP, ARG, CONST, FIELD, ADD, SUB, EXT
+        final int argIdx;
+        final long constVal;
+        final BExpr base; // FIELD base, EXT inner, ADD/SUB left
+        final BExpr other; // ADD/SUB right
+        final long off; // FIELD offset
+        final int extSize; // EXT output size
+        private BExpr(String k, int a, long c, BExpr b, BExpr o,
+            long f, int e) {
+            kind = k; argIdx = a; constVal = c; base = b; other = o;
+            off = f; extSize = e;
+        }
+        static final BExpr TOP = new BExpr("TOP", -1, 0, null, null, 0, 0);
+        static BExpr arg(int i) {
+            return new BExpr("ARG", i, 0, null, null, 0, 0);
+        }
+        static BExpr cnst(long v) {
+            return new BExpr("CONST", -1, v, null, null, 0, 0);
+        }
+        static BExpr field(BExpr b, long o) {
+            return new BExpr("FIELD", -1, 0, b, null, o, 0);
+        }
+        static BExpr add(BExpr l, BExpr r) {
+            if (l == TOP || r == TOP) return TOP;
+            if (l.kind.equals("CONST") && r.kind.equals("CONST")) {
+                return cnst(l.constVal + r.constVal);
+            }
+            if (l.kind.equals("CONST") && l.constVal == 0) return r;
+            if (r.kind.equals("CONST") && r.constVal == 0) return l;
+            return new BExpr("ADD", -1, 0, l, r, 0, 0);
+        }
+        static BExpr sub(BExpr l, BExpr r) {
+            if (l == TOP || r == TOP) return TOP;
+            if (l.kind.equals("CONST") && r.kind.equals("CONST")) {
+                return cnst(l.constVal - r.constVal);
+            }
+            // x - 0 == x (Ghidra lowers cmp r, #0 to SUB(r, 0)
+            // followed by SLESS on the difference, so without this
+            // fold a plain `cmp offset, #0` would not match ARG).
+            if (r.kind.equals("CONST") && r.constVal == 0) return l;
+            return new BExpr("SUB", -1, 0, l, r, 0, 0);
+        }
+        static BExpr ext(BExpr in, int sz) {
+            if (in == TOP) return TOP;
+            return new BExpr("EXT", -1, 0, in, null, 0, sz);
+        }
+        String key() {
+            if (kind.equals("TOP")) return "TOP";
+            if (kind.equals("ARG")) return "A" + argIdx;
+            if (kind.equals("CONST")) return "C" + constVal;
+            if (kind.equals("FIELD")) {
+                return "F(" + base.key() + "," + off + ")";
+            }
+            if (kind.equals("EXT")) {
+                return "EXT(" + base.key() + "," + extSize + ")";
+            }
+            return kind + "(" + base.key() + "," + other.key() + ")";
+        }
+        @Override public boolean equals(Object o) {
+            return o instanceof BExpr && key().equals(((BExpr) o).key());
+        }
+        @Override public int hashCode() { return key().hashCode(); }
+        /** True iff this expression is ADD(offsetArg, anything). */
+        BExpr addOtherSide(BExpr offsetArg) {
+            if (!kind.equals("ADD")) return null;
+            if (base.equals(offsetArg)) return other;
+            if (other.equals(offsetArg)) return base;
+            return null;
+        }
+        /** True iff this expression contains EXT(offsetArg) wider
+            than pointer size (a 64-bit-style range check operand). */
+        boolean containsWideExt(BExpr offsetArg, int ptrSize) {
+            if (kind.equals("EXT")) {
+                return base.equals(offsetArg) && extSize > ptrSize;
+            }
+            if (kind.equals("ADD") || kind.equals("SUB")) {
+                return base.containsWideExt(offsetArg, ptrSize) ||
+                    other.containsWideExt(offsetArg, ptrSize);
+            }
+            return false;
+        }
+    }
+
+    /** One comparison op seen by the bounds scan, with operand
+        provenance as of that op. */
+    private static class BoundsCmp {
+        final int idx;
+        final String mnem;
+        final BExpr a;
+        final BExpr b;
+        BoundsCmp(int i, String m, BExpr x, BExpr y) {
+            idx = i; mnem = m; a = x; b = y;
+        }
+        boolean isUnsigned() {
+            return mnem.equals("INT_LESS") ||
+                mnem.equals("INT_LESSEQUAL");
+        }
+        boolean isSigned() {
+            return mnem.equals("INT_SLESS") ||
+                mnem.equals("INT_SLESSEQUAL");
+        }
+    }
+
+    /** One direct CALL seen by the bounds scan (guard-call search). */
+    private static class BoundsCall {
+        final int idx;
+        final long entry;
+        BoundsCall(int i, long e) { idx = i; entry = e; }
+    }
+
+    /** One emitted copy site: JSON text + flagged bit. */
+    private static class BoundsSiteRec {
+        final String json;
+        final boolean flagged;
+        BoundsSiteRec(String j, boolean f) { json = j; flagged = f; }
+    }
+
+    /** Result of one bounds scan: comparison events, copy sites, and
+        whether the function contains a signed ARG-vs-0 comparison
+        (the guard-call pre-pass reads only this last field). */
+    private static class BoundsScan {
+        final List<BoundsCmp> cmps = new ArrayList<BoundsCmp>();
+        final List<BoundsSiteRec> sites = new ArrayList<BoundsSiteRec>();
+        boolean hasSignedArgCheck = false;
+    }
+
+    /** Provenance of one varnode under the bounds scan. Constants
+        fold; ram-space (global) and unknown varnodes are TOP. */
+    private BExpr boundsProvOf(Varnode v, Map<String, BExpr> prov) {
+        if (v == null) return BExpr.TOP;
+        try {
+            if (v.isConstant()) return BExpr.cnst(v.getOffset());
+        } catch (Exception e) {
+            return BExpr.TOP;
+        }
+        String space;
+        try {
+            space = v.getAddress().getAddressSpace().getName();
+        } catch (Exception e) {
+            return BExpr.TOP;
+        }
+        if (!space.equals("register") && !space.equals("unique")) {
+            return BExpr.TOP;
+        }
+        BExpr p = prov.get(space + ":" + v.getOffset());
+        return p == null ? BExpr.TOP : p;
+    }
+
+    private void boundsPut(Varnode v, BExpr p, Map<String, BExpr> prov) {
+        if (v == null) return;
+        String space;
+        try {
+            space = v.getAddress().getAddressSpace().getName();
+        } catch (Exception e) {
+            return;
+        }
+        if (!space.equals("register") && !space.equals("unique")) return;
+        String k = space + ":" + v.getOffset();
+        if (p == BExpr.TOP) prov.remove(k);
+        else prov.put(k, p);
+    }
+
+    /** Argument-register offsets for one function: the ISA's
+        argument registers under the function's own calling
+        convention (null/empty = unmodelled: no sites, no guard). */
+    private long[] boundsArgOffsets(FuncRec rec) {
+        try {
+            String conv = callConvMap.get(rec.entryKey);
+            if (conv == null) {
+                conv = callConvMap.get(
+                    isa.stripInstructionTag(rec.entryKey));
+            }
+            return isa.argumentRegisterOffsets(conv);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Transfer for one bounds-scan op: a copy of the incoming
+        provenance map with this op's effect applied. COPY propagates,
+        INT_ADD folds constants, LOAD through ADD(ptr, const) yields
+        FIELD(ptr, const), INT_ZEXT/SEXT yields EXT(inner, size),
+        CALL/CALLIND kill the ISA's caller-saved registers, and every
+        other op result is TOP. When stripUniques is true (first op
+        of an instruction), unique-space temporaries are dropped
+        first: they are local to one instruction (same rule as the
+        value fixpoint), so a stale unique from a predecessor
+        instruction must never be readable here. */
+    private Map<String, BExpr> boundsTransfer(Map<String, BExpr> in,
+        OpRec op, long[] saved, boolean stripUniques) {
+        Map<String, BExpr> prov = new HashMap<String, BExpr>(in);
+        if (stripUniques) {
+            java.util.Iterator<String> it = prov.keySet().iterator();
+            while (it.hasNext()) {
+                if (it.next().startsWith("unique:")) it.remove();
+            }
+        }
+        String mnem = op.mnem;
+        if (op.out != null) {
+            if (mnem.equals("COPY") && op.ins.length == 1) {
+                boundsPut(op.out, boundsProvOf(op.ins[0], prov), prov);
+            } else if (mnem.equals("LOAD") && op.ins.length >= 2) {
+                BExpr addr = boundsProvOf(op.ins[1], prov);
+                if (addr.kind.equals("ADD") &&
+                    addr.other.kind.equals("CONST")) {
+                    boundsPut(op.out,
+                        BExpr.field(addr.base, addr.other.constVal),
+                        prov);
+                } else if (addr.kind.equals("ADD") &&
+                    addr.base.kind.equals("CONST")) {
+                    boundsPut(op.out,
+                        BExpr.field(addr.other, addr.base.constVal),
+                        prov);
+                } else if (addr.kind.equals("ARG") ||
+                    addr.kind.equals("FIELD")) {
+                    boundsPut(op.out, BExpr.field(addr, 0), prov);
+                } else {
+                    boundsPut(op.out, BExpr.TOP, prov);
+                }
+            } else if (mnem.equals("INT_ADD") && op.ins.length == 2) {
+                boundsPut(op.out,
+                    BExpr.add(boundsProvOf(op.ins[0], prov),
+                        boundsProvOf(op.ins[1], prov)),
+                    prov);
+            } else if (mnem.equals("INT_SUB") && op.ins.length == 2) {
+                boundsPut(op.out,
+                    BExpr.sub(boundsProvOf(op.ins[0], prov),
+                        boundsProvOf(op.ins[1], prov)),
+                    prov);
+            } else if ((mnem.equals("INT_ZEXT") || mnem.equals("INT_SEXT")) &&
+                op.ins.length == 1) {
+                boundsPut(op.out,
+                    BExpr.ext(boundsProvOf(op.ins[0], prov),
+                        op.out.getSize()),
+                    prov);
+            } else {
+                boundsPut(op.out, BExpr.TOP, prov);
+            }
+        }
+        if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
+            if (saved != null) {
+                for (long ro : saved) prov.remove("register:" + ro);
+            }
+        }
+        return prov;
+    }
+
+    /** Full bounds scan of one function's ops: a CFG must-fixpoint
+        over provenance maps (same successor rules as the value
+        fixpoint, via buildSucc; Gauss-Seidel sweeps in listing
+        order, so forward chains propagate within one sweep), then
+        one event/site pass that walks instruction by instruction
+        from the final IN states with a working map. Must-join: a register keeps provenance only
+        if EVERY predecessor agrees, so provenance never flows down
+        a path that cannot reach the op -- the linear scan this
+        replaced did exactly that (an epilogue pop block listed
+        before the memcpy block clobbered the live struct pointer).
+        signedCheckByEntry (built by the pre-pass) maps callee entries
+        to their hasSignedArgCheck bit; null during the pre-pass
+        itself, in which case guard-call classification is skipped
+        (sites are still recorded, but the pre-pass ignores them).
+        If the fixpoint does not converge in 500 sweeps, sites are
+        dropped (only the suppression-leaning hasSignedArgCheck is
+        kept): a non-converged iterate may still hold provenance
+        the true fixpoint would drop, and a site built on it would
+        not be proven. */
+    private BoundsScan boundsScan(Function callerFn, List<OpRec> ops,
+        Map<Integer, List<Integer>> branchTargets, long[] argOffs,
+        Map<Long, FuncRec> funcByEntry,
+        Map<Long, Boolean> signedCheckByEntry) {
+        BoundsScan res = new BoundsScan();
+        if (argOffs == null || argOffs.length < 3) return res;
+        int n = ops.size();
+        if (n == 0) return res;
+        Map<String, BExpr> seeds = new HashMap<String, BExpr>();
+        for (int i = 0; i < argOffs.length; i++) {
+            seeds.put("register:" + argOffs[i], BExpr.arg(i));
+        }
+        long[] saved = null;
+        try {
+            saved = isa.callerSavedRegisterOffsets();
+        } catch (Exception e) {
+            saved = null;
+        }
+        List<List<Integer>> succ = null;
+        try {
+            succ = buildSucc(ops, branchTargets);
+        } catch (Exception e) {
+            succ = null;
+        }
+        List<List<Integer>> pred = new ArrayList<List<Integer>>();
+        for (int i = 0; i < n; i++) pred.add(new ArrayList<Integer>());
+        if (succ != null) {
+            for (int i = 0; i < n; i++) {
+                for (int j : succ.get(i)) {
+                    if (j >= 0 && j < n) pred.get(j).add(i);
+                }
+            }
+        } else {
+            for (int i = 1; i < n; i++) pred.get(i).add(i - 1);
+        }
+        Map<String, BExpr>[] inStates = new Map[n];
+        Map<String, BExpr>[] outStates = new Map[n];
+        for (int i = 0; i < n; i++) {
+            inStates[i] = new HashMap<String, BExpr>(seeds);
+            outStates[i] = new HashMap<String, BExpr>();
+        }
+        // Gauss-Seidel sweeps in listing order: each op's IN is
+        // rejoined from its predecessors' latest OUTs and its OUT
+        // recomputed immediately, so forward chains propagate within
+        // a single sweep (a Jacobi iteration needs one round per
+        // CFG edge of depth, which a 184-op function already
+        // exceeds). A sweep with zero IN changes is the fixpoint.
+        // First op of each instruction strips uniques (see
+        // boundsTransfer); IN[0] stays the entry seeds.
+        boolean[] isInstrStart = new boolean[n];
+        for (int i = 0; i < n; i++) {
+            isInstrStart[i] = i == 0 ||
+                !ops.get(i).instrAddr.equals(ops.get(i - 1).instrAddr);
+        }
+        boolean converged = false;
+        for (int sweep = 0; sweep < 500 && !converged; sweep++) {
+            boolean changed = false;
+            outStates[0] = boundsTransfer(inStates[0], ops.get(0),
+                saved, true);
+            for (int i = 1; i < n; i++) {
+                List<Integer> ps = pred.get(i);
+                Map<String, BExpr> joined;
+                if (ps.isEmpty()) {
+                    joined = new HashMap<String, BExpr>();
+                } else {
+                    joined =
+                        new HashMap<String, BExpr>(outStates[ps.get(0)]);
+                    for (int k = 1; k < ps.size(); k++) {
+                        Map<String, BExpr> o = outStates[ps.get(k)];
+                        java.util.Iterator<Map.Entry<String, BExpr>> it =
+                            joined.entrySet().iterator();
+                        while (it.hasNext()) {
+                            Map.Entry<String, BExpr> e = it.next();
+                            BExpr v = o.get(e.getKey());
+                            if (v == null || !v.equals(e.getValue())) {
+                                it.remove();
+                            }
+                        }
+                    }
+                }
+                if (!joined.equals(inStates[i])) {
+                    inStates[i] = joined;
+                    changed = true;
+                }
+                outStates[i] = boundsTransfer(inStates[i], ops.get(i),
+                    saved, isInstrStart[i]);
+            }
+            if (!changed) converged = true;
+        }
+        int ptrSize = 4;
+        try {
+            ptrSize = isa.pointerSize();
+        } catch (Exception e) {
+            ptrSize = 4;
+        }
+        List<BoundsCall> calls = new ArrayList<BoundsCall>();
+        List<Integer> cbranchIdx = new ArrayList<Integer>();
+        // Phase 2 walks instruction by instruction: the working map
+        // starts from the first op's IN state with uniques stripped,
+        // then advances op by op within the instruction, so a
+        // comparison or CALL reads unique temporaries defined
+        // earlier in the SAME instruction (e.g. cmp lowering's SUB
+        // result feeding SLESS) while never seeing a stale unique
+        // from another instruction.
+        for (int grp = 0; grp < n;) {
+            int grpEnd = grp + 1;
+            while (grpEnd < n && ops.get(grpEnd).instrAddr.equals(
+                ops.get(grp).instrAddr)) grpEnd++;
+            Map<String, BExpr> working =
+                new HashMap<String, BExpr>(inStates[grp]);
+            java.util.Iterator<String> wit =
+                working.keySet().iterator();
+            while (wit.hasNext()) {
+                if (wit.next().startsWith("unique:")) wit.remove();
+            }
+            for (int i = grp; i < grpEnd; i++) {
+            OpRec op = ops.get(i);
+            String mnem = op.mnem;
+            Map<String, BExpr> prov = working;
+            if (mnem.equals("CBRANCH")) cbranchIdx.add(i);
+            if ((mnem.equals("INT_LESS") || mnem.equals("INT_LESSEQUAL") ||
+                mnem.equals("INT_SLESS") || mnem.equals("INT_SLESSEQUAL")) &&
+                op.ins.length == 2) {
+                BExpr a = boundsProvOf(op.ins[0], prov);
+                BExpr b = boundsProvOf(op.ins[1], prov);
+                res.cmps.add(new BoundsCmp(i, mnem, a, b));
+                if ((mnem.equals("INT_SLESS") ||
+                    mnem.equals("INT_SLESSEQUAL")) &&
+                    ((a.kind.equals("ARG") && b.kind.equals("CONST") &&
+                        b.constVal == 0) ||
+                    (b.kind.equals("ARG") && a.kind.equals("CONST") &&
+                        a.constVal == 0))) {
+                    res.hasSignedArgCheck = true;
+                }
+            }
+            if (converged) {
+            if (mnem.equals("CALL") || mnem.equals("BRANCH")) {
+                FuncRec callee = null;
+                String calleeName = null;
+                if (op.ins.length >= 1) {
+                    try {
+                        String sp = op.ins[0].getAddress()
+                            .getAddressSpace().getName();
+                        if (sp.equals("ram") && funcByEntry != null) {
+                            long tgt = op.ins[0].getOffset();
+                            callee = funcByEntry.get(tgt);
+                            if (callee == null) {
+                                callee = funcByEntry.get(
+                                    isa.stripInstructionTag(tgt));
+                            }
+                            if (callee != null && callee.f != null) {
+                                calleeName = callee.f.getName();
+                            }
+                        }
+                    } catch (Exception e) {
+                        callee = null;
+                    }
+                }
+                if (calleeName != null &&
+                    (calleeName.equals("memcpy") ||
+                        calleeName.equals("memmove"))) {
+                    // Snapshot argument registers from the IN state
+                    // (before the call clobber).
+                    BExpr dst = boundsProvOf(
+                        regVarnode(argOffs[0], 4), prov);
+                    BExpr src = boundsProvOf(
+                        regVarnode(argOffs[1], 4), prov);
+                    // One site per call, role = src if the source
+                    // is computed, else dst; both -> "both".
+                    BExpr[] ptrs = new BExpr[] { src, dst };
+                    String[] roles = new String[] { "src", "dst" };
+                    BExpr offArg = null;
+                    BExpr structBase = null;
+                    long baseOff = 0;
+                    String role = null;
+                    for (int pi = 0; pi < 2; pi++) {
+                        BExpr p = ptrs[pi];
+                        if (!p.kind.equals("ADD")) continue;
+                        BExpr f = null;
+                        BExpr o = null;
+                        if (p.base.kind.equals("FIELD") &&
+                            p.other.kind.equals("ARG")) {
+                            f = p.base; o = p.other;
+                        } else if (p.other.kind.equals("FIELD") &&
+                            p.base.kind.equals("ARG")) {
+                            f = p.other; o = p.base;
+                        }
+                        if (f == null) continue;
+                        if (role == null) {
+                            role = roles[pi]; offArg = o;
+                            structBase = f.base; baseOff = f.off;
+                        } else {
+                            role = "both";
+                        }
+                    }
+                    if (role != null) {
+                        // Unsound check: unsigned comparison of
+                        // ADD(offArg, X) vs FIELD(structBase, _).
+                        boolean unsound = false;
+                        long sizeOff = -1;
+                        for (BoundsCmp c : res.cmps) {
+                            if (!c.isUnsigned()) continue;
+                            BExpr fld = null;
+                            if (c.a.addOtherSide(offArg) != null &&
+                                c.b.kind.equals("FIELD") &&
+                                c.b.base.equals(structBase)) {
+                                fld = c.b;
+                            } else if (c.b.addOtherSide(offArg) != null &&
+                                c.a.kind.equals("FIELD") &&
+                                c.a.base.equals(structBase)) {
+                                fld = c.a;
+                            }
+                            if (fld != null) {
+                                unsound = true;
+                                sizeOff = fld.off;
+                                break;
+                            }
+                        }
+                        // Sound guards (any one suppresses).
+                        String guard = "none";
+                        for (BoundsCmp c : res.cmps) {
+                            if (!c.isSigned()) continue;
+                            if ((c.a.equals(offArg) &&
+                                c.b.kind.equals("CONST") &&
+                                c.b.constVal == 0) ||
+                                (c.b.equals(offArg) &&
+                                    c.a.kind.equals("CONST") &&
+                                    c.a.constVal == 0)) {
+                                guard = "signed-check";
+                                break;
+                            }
+                        }
+                        if (guard.equals("none")) {
+                            for (BoundsCmp c : res.cmps) {
+                                if (!c.isUnsigned()) continue;
+                                boolean wide = false;
+                                if (c.a.containsWideExt(offArg, ptrSize) &&
+                                    c.b.kind.equals("FIELD") &&
+                                    c.b.base.equals(structBase)) {
+                                    wide = true;
+                                } else if (c.b.containsWideExt(offArg,
+                                    ptrSize) &&
+                                    c.a.kind.equals("FIELD") &&
+                                    c.a.base.equals(structBase)) {
+                                    wide = true;
+                                }
+                                if (wide) {
+                                    guard = "wide-check";
+                                    break;
+                                }
+                            }
+                        }
+                        if (guard.equals("none") &&
+                            signedCheckByEntry != null) {
+                            for (BoundsCall gc : calls) {
+                                Boolean sc =
+                                    signedCheckByEntry.get(gc.entry);
+                                if (sc == null || !sc) continue;
+                                for (int cb : cbranchIdx) {
+                                    if (cb > gc.idx && cb < i) {
+                                        guard = "guard-call";
+                                        break;
+                                    }
+                                }
+                                if (!guard.equals("none")) break;
+                            }
+                        }
+                        boolean flagged = unsound &&
+                            guard.equals("none");
+                        String addrHex;
+                        try {
+                            addrHex = "0x" + Long.toHexString(
+                                op.instrAddr.getOffset());
+                        } catch (Exception e) {
+                            addrHex = "0x0";
+                        }
+                        StringBuilder sb = new StringBuilder();
+                        sb.append("{\"func\": \"");
+                        // The site lives in the CALLER function.
+                        try {
+                            sb.append(esc(callerFn.getName()));
+                        } catch (Exception e) {
+                            sb.append("?");
+                        }
+                        sb.append("\", \"instr\": \"").append(addrHex);
+                        sb.append("\", \"kind\": \"")
+                            .append(calleeName).append("\"");
+                        sb.append(", \"role\": \"").append(role)
+                            .append("\"");
+                        sb.append(", \"offset_arg\": ")
+                            .append(offArg.argIdx);
+                        sb.append(", \"base_field\": ").append(baseOff);
+                        sb.append(", \"size_field\": ");
+                        if (sizeOff >= 0) sb.append(sizeOff);
+                        else sb.append("null");
+                        sb.append(", \"unsound_check\": ")
+                            .append(unsound);
+                        sb.append(", \"sound_guard\": \"").append(guard)
+                            .append("\"");
+                        sb.append(", \"flagged\": ").append(flagged);
+                        sb.append("}");
+                        res.sites.add(new BoundsSiteRec(
+                            sb.toString(), flagged));
+                    }
+                } else if (mnem.equals("CALL") && callee != null) {
+                    long ent;
+                    try {
+                        ent = callee.entryKey;
+                    } catch (Exception e) {
+                        ent = -1;
+                    }
+                    calls.add(new BoundsCall(i, ent));
+                }
+            }
+            }
+            working = boundsTransfer(working, op, saved, false);
+            }
+            grp = grpEnd;
+        }
+        return res;
+    }
+
     @Override
     public void run() throws Exception {
         if (getScriptArgs().length < 1) {
@@ -8337,7 +8976,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.14\",");
+        w.println("  \"extractor_version\": \"v3.15\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -8374,6 +9013,10 @@ public class ExtractIR extends GhidraScript {
         int totalUnresolvedTail = 0;
         int totalProtoEdges = 0;
         int totalBarRel = 0;
+        // v3.15 bounds: aggregated copy sites + flagged count.
+        int totalCopySites = 0;
+        int totalBoundsFlagged = 0;
+        List<String> allCopySites = new ArrayList<String>();
         // v3.5 pass 1: function-pointer store map for the whole
         // program, before any function is printed (may-edges need
         // cross-function stores). Best-effort: a failure here only
@@ -9930,6 +10573,33 @@ public class ExtractIR extends GhidraScript {
         println("[*] tailsites: direct-branch tail-call sites " +
             "added to sitesByCallee=" + tailSitesAdded + ".");
         }
+        // v3.15 bounds pre-pass: per-function signed-ARG-vs-0 bit,
+        // used for guard-call classification in the main scan.
+        // Best-effort: a failure here only loses guard-call
+        // suppression (sites stay, possibly flagged), never the
+        // report.
+        Map<Long, Boolean> signedCheckByEntry =
+            new HashMap<Long, Boolean>();
+        try {
+            for (FuncRec gr : funcRecs) {
+                try {
+                    long[] goffs = boundsArgOffsets(gr);
+                    if (goffs == null || goffs.length < 3) {
+                        signedCheckByEntry.put(gr.entryKey, false);
+                        continue;
+                    }
+                    BoundsScan gs = boundsScan(gr.f, gr.or.ops,
+                        gr.branchTargets, goffs, funcByEntry, null);
+                    signedCheckByEntry.put(gr.entryKey,
+                        gs.hasSignedArgCheck);
+                } catch (Exception e) {
+                    // Unknown for this function; guard-call lookup
+                    // treats a missing entry as "not a guard".
+                }
+            }
+        } catch (Exception e) {
+            // Map stays partial; guard-call lookup tolerates it.
+        }
         for (FuncRec rec : funcRecs) {
             Function f = rec.f;
             if (!firstFn) w.println(",");
@@ -9976,6 +10646,25 @@ public class ExtractIR extends GhidraScript {
             // exactly as before v2 item #2.
             OpsResult or = rec.or;
             List<OpRec> ops = or.ops;
+            // v3.15 bounds: computed-pointer copy sites for this
+            // function (additive evidence; a failure here must not
+            // lose the function's MMIO findings).
+            List<BoundsSiteRec> copySites =
+                new ArrayList<BoundsSiteRec>();
+            int copyFlagged = 0;
+            try {
+                long[] boffs = boundsArgOffsets(rec);
+                if (boffs != null && boffs.length >= 3) {
+                    BoundsScan bs = boundsScan(f, ops, rec.branchTargets,
+                        boffs, funcByEntry, signedCheckByEntry);
+                    copySites = bs.sites;
+                    for (BoundsSiteRec sr : copySites) {
+                        if (sr.flagged) copyFlagged++;
+                    }
+                }
+            } catch (Exception e) {
+                // copySites stays empty; report continues.
+            }
             boolean truncated = or.truncated;
             int opCount = ops.size();
             Map<Integer, List<Integer>> branchTargets = rec.branchTargets;
@@ -10582,7 +11271,16 @@ public class ExtractIR extends GhidraScript {
             w.println("      ],");
             w.println("      \"may_tail_call_site_count\": " + tc.sites.size() + ",");
             w.println("      \"may_tail_call_target_count\": " + tc.targets + ",");
-            w.println("      \"unresolved_tail_call_count\": " + tc.unresolved);
+            w.println("      \"unresolved_tail_call_count\": " + tc.unresolved + ",");
+            w.println("      \"copy_sites\": [");
+            for (int ci = 0; ci < copySites.size(); ci++) {
+                if (ci > 0) w.println(",");
+                w.print("        " + copySites.get(ci).json);
+            }
+            w.println();
+            w.println("      ],");
+            w.println("      \"copy_site_count\": " + copySites.size() + ",");
+            w.println("      \"bounds_flagged_count\": " + copyFlagged);
             totalIndirect += ind.edges;
             totalIndSucc += indSucc;
             totalMayCallSites += pt.maySites.size();
@@ -10597,6 +11295,11 @@ public class ExtractIR extends GhidraScript {
             totalMay += may.size();
             totalPortIo += portIo.size();
             totalMsr += msr.size();
+            totalCopySites += copySites.size();
+            totalBoundsFlagged += copyFlagged;
+            for (BoundsSiteRec sr : copySites) {
+                allCopySites.add(sr.json);
+            }
             w.print("    }");
         }
 
@@ -10696,6 +11399,15 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"unresolved_tail_call_total\": " + totalUnresolvedTail + ",");
         w.println("  \"protocol_call_edge_total\": " + totalProtoEdges + ",");
         w.println("  \"bar_relative_access_total\": " + totalBarRel + ",");
+        w.println("  \"copy_sites\": [");
+        for (int ci = 0; ci < allCopySites.size(); ci++) {
+            if (ci > 0) w.println(",");
+            w.print("    " + allCopySites.get(ci));
+        }
+        w.println();
+        w.println("  ],");
+        w.println("  \"copy_site_total\": " + totalCopySites + ",");
+        w.println("  \"bounds_flagged_total\": " + totalBoundsFlagged + ",");
         w.println("  \"literal_scan\": {");
         w.println("    \"literal_count\": " + litScan.literalCount + ",");
         w.print("    \"attributed\": {");
