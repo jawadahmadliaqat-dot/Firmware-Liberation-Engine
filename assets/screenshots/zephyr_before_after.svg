@@ -1,0 +1,15 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='473' height='218' viewBox='0 0 473 218'>
+<title>Zephyr before/after: v3.13 baseline vs v3.14 report</title>
+<rect width='473' height='218' rx='10' fill='#0c0c0c'/>
+<path d='M0,10 A10,10 0 0 1 10,0 H463 A10,10 0 0 1 473,10 V36 H0 Z' fill='#1e1e1e'/>
+<circle cx='24' cy='18' r='6' fill='#f87171'/><circle cx='44' cy='18' r='6' fill='#fbbf24'/><circle cx='64' cy='18' r='6' fill='#4ade80'/>
+<text x='84' y='23' font-family='DejaVu Sans Mono, monospace' font-size='13' fill='#94a3b8'>terminal</text>
+<text x='22' y='60' font-family='DejaVu Sans Mono, monospace' font-size='14' font-weight='bold' fill='#4ade80'>$</text>
+<text x='36' y='60' font-family='DejaVu Sans Mono, monospace' font-size='14' font-weight='bold' fill='#f1f5f9'>python3 assets/screenshots/zephyr_before_after.py</text>
+<text x='22' y='80' font-family='DejaVu Sans Mono, monospace' font-size='14' fill='#d4d4d4'>baseline v3.13: 127 MMIO</text>
+<text x='22' y='100' font-family='DejaVu Sans Mono, monospace' font-size='14' fill='#d4d4d4'>new      v3.14: 196 MMIO</text>
+<text x='22' y='120' font-family='DejaVu Sans Mono, monospace' font-size='14' font-weight='bold' fill='#4ade80'>gain: +69, losses: 0</text>
+<text x='22' y='140' font-family='DejaVu Sans Mono, monospace' font-size='14' fill='#d4d4d4'>UARTE layer: 0 -&gt; 65</text>
+<text x='22' y='160' font-family='DejaVu Sans Mono, monospace' font-size='14' fill='#d4d4d4'>outside layer (gpiote+gppi): 4</text>
+<text x='22' y='180' font-family='DejaVu Sans Mono, monospace' font-size='14' fill='#d4d4d4'>65 + 4 = 69 = gain</text>
+</svg>

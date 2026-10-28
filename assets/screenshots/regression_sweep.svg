@@ -1,0 +1,16 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='583' height='238' viewBox='0 0 583 238'>
+<title>v3.14 regression recount</title>
+<rect width='583' height='238' rx='10' fill='#0c0c0c'/>
+<path d='M0,10 A10,10 0 0 1 10,0 H573 A10,10 0 0 1 583,10 V36 H0 Z' fill='#1e1e1e'/>
+<circle cx='24' cy='18' r='6' fill='#f87171'/><circle cx='44' cy='18' r='6' fill='#fbbf24'/><circle cx='64' cy='18' r='6' fill='#4ade80'/>
+<text x='84' y='23' font-family='DejaVu Sans Mono, monospace' font-size='13' fill='#94a3b8'>terminal</text>
+<text x='22' y='60' font-family='DejaVu Sans Mono, monospace' font-size='14' font-weight='bold' fill='#4ade80'>$</text>
+<text x='36' y='60' font-family='DejaVu Sans Mono, monospace' font-size='14' font-weight='bold' fill='#f1f5f9'>python3 assets/screenshots/regress_check.py</text>
+<text x='22' y='80' font-family='DejaVu Sans Mono, monospace' font-size='14' fill='#d4d4d4'>targets checked: 36</text>
+<text x='22' y='100' font-family='DejaVu Sans Mono, monospace' font-size='14' fill='#d4d4d4'>mismatches: 0</text>
+<text x='22' y='120' font-family='DejaVu Sans Mono, monospace' font-size='14' fill='#d4d4d4'>--- tail ---</text>
+<text x='22' y='140' font-family='DejaVu Sans Mono, monospace' font-size='14' fill='#d4d4d4'>memprop_test.elf | exp_mmio=5 exp_ports=0 | got v3.14 5 0 0</text>
+<text x='22' y='160' font-family='DejaVu Sans Mono, monospace' font-size='14' fill='#d4d4d4'>memseed_test.elf | exp_mmio=3 exp_ports=0 | got v3.14 3 0 0</text>
+<text x='22' y='180' font-family='DejaVu Sans Mono, monospace' font-size='14' fill='#d4d4d4'>memseed_leak_test.elf | exp_mmio=1 exp_ports=0 | got v3.14 1 0 0</text>
+<text x='22' y='200' font-family='DejaVu Sans Mono, monospace' font-size='14' font-weight='bold' fill='#4ade80'>REGRESSION DONE</text>
+</svg>

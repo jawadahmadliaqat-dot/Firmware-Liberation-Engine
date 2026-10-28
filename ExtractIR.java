@@ -7510,6 +7510,70 @@ public class ExtractIR extends GhidraScript {
         return true;
     }
 
+    /** v14 zephyr: resolve ONE indirect call to a (target,
+        device) pair from a pre-call in-state. Fast path only:
+        the CALLIND target varnode and argument register 0 must
+        both be exact constants in the given state, and the
+        Thumb-stripped target must be a known non-external
+        function entry. Anything else (unknown, partial, symbol
+        value, non-function target, self-call is filtered by the
+        caller) returns null -- never a guess. The same helper
+        serves the seed pass (merged in-states) and the worklist
+        pass (clone in-states). */
+    private long[] resolveDeviceCallSite(List<OpRec> ops,
+        Map<String, Bits> st, int opIdx, long devRegOff,
+        int ptrSize, long mask,
+        Map<Long, FuncRec> funcByEntry) {
+        if (st == null || opIdx < 0 || opIdx >= ops.size()) {
+            return null;
+        }
+        OpRec op = ops.get(opIdx);
+        if (op == null || !"CALLIND".equals(op.mnem) ||
+            op.ins == null || op.ins.length < 1) {
+            return null;
+        }
+        Bits tb = resolveBits(op.ins[0], st);
+        if (tb == null) return null;
+        Long t = tb.exactValue(mask);
+        if (t == null) return null;
+        Varnode dvn = regVarnode(devRegOff, ptrSize);
+        if (dvn == null) return null;
+        Bits db = resolveBits(dvn, st);
+        if (db == null) return null;
+        Long d = db.exactValue(mask);
+        if (d == null) return null;
+        long te = isa.stripInstructionTag(t.longValue());
+        FuncRec tgt = funcByEntry.get(te);
+        if (tgt == null) tgt = funcByEntry.get(t.longValue());
+        if (tgt == null || tgt.f.isExternal()) return null;
+        return new long[]{tgt.entryKey, d.longValue()};
+    }
+
+    /** v14 zephyr: true when addr looks like a Zephyr device
+        struct in initialised, NON-writable memory, with its
+        init word a known function entry and its config/api
+        words readable. The non-writable gate is the soundness
+        argument: the initial image value is the runtime value
+        (a store to flash would fault on real hardware), so
+        resolving config/api/init from image bytes is sound
+        for such structs. Any read failure returns false. */
+    private boolean looksLikeDeviceStruct(Memory mem, long addr,
+        Map<Long, FuncRec> funcByEntry) {
+        try {
+            MemoryBlock blk = mem.getBlock(toAddr(addr));
+            if (blk == null || !blk.isInitialized() ||
+                blk.isWrite()) return false;
+            long init = isa.stripInstructionTag(
+                isa.readPointer(mem, toAddr(addr + 20)));
+            if (!funcByEntry.containsKey(init)) return false;
+            isa.readPointer(mem, toAddr(addr + 4));
+            isa.readPointer(mem, toAddr(addr + 8));
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     /** Empty must-fixpoint fallback (same as the old per-function
         exception fallback: claim nothing). */
     private static FixResult emptyFix(int nOps) {
@@ -8273,7 +8337,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.13\",");
+        w.println("  \"extractor_version\": \"v3.14\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -9399,9 +9463,12 @@ public class ExtractIR extends GhidraScript {
             new HashMap<Long, long[]>();
         for (FuncRec callee : funcRecs) {
             if (callee.f.isExternal()) continue;
-            List<CallSite> sites =
-                sitesByCallee.get(callee.entryKey);
-            if (sites == null || sites.isEmpty()) continue;
+            // v14: no longer restricted to callees with direct
+            // sites -- device-API and enumeration clones need
+            // argument registers for functions with zero direct
+            // sites. The seed loop below null-guards its site
+            // lists, so a site-less callee simply yields no
+            // site-driven groups.
             long[] argRegs = isa.argumentRegisterOffsets(
                 callConvMap.get(callee.entryKey));
             if (argRegs == null) continue;
@@ -9417,13 +9484,138 @@ public class ExtractIR extends GhidraScript {
         int persiteSkippedNonconv = 0;
         int persiteClones = 0;
         long persiteMask = sizeMask(isa.pointerSize());
+        // ---- v14 zephyr: device-API dispatch ----
+        // Site-driven: every CALLIND whose target varnode and
+        // argument register 0 are both exact constants in the
+        // caller's final in-state resolves to exactly one
+        // (target, device) pair, fed to the seed loop below
+        // through a persite-only site list. sitesByCallee is
+        // untouched, so merged phases are unaffected.
+        // Table-driven: device init functions (symbols
+        // __device_dts_ord_*) and ISR table entries
+        // (sw_isr_table block, (arg, isr) pairs), each
+        // validated as a device struct in non-writable memory,
+        // seeded directly after the seed loop. All three feeds
+        // use the existing clone caps/skips; nothing here
+        // changes the merged analysis or the JSON shape.
+        Map<Long, List<CallSite>> deviceSitesByCallee =
+            new HashMap<Long, List<CallSite>>();
+        List<long[]> deviceEnumPairs =
+            new ArrayList<long[]>();
+        // v14: addresses of validated device structs (from
+        // init enumeration). ISR-table args must be members:
+        // a bare shape check is not enough -- the ARM vector
+        // table at address 0 also "looks like" a struct (its
+        // word at +20 is a handler entry), and every unused
+        // ISR entry carries arg 0, which would otherwise seed
+        // dozens of bogus r0=0 clones.
+        Set<Long> deviceAddrs = new HashSet<Long>();
+        int devApiSites = 0, devApiSkipped = 0;
+        int devInitFound = 0, devIsrFound = 0;
+        int devPtrSize = isa.pointerSize();
+        for (FuncRec rec : funcRecs) {
+            if (rec.f.isExternal() || rec.fx == null ||
+                rec.fx.inStates == null) continue;
+            long[] convRegs = isa.argumentRegisterOffsets(
+                callConvMap.get(rec.entryKey));
+            if (convRegs == null || convRegs.length < 1) continue;
+            List<OpRec> pops = rec.or.ops;
+            for (int oi = 0; oi < pops.size(); oi++) {
+                OpRec op = pops.get(oi);
+                if (op == null || !"CALLIND".equals(op.mnem)) {
+                    continue;
+                }
+                if (oi >= rec.fx.inStates.length ||
+                    rec.fx.inStates[oi] == null) continue;
+                long[] pair = resolveDeviceCallSite(pops,
+                    rec.fx.inStates[oi], oi, convRegs[0],
+                    devPtrSize, persiteMask, funcByEntry);
+                if (pair == null) {
+                    devApiSkipped++;
+                    continue;
+                }
+                if (pair[0] == rec.entryKey) continue;
+                List<CallSite> dl =
+                    deviceSitesByCallee.get(pair[0]);
+                if (dl == null) {
+                    dl = new ArrayList<CallSite>();
+                    deviceSitesByCallee.put(pair[0], dl);
+                }
+                dl.add(new CallSite(rec, oi));
+                devApiSites++;
+            }
+        }
+        try {
+            SymbolIterator sit =
+                currentProgram.getSymbolTable().getSymbolIterator();
+            while (sit.hasNext()) {
+                Symbol s = sit.next();
+                String nm = s.getName();
+                if (nm == null ||
+                    !nm.startsWith("__device_dts_ord_")) continue;
+                long da = s.getAddress().getOffset();
+                if (!looksLikeDeviceStruct(memA, da,
+                    funcByEntry)) continue;
+                long init = isa.stripInstructionTag(
+                    isa.readPointer(memA, toAddr(da + 20)));
+                FuncRec tgt = funcByEntry.get(init);
+                if (tgt == null || tgt.f.isExternal()) continue;
+                deviceEnumPairs.add(
+                    new long[]{tgt.entryKey, da, 0});
+                deviceAddrs.add(da);
+                devInitFound++;
+            }
+        } catch (Exception e) {
+            // Init enumeration is best-effort; a symbol-table
+            // failure must not lose the site-driven results.
+        }
+        try {
+            MemoryBlock isrBlk = null;
+            for (MemoryBlock b : memA.getBlocks()) {
+                if ("sw_isr_table".equals(b.getName())) {
+                    isrBlk = b;
+                    break;
+                }
+            }
+            if (isrBlk != null) {
+                long a = isrBlk.getStart().getOffset();
+                long e = isrBlk.getEnd().getOffset();
+                while (a + 7 <= e) {
+                    long arg = isa.readPointer(memA, toAddr(a));
+                    long isr = isa.stripInstructionTag(
+                        isa.readPointer(memA, toAddr(a + 4)));
+                    FuncRec tgt = funcByEntry.get(isr);
+                    if (tgt != null && !tgt.f.isExternal() &&
+                        deviceAddrs.contains(arg) &&
+                        looksLikeDeviceStruct(memA, arg,
+                            funcByEntry)) {
+                        deviceEnumPairs.add(
+                            new long[]{tgt.entryKey, arg, 1});
+                        devIsrFound++;
+                    }
+                    a += 8;
+                }
+            }
+        } catch (Exception e) {
+            // ISR enumeration is best-effort, as above.
+        }
         // Seed groups from merged contexts (caller final
         // fixpoints), grouped by binding vector.
         for (FuncRec callee : funcRecs) {
             long[] argRegs = persiteArgRegs.get(callee.entryKey);
             if (argRegs == null) continue;
-            List<CallSite> sites =
+            // v14: union of direct sites and device-API sites
+            // (CALL vs CALLIND ops, so the two lists are
+            // disjoint and no dedup is needed). Null-guarded:
+            // persiteArgRegs is now widened to site-less
+            // callees, which simply yield empty unions.
+            List<CallSite> sites = new ArrayList<CallSite>();
+            List<CallSite> directSites =
                 sitesByCallee.get(callee.entryKey);
+            if (directSites != null) sites.addAll(directSites);
+            List<CallSite> devSites =
+                deviceSitesByCallee.get(callee.entryKey);
+            if (devSites != null) sites.addAll(devSites);
             Map<String, List<Bits>> valsByKey =
                 new HashMap<String, List<Bits>>();
             Map<String, List<String>> sitesByKey =
@@ -9496,10 +9688,79 @@ public class ExtractIR extends GhidraScript {
                 persiteClones++;
             }
         }
-        // Worklist: scan each clone's ops for inner direct
-        // CALLs, whose bindings (read from the CLONE's
-        // in-states) may form new groups for the inner
-        // callee. Termination is structural: groups are only
+        // v14: seed enumeration pairs (device init fns +
+        // ISR table entries) as clones with r0 = device
+        // address. Same caps/skips/group discipline as the
+        // seed loop; a pair whose group already exists (e.g.
+        // a site-driven clone for the same function+device)
+        // is skipped, never duplicated. Enumeration clones
+        // join the same queue, so the worklist extends them.
+        for (long[] pair : deviceEnumPairs) {
+            long calleeKey = pair[0];
+            long devAddr = pair[1];
+            FuncRec calleeRec = funcByEntry.get(calleeKey);
+            if (calleeRec == null) continue;
+            long[] argRegs = persiteArgRegs.get(calleeKey);
+            if (argRegs == null) continue;
+            List<Bits> vals = new ArrayList<Bits>();
+            for (int vi = 0; vi < argRegs.length; vi++) {
+                vals.add(vi == 0 ?
+                    Bits.exact(devAddr, persiteMask) : null);
+            }
+            String key = persiteGroupKey(vals, persiteMask);
+            if (persiteAllUnknown(key)) {
+                persiteSkippedUnknown++;
+                continue;
+            }
+            if (persiteEqualsMerged(key,
+                entries.get(calleeKey), argRegs,
+                persiteMask)) {
+                persiteSkippedIdentical++;
+                continue;
+            }
+            Map<String, PerSiteGroup> have =
+                persiteMap.get(calleeKey);
+            if (have != null && have.containsKey(key)) continue;
+            if (have != null && have.size() >= 32) {
+                persiteSkippedCap++;
+                continue;
+            }
+            if (persiteClones >= 1024) {
+                persiteSkippedCap++;
+                continue;
+            }
+            Map<String, Bits> entry = persiteEntry(
+                vals, argRegs, memSeeds, persiteMask);
+            FixResult cfx;
+            try {
+                cfx = runFixpoint(calleeRec.or.ops, memA,
+                    calleeRec.branchTargets, entry,
+                    calleeRec.loopCallOps);
+            } catch (Exception ex) {
+                cfx = emptyFix(calleeRec.or.ops.size());
+            }
+            if (!cfx.converged) {
+                persiteSkippedNonconv++;
+                continue;
+            }
+            List<String> desc = new ArrayList<String>();
+            desc.add((pair[2] == 0 ? "device-init:0x" :
+                "isr-table:0x") + Long.toHexString(devAddr));
+            PerSiteGroup g = new PerSiteGroup(
+                calleeKey, key, cfx, desc);
+            if (have == null) {
+                have = new HashMap<String, PerSiteGroup>();
+                persiteMap.put(calleeKey, have);
+            }
+            have.put(key, g);
+            persiteQueue.add(g);
+            persiteClones++;
+        }
+        // Worklist: scan each clone's ops for inner CALLs
+        // and device-API CALLINDs, whose bindings (read from
+        // the CLONE's in-states) may form new groups for the
+        // inner callee. Termination is structural: groups are
+        // only
         // added (never modified), keyed by (callee, vector),
         // and bounded by the caps above.
         int persiteQueueIdx = 0;
@@ -9511,16 +9772,42 @@ public class ExtractIR extends GhidraScript {
             List<OpRec> pops = calleeRec.or.ops;
             for (int pi = 0; pi < pops.size(); pi++) {
                 OpRec op = pops.get(pi);
-                if (!op.mnem.equals("CALL") ||
-                    op.ins.length < 1) continue;
-                Varnode t = op.ins[0];
-                if (t == null || t.getAddress() == null ||
-                    !"ram".equals(t.getAddress().getAddressSpace().
-                        getName())) continue;
-                FuncRec inner = funcByEntry.get(t.getOffset());
-                if (inner == null) {
-                    inner = funcByEntry.get(
-                        isa.stripInstructionTag(t.getOffset()));
+                if (op.ins.length < 1) continue;
+                FuncRec inner = null;
+                if (op.mnem.equals("CALL")) {
+                    Varnode t = op.ins[0];
+                    if (t == null || t.getAddress() == null ||
+                        !"ram".equals(t.getAddress().
+                            getAddressSpace().getName())) {
+                        continue;
+                    }
+                    inner = funcByEntry.get(t.getOffset());
+                    if (inner == null) {
+                        inner = funcByEntry.get(
+                            isa.stripInstructionTag(
+                                t.getOffset()));
+                    }
+                } else if (op.mnem.equals("CALLIND")) {
+                    // v14: indirect calls inside a clone
+                    // resolve against the CLONE's in-state
+                    // (not the merged fixpoint), so a wrapper
+                    // cloned with r0 = device dispatches to
+                    // the real driver function.
+                    long[] wRegs = isa.argumentRegisterOffsets(
+                        callConvMap.get(g.calleeKey));
+                    if (wRegs == null || wRegs.length < 1) {
+                        continue;
+                    }
+                    if (pi >= g.fx.inStates.length ||
+                        g.fx.inStates[pi] == null) continue;
+                    long[] pair = resolveDeviceCallSite(pops,
+                        g.fx.inStates[pi], pi, wRegs[0],
+                        devPtrSize, persiteMask, funcByEntry);
+                    if (pair != null) {
+                        inner = funcByEntry.get(pair[0]);
+                    }
+                } else {
+                    continue;
                 }
                 if (inner == null) continue;
                 // Self-recursion keeps merged behaviour (see
@@ -9633,6 +9920,11 @@ public class ExtractIR extends GhidraScript {
                 persiteSkippedUnknown + ", skippedCap=" +
                 persiteSkippedCap + ", skippedNonconv=" +
                 persiteSkippedNonconv + ".");
+            println("[*] devicesites: apiSites=" +
+                devApiSites + ", apiSkipped=" +
+                devApiSkipped + ", devInit=" +
+                devInitFound + ", devIsr=" + devIsrFound +
+                ".");
         println("[*] stackslot: stores=" + stkStoreCount +
             ", loadHits=" + stkLoadHitCount + ".");
         println("[*] tailsites: direct-branch tail-call sites " +

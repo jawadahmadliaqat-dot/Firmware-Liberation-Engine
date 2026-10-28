@@ -1,7 +1,7 @@
 <svg xmlns='http://www.w3.org/2000/svg' width='900' height='470' viewBox='0 0 900 470'>
-<title>Fixed findings by stack, extractor v3.13</title>
+<title>Fixed findings by stack, extractor v3.14</title>
 <rect width='900' height='470' fill='#0d1424'/>
-<text x='40' y='55' font-family='DejaVu Sans, Arial, sans-serif' font-size='28' font-weight='bold' fill='#f1f5f9'>FIXED FINDINGS · v3.13</text>
+<text x='40' y='55' font-family='DejaVu Sans, Arial, sans-serif' font-size='28' font-weight='bold' fill='#f1f5f9'>FIXED FINDINGS · v3.14</text>
 <text x='40' y='126' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>BMP</text>
 <rect x='190' y='100' width='480' height='34' rx='7' fill='#38bdf8'/>
 <text x='684' y='126' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>427</text>
@@ -23,9 +23,9 @@
 <text x='396' y='334' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>171</text>
 <text x='770' y='334' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#4ade80'>✓ PASS</text>
 <text x='40' y='386' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>Zephyr</text>
-<rect x='190' y='360' width='142' height='34' rx='7' fill='#38bdf8'/>
-<text x='346' y='386' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>127</text>
+<rect x='190' y='360' width='220' height='34' rx='7' fill='#38bdf8'/>
+<text x='424' y='386' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>196</text>
 <text x='770' y='386' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#4ade80'>✓ PASS</text>
 <line x1='40' y1='420' x2='860' y2='420' stroke='#384878' stroke-width='2'/>
-<text x='337' y='464' font-family='DejaVu Sans, Arial, sans-serif' font-size='32' font-weight='bold' fill='#fbbf24'>TOTAL 1,352</text>
+<text x='337' y='464' font-family='DejaVu Sans, Arial, sans-serif' font-size='32' font-weight='bold' fill='#fbbf24'>TOTAL 1,421</text>
 </svg>

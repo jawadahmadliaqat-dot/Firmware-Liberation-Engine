@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.13-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.14-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -21,12 +21,14 @@ flowchart LR
 
 - Lifts firmware to Ghidra P-Code and resolves hardware addresses statically:
   literal pools, CFG-fixpoint register tracking, per-site argument binding,
-  stack-slot tracking, direct-branch tail-call sites.
+  stack-slot tracking, direct-branch tail-call sites, .rodata
+  device-config/API-struct resolution (v3.14, Zephyr device-API).
 - Emits a JSON fact file: fixed MMIO / port / MSR accesses, may-access sets,
   protocol-call edges, BAR-relative provenance.
 - Checks the facts with Lean 4: in-window addresses, driver confinement
-  (each driver family touches only its own peripherals), and port/MSR
-  confinement against an architectural allowlist.
+  (each driver family touches only its own peripherals), port/MSR
+  confinement against an architectural allowlist, and clock-enable-before-use
+  (every used STM32 peripheral's gate register touched, generic mode).
 
 ## What it does not do
 
@@ -36,7 +38,7 @@ flowchart LR
 - It does not flash, unlock, or modify any device, and it takes no firmware
   uploads — there is no upload form anywhere in this project.
 
-## Results (extractor v3.13)
+## Results (extractor v3.14)
 
 | Target | Fixed findings | May | Lean verdict |
 |---|---|---|---|
@@ -45,10 +47,10 @@ flowchart LR
 | STM32F4 UART (-O0) | 171 MMIO | 0 | generic PASS |
 | nRF52 UART (-O3) | 205 MMIO | 0 | generic PASS |
 | TinyUSB cdc_msc (RP2040) | 224 MMIO | 0 | generic PASS |
-| Zephyr echo_bot (nRF52840) | 127 MMIO | 0 | generic PASS |
+| Zephyr echo_bot (nRF52840) | 196 MMIO | 0 | generic PASS |
 | Black Magic Probe, stripped | 314 MMIO | 5 sites / 9 addrs | generic PASS only (never bmp mode on stripped input) |
-| OVMF UEFI drivers (7 images) | 0 fixed MMIO · 27 ports · 2 MSRs | 0 | DxeCore / PciBus / QemuVideo PASS; PciHostBridge FAIL [0x510, 0x514, 0x518]; Sata / Virtio FAIL (empty trace) |
-| **Corpus total (6 stacks)** | **1,352** | | |
+| OVMF UEFI drivers (7 images) | 0 fixed MMIO · 27 ports · 2 MSRs | 0 | DxeCore / PciBus / PciHostBridge / QemuVideo PASS; Sata / Virtio FAIL (empty trace) |
+| **Corpus total (6 stacks)** | **1,421** | | |
 
 ![Fixed findings by stack](assets/corpus_chart.svg)
 
@@ -59,6 +61,47 @@ plane), Slice 4 direct-branch tail-call sites (nRF52 +23 TX path, BMP +4
 TIM3/TIM1 pairs, PciHostBridge +1 port 0x510). Zero findings lost on all
 25 regression fixtures. USART2 is still missing — see Limitations.
 
+**v3.14 changes:** device-API resolver — `.rodata` device-config/API structs
+seed per-site clones with the peripheral base, so Zephyr's UARTE driver layer
+resolves through device-API indirect dispatch. Zephyr 127 -> 196 (+69, zero
+lost, 10 gain functions, same ELF). UARTE layer 0 -> 65 (live 44/54; PSEL 4/4;
+GPIO tail 0/10 missed — the pin array flows through a lookup out-parameter
+and the loop join destroys per-pin values). Full regression exact on 36
+targets, Lean sweep zero flips. Corpus 1,352 -> 1,421. Version bumped
+v3.13 -> v3.14 because outputs changed on existing corpora.
+
+**Clock-enable-before-use (Lean-side, generic mode; no extractor change, no
+JSON change, no new flags):** every MUST access to a mapped STM32 peripheral's
+register block requires a MUST STORE to that peripheral's clock-gate register
+somewhere in the trace, printed as a `clock-enable` verdict line with a named
+violation line. Synthetic violation (built firmware, TIM3 clock only + GPIOA
+use) FAILs exactly: `clock-enable violations: [main mmio 0x4001080c (GPIOA
+needs 0x40021018 bit 2)]`; control (GPIOA clock + GPIOA use) PASSes;
+blink/BMP/F4 PASS. Honest v1 limits: order-free (gate touch anywhere in the
+trace, not must-precede — BMP proves file order is not execution order);
+register granularity, not bit granularity (a bit-precise check would
+false-FAIL BMP, whose generic `rcc_periph_clock_enable` helper resolves only
+3 gate bits in must); no-RCC firmware is vacuous PASS (the maps activate on
+gate touch, which is also what keeps non-STM32 targets safe); F4 USART2
+invisible (Gap B); enable→disable→use (LPUART shape) NOT caught.
+
+## Screenshots (real terminal output)
+
+Terminal captures (SVG) of verbatim output from real runs — not mockups, not
+diagrams. Binary PNGs cannot be pushed (the push tooling builds a UTF-8
+snapshot), so the captures are rendered as SVG; the text inside each one is
+copied byte-for-byte from the command shown, and the helper scripts live
+next to the captures.
+
+![Zephyr v3.14 Lean PASS](assets/screenshots/zephyr_v314_lean_pass.svg)
+Fresh `lake exe ingest_check ../analysis_reports/zephyr_v314.elf_report.json generic` (run from `lean/`): trace 196, clock-enable true, VERDICT: PASS.
+
+![Zephyr before/after](assets/screenshots/zephyr_before_after.svg)
+Computed from the v3.13 baseline and v3.14 Zephyr report JSONs (`python3 assets/screenshots/zephyr_before_after.py`, run from the repo root): 127 → 196, UARTE layer 0 → 65, gain +69 with zero losses.
+
+![v3.14 regression sweep](assets/screenshots/regression_sweep.svg)
+Fresh recount of the v3.14 regression log (`python3 assets/screenshots/regress_check.py`, run from the repo root): 36 targets checked, 0 mismatches.
+
 ## Honest zeros
 
 - **OVMF fixed MMIO: 0.** UEFI drivers reach hardware through protocols and
@@ -68,12 +111,23 @@ TIM3/TIM1 pairs, PciHostBridge +1 port 0x510). Zero findings lost on all
   PE/TE twin once), 2 MSRs, and protocol-call provenance.
 - **Real violations found: 0.** No real firmware has produced a confinement
   FAIL yet. The FAILs that exist are the synthetic demo below and
-  PciHostBridge's genuine-but-unidentified ports.
+  Sata/Virtio's genuinely-empty traces.
 - **Synthetic confinement demo (SYNTHETIC, not a found violation):** ARM
   driver-confinement bmp FAIL (`rcc_syndemo_touch` touches GPIOA
   0x4001080c) with control PASS; x86 port-confinement generic FAIL
   [`syndemo_bad_port` port 0x1234] with control COM1 PASS. Both shapes
-  preserved in v3.13.
+  preserved in v3.13 and v3.14. Clock-enable demo (SYNTHETIC, same rule):
+  built firmware with TIM3 clock only + GPIOA use FAILs exactly
+  [`main mmio 0x4001080c (GPIOA needs 0x40021018 bit 2)`] with control
+  (GPIOA clock + GPIOA use) PASS.
+- **PciHostBridge (resolved, not a finding):** its ports 0x510/0x514/0x518
+  are QEMU fw_cfg (0x510 selector, 0x511 data, 0x514 DMA address high,
+  0x518 DMA address low/trigger), identified from the binary (OUT
+  immediates feeding the generic IoWrite32 helper, high-then-low 32-bit
+  writes plus control poll) and the QEMU fw_cfg spec (DMA base 0x514).
+  The Lean allowlist grants the four named ports only, not the
+  0x510–0x518 range, and PciHostBridge now PASSES. Closing an allowlist
+  gap is not finding a bug.
 
 ## What it proves today
 
@@ -137,7 +191,7 @@ TIM3/TIM1 pairs, PciHostBridge +1 port 0x510). Zero findings lost on all
   - `blink` — clock+mode before LED, LED bit decided, clock bit set,
     mode clear-then-set (theorem version: `Verifier/BlinkProof.lean`)
   - `generic` — trace non-empty, masks consistent, all addresses in the
-    MMIO window
+    MMIO window, port/MSR confinement, clock-enable-before-use
   - `bmp` — **driver confinement**: each driver family touches only its
     own peripherals (see below)
 
@@ -163,7 +217,7 @@ full pipeline under a 512 MB Ghidra heap:
 | RISC-V support | `RiscVIsa` (RV32) — auto-selected by Ghidra language. Verified on `targets/riscv_blink` built from source: 18 trace ops, may 0, Lean generic PASS; ARM output unchanged. Test ELFs ship base64-encoded (`.b64`, decode like the blink fixture). |
 | Stripped binaries | No code change needed — the engine uses Ghidra auto-analysis, never debug info. Stripped BMP: 314 vs 427 must (−26%), may 9 vs 13, 0 suspects, Lean generic PASS; stripped blink: zero loss (10/10). **Stripped binaries must use generic mode only** — `bmp` mode passes vacuously on stripped input (`FUN_` names fall through) and proves nothing. Reproduce with [`elf_strip.py`](elf_strip.py) on the official BMP release ELF. |
 | MIPS support | `MipsIsa` (MIPS32 BE+LE) — auto-selected by Ghidra language. Verified on `targets/mips_blink` built from source: 14 trace ops, may 0, 2 certain indirect edges, Lean generic PASS (the report carries the platform's MMIO bands in `mmio_windows`; old reports fall back to the ARM window); ARM output unchanged. Test ELF ships base64-encoded (`.b64`). |
-| x86 support (v3.8) | `X86Isa` (x86-64 first; 32-bit structural only, untested) — auto-selected by Ghidra language; PE verified, TE supported via the custom TeLoader (v1, see TE row). Signature-driven calling conventions (per-callee Ghidra signature, binary default PE→Windows / ELF→System V, `abi=` override, SysV union only for unknown callees); overlapping registers handled by conservative full-register invalidation + derive-contained-views + slice-aware reads (not per-byte tracking). Port I/O (`port_io_accesses`) and MSRs (`msr_accesses`) are separate JSON classes; PCI config ports fall out raw (BDF decoding is v2). Verified on `targets/x86_blink` built from source: 11 MMIO, may 0, 2 port, 3 MSR, 2 certain indirect edges, Lean generic PASS, trace 16 (11 MMIO, 2 port, 3 MSR). OVMF corpus (EDK2 2025.11, 6 DXE drivers incl. DxeCore, 411 functions — DxeCore alone is 254): no crashes, but 0 fixed-band MMIO — real UEFI code reaches hardware via protocol calls, parameter-port helpers, and runtime-discovered BARs, so inter-procedural constant propagation shipped in v3.9 (OVMF unchanged — see v3.9 row); protocol-aware points-to shipped in v3.10 (see v3.10 row); ACPI-derived bands implemented (MCFG-only) but dormant on OVMF — no tables in image, see ACPI row; Lean generic on OVMF reports: DxeCore, QemuVideo PASS (their port/MSR findings now enter the trace — v2 item #1, Lean-side only, extractor now v3.10); PciBus now PASSES too (v3.10 protocol findings); PciHostBridge FAILS on confinement only since v3.12 (new genuine ports 0x514/0x518 outside the allowlist — see v3.12 row); at v3.13 the violation set grows to [0x510, 0x514, 0x518] (0x510 = QEMU fw_cfg data port) and its port count is 8 — see v3.13 row; SataController, VirtioBlk still fail on genuinely-empty trace. Port/MSR sanity enforced (port ≤ 0xFFFF, MSR index < 2^32); port/MSR confinement shipped (Lean-side, see confinement row). Real mode (16-bit) assessed, still open. Test ELF ships base64-encoded (`.b64`). |
+| x86 support (v3.8) | `X86Isa` (x86-64 first; 32-bit structural only, untested) — auto-selected by Ghidra language; PE verified, TE supported via the custom TeLoader (v1, see TE row). Signature-driven calling conventions (per-callee Ghidra signature, binary default PE→Windows / ELF→System V, `abi=` override, SysV union only for unknown callees); overlapping registers handled by conservative full-register invalidation + derive-contained-views + slice-aware reads (not per-byte tracking). Port I/O (`port_io_accesses`) and MSRs (`msr_accesses`) are separate JSON classes; PCI config ports fall out raw (BDF decoding is v2). Verified on `targets/x86_blink` built from source: 11 MMIO, may 0, 2 port, 3 MSR, 2 certain indirect edges, Lean generic PASS, trace 16 (11 MMIO, 2 port, 3 MSR). OVMF corpus (EDK2 2025.11, 6 DXE drivers incl. DxeCore, 411 functions — DxeCore alone is 254): no crashes, but 0 fixed-band MMIO — real UEFI code reaches hardware via protocol calls, parameter-port helpers, and runtime-discovered BARs, so inter-procedural constant propagation shipped in v3.9 (OVMF unchanged — see v3.9 row); protocol-aware points-to shipped in v3.10 (see v3.10 row); ACPI-derived bands implemented (MCFG-only) but dormant on OVMF — no tables in image, see ACPI row; Lean generic on OVMF reports: DxeCore, QemuVideo PASS (their port/MSR findings now enter the trace — v2 item #1, Lean-side only, extractor now v3.10); PciBus now PASSES too (v3.10 protocol findings); PciHostBridge FAILED on confinement at v3.12–v3.13 (genuine ports 0x514/0x518, then [0x510, 0x514, 0x518], outside the allowlist — see v3.12/v3.13 rows) and now PASSES: the three ports are QEMU fw_cfg (0x510 selector, 0x511 data, 0x514 DMA address high, 0x518 DMA address low/trigger), and the Lean allowlist grants the four named ports — see fw_cfg row; SataController, VirtioBlk still fail on genuinely-empty trace. Port/MSR sanity enforced (port ≤ 0xFFFF, MSR index < 2^32); port/MSR confinement shipped (Lean-side, see confinement row). Real mode (16-bit) assessed, still open. Test ELF ships base64-encoded (`.b64`). |
 | Inter-procedural constant propagation (v3.9) | Extractor-side only, JSON shape unchanged. Exact argument-register constants propagate across direct calls when EVERY direct call site agrees (else unknown, never guessed; since retprop, meetOverSites also binds when all sites agree on the same BAR/BASE symbol); guarded by: all Ghidra callers direct, callee never address-taken, never a tail-call target, x86-64 convention known (unknown convention ⇒ unmodelled, never the clobber union). ARM BMP must 235 → 346 (v3.9) → 422 (v3.11, per-site) → 423 (v3.12, clobber) (libopencm3 peripheral helpers with consistent bases: adc/dma/flash/gpio/rcc/timer; 0 accesses lost, may 7/13 unchanged, classifier 423/0); stripped BMP 198 → 241 (v3.9) → 312 (v3.11, per-site). OVMF unchanged (0 MMIO / 2 port / 1 MSR): UEFI BARs flow through protocols and memory, not constant arguments — memory propagation and protocol-aware points-to remain. Lean: all previous PASS verdicts hold (BMP bmp PASS at 423/13). Soundness fixture: targets/x86_constprop_test. |
 | Protocol-aware points-to (v3.10) | x86-64 UEFI only. Boot Services interface acquisition (Locate/Handle/OpenProtocol, InstallMultiple variadic pairs), embedded-interface + parameter tracking, member-call resolution to PciIo/PciRootBridgeIo methods. Pci.Read/Write attributed to PCI config cycles (OUT 0xCF8 + IN/OUT 0xCFC); all other methods recorded as visible protocol-call edges, never fabricated accesses. PciBusDxe 0 → 2 port findings + 50 protocol edges, unresolved 195 → 145; DxeCore 94 → 73, PciHostBridge 32 → 23, QemuVideo 6 → 2; no regressions on any other corpus (all v3.9 numbers byte-identical). Soundness: a protocol call resolves only when interface identity AND method offset are certain (GUID-resolved or single-implementation); ambiguous calls stay unresolved/may — FUN_00002154's 9 unknown-interface member calls gain zero findings. Caveat: protocol-attributed port entries record the engine's generic size (4); the Width argument is not decoded (PciBus Pci.Write at 0x682f is Width=0/Uint8, so the true CFC phase is 1 byte). ECAM-only platforms differ from the CF8/CFC mechanism attributed here. |
 | ACPI-derived bands (MCFG) | Extractor-side, x86 branch only, JSON shape unchanged. The input image is signature-scanned for a valid ACPI MCFG table (signature + exact length arithmetic + checksum + sane allocations); derived ECAM bands [base, base + nBuses*1MB) are unioned into mmio_windows, else static x86 bands (explicit mmio= suppresses augmentation). OVMF result: NO bands derived — OVMF_CODE_4M.fd contains no ACPI tables at all (tables are QEMU runtime artifacts via fw_cfg; the installer driver QemuFwCfgAcpiPlatform contains no MCFG string, no 0xB0000000 immediate, no RSDP). Validated on synthetic carriers (non-default base 0xE0000000 → band [0xE0000000, 0xE0200000); corrupted checksum/length fall back to static bands). Test fixtures: targets/acpi_mcfg_test. DSDT/SSDT OperationRegions remain future work (need an AML parser; no DSDT/SSDT exists in this image anyway). Version stays v3.10: outputs unchanged on all real corpora. |
@@ -175,8 +229,11 @@ full pipeline under a 512 MB Ghidra heap:
 | u32/INT_SEXT MMIO recovery (v3.10, no version bump — no existing-corpus output changed) | A 32-bit MMIO address held in a u32 (bit 31 set) is widened on x86-64 through a signed int, so Ghidra lifts INT_SEXT and the address becomes 0xFFFFFFFFFED00000, outside every band. The fix recovers the low 32 bits ONLY when the Bits prove bits 63..32 are all copies of bit 31 (band-gated: a truncated value outside every band keeps today's behaviour, so nothing is band-shopped and no non-band memState key moves). Three layers were fixed, not one: (1) COPY-from-ram read a full 8-byte pointer even for 4-byte loads and threw at block ends — now size-correct reads; (2) INT_SEXT/INT_ZEXT with a folded global load (movslq mem, reg) resolved ram inputs to unknown — now image bytes like COPY-from-ram; (3) band-gated truncation at every address site (must emission, STORE/COPY-to-ram transfer, loadBits, gmem seed/leak scans, may filter, ports, MSR indices — MSR un-gated since indices are architecturally 32-bit). Fixture `targets/x86_u32_test/` (before: mmio 2; after: mmio 6, Lean generic PASS trace 6; all 3 soundness negatives absent: genuine 64-bit pointer, sext-not-in-band, unknown parameter). On all real corpora outputs are unchanged (0/20 identical, version stays v3.10): the regression corpora contain no u32-MMIO pattern (their globals are u64, their addresses constants). Out of slice: ARM/RISC-V/MIPS have no analogous path (all address varnodes 4 bytes; MIPS SEXTs are 1->4 value extensions); genuine-64-bit addresses whose upper bits happen to be all sign copies remain indistinguishable from sign-extended 32-bit addresses at the Bits level (documented residual). |
 | Port/MSR confinement (Lean-side only, extractor v3.10 unchanged) | Generic mode now checks every port/MSR trace entry against an architectural allowlist selected by the report's `language` field (x86: PCI config 0xCF8–0xCFF, legacy PIC/PIT/DMA/keyboard/CMOS, serial COM1–COM4; Intel SDM architectural MSRs incl. APIC_BASE 0x1B and EFER 0xC0000080; AMD SYSCFG/HWCR/GHCB/SEV_STATUS). Non-allowlisted entries produce a distinct `confinement violations: [func kind 0xaddr, ...]` line and FAIL the verdict — never silently dropped, never silently passed. Non-x86 architectures and unknown language have no allowlist, so port/MSR entries there fail (no "everything passes" default). Protocol-attributed CF8/CFC ports pass by the architectural PCI range, with no exemption. Bmp/blink modes untouched. Verified at v3.10: all 7 OVMF drivers' verdicts unchanged (DxeCore IN 0xCFE, PciBus CF8/CFC, PciHostBridge RDMSR 0xC0010131, QemuVideo OUT 0xCF8 all pass with reason); PciHostBridge's verdict changed at v3.12 (see v3.12 row); all other Lean verdicts unchanged; synthetic negatives (port 0x1234, MSR 0xC0009999, COM1 port on an ARM report) all FAIL with named violations. Out of slice: profile-file/report-field allowlist extension (would need a new CLI argument or JSON field); device-register ports (parallel/VGA/IDE/floppy) go through the documented source-edit allowlist path. |
 | v3.11 — per-site transfer (extractor) | A callee is analyzed separately per distinct argument-binding group instead of one all-sites-agree summary, so a helper called with different arguments at different sites resolves per site. Clone per binding equivalence class (not per call site); clones never merge back into a shared summary; findings recorded under the callee, deduped by (instr, location); recursion via intra-procedural clones (inner CALLs use merged summaries; self-sites skipped); caps 32 groups/callee, 1024 clones total, excess groups fall back to merged/unknown (never a guessed value). Constants + BAR/BASE symbols flow per-site; struct/interface provenance per-site is future work. BMP 346 -> 422 (+76, all libopencm3 parameter helpers, source-verified e.g. dma_channel_reset channel-5 registers), stripped 241 -> 312, constprop 2 -> 3, u32 6 -> 8, zero findings lost anywhere. QemuVideoDxe UNCHANGED (0/1/0): per-site splits its generic helper into CF8 and CFC clones, but the IN stays unknown because the intervening CALL clobbers RCX — the actual unlock is callee clobber refinement (shipped in v3.12, see next row). On BMP the global clone cap binds (1024 clones, 1213 groups skipped, sound fallback to merged/unknown). Fixture `targets/x86_persite_test/` (new code: MMIO 7, port 7, BAR 2, Lean generic PASS trace 14; old code: MMIO 1, port 5, BAR 0). Version bumped v3.10 -> v3.11 because outputs changed on existing corpora. |
-| v3.12 — callee clobber refinement (extractor) | A direct CALL now clobbers only the registers the callee may actually write on some path (per-callee may-write sets over the call graph, all-paths rule; indirect calls stay fully conservative; caller-saved values provably surviving a call are preserved). This is the measured QemuVideoDxe unlock: the generic helper's IN at 000016d6 now resolves to CF8 and CFC per site (port 1 → 3, PE and TE twin identical, Lean generic PASS trace 3). Same shape unlocks DxeCore's generic IO helpers (port 1 → 11: COM1 block 0x3f8–0x3fd plus PCI CF8/CFC) and PciHostBridge's (port 0 → 7, incl. literal-immediate sites at 0x514/0x518 — see confinement note). BMP 422 → 423 (new ADC1_CR2 LOAD in adc_is_calibrating, source-verified in libopencm3). Soundness negatives hold: one-path writes, mixed save/restore, and indirect-call callees all stay fully clobbered. Documented limit: balanced push/pop of a caller-saved register still counts as a write (save/restore analysis is future work). May/taint transfers deliberately left conservative. PciHostBridge confinement note: its Lean generic verdict is now FAIL on confinement, naming only 0x514/0x518 — new genuine findings outside the architectural allowlist; allowlist extension is a separate Lean-side decision pending identification of that device. Fixture `targets/x86_clobber_test/` (new code: MMIO 1, port 4, Lean generic PASS trace 5; old code: MMIO 1, port 1). Version bumped v3.11 -> v3.12 because outputs changed on existing corpora. |
-| v3.13 — stack-slot tracking + direct-branch tail-call sites (extractor) | Slice 1: stack slots (`SP:<func>:<delta>` symbols) flow through COPY/INT_ADD/INT_SUB; SP seeded at op 0, loop back-edges meet into it; `stk:` cells range-dropped on overlapping stores and dropped entirely on escape to non-stack memory or on CALLIND/unknown/tainted calls (a restricted "b-lite" rule keeps them across direct calls to known untainted callees unless an argument carries an SP symbol). Slice 4: `sitesByCallee` now accepts direct BRANCH ops to another function's entry alongside CALL ops, so helpers entered only via tail branches get binding sites — this is the nRF52 TX unlock (its TX functions were NOT stack-spilled; they had no binding site at all). STM32F4 -O0 150 -> 171 (+21 GPIO plane, all code-true), nRF52 182 -> 205 (+23), BMP 423 -> 427 (+4 TIM3_CR1/TIM1_BDTR pairs), stripped 312 -> 314, Zephyr 126 -> 127 (RTC1 CC[0]), F4 -O2 169 -> 171, PciHostBridge port 7 -> 8 (new 0x510 fw_cfg data port; Lean generic FAIL now [0x510, 0x514, 0x518]). Corpus 1,303 -> 1,352; zero findings lost on all 25 fixtures. A third piece (entry-memory flow, `meetMemOnly`) was built, measured zero added and zero lost, and reverted — a sound change with no measured benefit does not ship. Gap B (USART2) NOT fixed: indexed AFR stores in HAL_GPIO_Init must drop-all (base + unbounded runtime pin index can wrap to any address including RAM) and the `__udivmoddi4` division chain blocks the handle-struct path; sound routes are redesigns (edge-translated closure, SARG seeding, per-site-clone summaries + re-run), not patches. Classifier profile reconciled: `stm32f4_profile.json` gains real EXTI (0x40013C00–0x40014000) and PWR (0x40007000–0x40007400) blocks from the STM32F407 SVD — F4 v3.13 now classifies 164 known / 7 suspects (bit-band aliases only). Version bumped v3.12 -> v3.13 because outputs changed on existing corpora. |
+| v3.12 — callee clobber refinement (extractor) | A direct CALL now clobbers only the registers the callee may actually write on some path (per-callee may-write sets over the call graph, all-paths rule; indirect calls stay fully conservative; caller-saved values provably surviving a call are preserved). This is the measured QemuVideoDxe unlock: the generic helper's IN at 000016d6 now resolves to CF8 and CFC per site (port 1 → 3, PE and TE twin identical, Lean generic PASS trace 3). Same shape unlocks DxeCore's generic IO helpers (port 1 → 11: COM1 block 0x3f8–0x3fd plus PCI CF8/CFC) and PciHostBridge's (port 0 → 7, incl. literal-immediate sites at 0x514/0x518 — see confinement note). BMP 422 → 423 (new ADC1_CR2 LOAD in adc_is_calibrating, source-verified in libopencm3). Soundness negatives hold: one-path writes, mixed save/restore, and indirect-call callees all stay fully clobbered. Documented limit: balanced push/pop of a caller-saved register still counts as a write (save/restore analysis is future work). May/taint transfers deliberately left conservative. PciHostBridge confinement note: its Lean generic verdict is now FAIL on confinement, naming only 0x514/0x518 — new genuine findings outside the architectural allowlist; allowlist extension is a separate Lean-side decision pending identification of that device. (Resolved after v3.13: the device is QEMU fw_cfg, the allowlist was extended — see fw_cfg row; PciHostBridge now PASSES.) Fixture `targets/x86_clobber_test/` (new code: MMIO 1, port 4, Lean generic PASS trace 5; old code: MMIO 1, port 1). Version bumped v3.11 -> v3.12 because outputs changed on existing corpora. |
+| v3.13 — stack-slot tracking + direct-branch tail-call sites (extractor) | Slice 1: stack slots (`SP:<func>:<delta>` symbols) flow through COPY/INT_ADD/INT_SUB; SP seeded at op 0, loop back-edges meet into it; `stk:` cells range-dropped on overlapping stores and dropped entirely on escape to non-stack memory or on CALLIND/unknown/tainted calls (a restricted "b-lite" rule keeps them across direct calls to known untainted callees unless an argument carries an SP symbol). Slice 4: `sitesByCallee` now accepts direct BRANCH ops to another function's entry alongside CALL ops, so helpers entered only via tail branches get binding sites — this is the nRF52 TX unlock (its TX functions were NOT stack-spilled; they had no binding site at all). STM32F4 -O0 150 -> 171 (+21 GPIO plane, all code-true), nRF52 182 -> 205 (+23), BMP 423 -> 427 (+4 TIM3_CR1/TIM1_BDTR pairs), stripped 312 -> 314, Zephyr 126 -> 127 (RTC1 CC[0]), F4 -O2 169 -> 171, PciHostBridge port 7 -> 8 (new 0x510 fw_cfg selector port; Lean generic FAIL now [0x510, 0x514, 0x518] — since resolved, see fw_cfg row). Corpus 1,303 -> 1,352; zero findings lost on all 25 fixtures. A third piece (entry-memory flow, `meetMemOnly`) was built, measured zero added and zero lost, and reverted — a sound change with no measured benefit does not ship. Gap B (USART2) NOT fixed: indexed AFR stores in HAL_GPIO_Init must drop-all (base + unbounded runtime pin index can wrap to any address including RAM) and the `__udivmoddi4` division chain blocks the handle-struct path; sound routes are redesigns (edge-translated closure, SARG seeding, per-site-clone summaries + re-run), not patches. Classifier profile reconciled: `stm32f4_profile.json` gains real EXTI (0x40013C00–0x40014000) and PWR (0x40007000–0x40007400) blocks from the STM32F407 SVD — F4 v3.13 now classifies 164 known / 7 suspects (bit-band aliases only). Version bumped v3.12 -> v3.13 because outputs changed on existing corpora.
+| QEMU fw_cfg allowlist (Lean-side, generic mode) | PciHostBridgeDxe's ports 0x510/0x514/0x518 identified from the binary: OUT immediates at 0x2f30 (`mov $0x514`) and 0x2f43 (`mov $0x518`) feeding the generic IoWrite32 helper, high 32 bits then low 32 bits of a `FwCfgDmaAccess` struct address, then a control-field completion poll — exactly the QEMU fw_cfg DMA protocol (spec DMA base 0x514; 64-bit register, low-half write triggers). The driver reads `etc/hardware-info` and `etc/extra-pci-roots` through QemuFwCfgLib, which is why the DMA routine is linked in at all. `x86PortAllowed` now grants the four named ports (0x510 selector, 0x511 data, 0x514 DMA high, 0x518 DMA low/trigger), NOT the 0x510–0x518 range (the in-between ports are unassigned padding). PciHostBridge FAIL [0x510, 0x514, 0x518] -> PASS (all 3 report variants); synthetic bad-port control still FAILs on 0x1234 (no hole opened); full OVMF sweep otherwise unchanged (Sata/Virtio still FAIL on empty trace, pre-existing). This is an allowlist gap closed, not a finding — never cite it as one. No version bump: verifier-only change, extractor untouched.
+| Clock-enable-before-use (Lean-side, generic mode) | Generalization of the blink theorem: every MUST access to a mapped STM32 peripheral's register block requires a MUST STORE to that peripheral's clock-gate register somewhere in the trace (ClockGate tables for STM32F1/RM0008 and STM32F4/RM0090, cross-checked against the Keil STM32F407 SVD: all 31 block ranges match). New `clock-enable` verdict line plus a named violation line under existing `generic` mode — no extractor change, no JSON change, no new flags or modes; `bmp`/`blink` modes untouched. PASS on blink, BMP (427), F4 -O0/-O2 (171), BMP stripped (314); synthetic violation (built firmware, TIM3 clock only + GPIOA use) FAILs exactly `[main mmio 0x4001080c (GPIOA needs 0x40021018 bit 2)]`, control PASSes; zero regression flips. Honest v1 limits, documented in code: order-free, not must-precede (BMP proves file order is not execution order); register granularity, not bit granularity; no-RCC firmware vacuous PASS (maps activate on gate touch — also what keeps non-STM32 targets safe); F4 USART2 invisible (Gap B); enable→disable→use (LPUART shape) NOT caught. Phase 2 (must-precede `gate_state_before` evidence + bit precision + `chip` field) needs a JSON-shape decision. Fixture `targets/arm_syndemo_clock/`. No version bump: verifier-only change.
+| v3.14 — device-API resolver (extractor) | Zephyr's device-API indirection defeated by resolving `.rodata` device-config/API structs: the device struct yields the peripheral base, the API struct yields the driver functions, and per-site clones are seeded with the base so indirect dispatch resolves. Console: `devicesites: apiSites=9, apiSkipped=15, devInit=4, devIsr=1`. Zephyr 127 -> 196 (+69, zero lost, 10 gain functions, same ELF `96d7bae0635eee8d6b0e9bd5ee4881e6`, may 0, 269 functions). UARTE layer 0 -> 65 (live 44/54: init 14, PSEL 4, poll_out 7, is_tx_ready 1, isr 11, rx_enable 2, rx_ready 1, fifo_read 4 — all register-exact; missed 10/54 all pinctrl GPIO tail, loop-join cause; 21 extras are path-insensitive dead-block/dead-arm sites, recorded per the engine's address-known discipline, never pruned by branch feasibility; outside-layer gains gpiote 2 + gppi 2). One bug found and fixed during measurement: the first run's shape-only ISR validator accepted `arg=0` (the ARM vector table at address 0 "looks like" a struct) and seeded 46 bogus ISR clones — fixed by requiring ISR args to be members of the device set; bogus clones produced zero findings. Full regression exact on 36 targets (all v3.13 numbers reproduced, OVMF ports identical — the ISA-neutral resolver caused no x86 changes); Lean sweep zero flips (Zephyr PASS, clock-enable true). Still blind: non-live 21 functions (all-slots seeding is a parent decision — it changes a finding's meaning from called to callable), GPIO tail 10 (redesign), ISR→callback BRANCHIND link, stripped-binary enumeration (Slice B needs symbols). Version bumped v3.13 -> v3.14 because outputs changed on existing corpora. |
 
 ## Quickstart (any Linux box)
 
@@ -243,34 +300,40 @@ remote. `--no-upload` skips the report upload. `FIRMWARE_WORKSPACE` and
   strict and the question is closed by measurement, not by widening.
 - No QEMU/angr/HIL in this stage — those belong to the big pipeline.
 - Stripped binaries lose names, so driver-family attribution is gone: use generic mode only. `bmp` mode on stripped input passes vacuously (every `FUN_` name falls through the family mapping) — never quote that PASS.
-- **USART2 (STM32F4) is still missing at v3.13, by design of the soundness
+- **USART2 (STM32F4) is still missing at v3.14, by design of the soundness
   rule, not by oversight.** The HAL handle struct (`UartHandle.Instance`)
   lives in RAM, and the path to it runs through indexed AFR stores that a
   sound must-analysis must drop-all, plus a `__udivmoddi4` division chain.
   Fixing it needs a redesign (edge-translated closure, SARG seeding, or
   per-site-clone summaries + re-run), not a patch. See the v3.13 row.
-- **Zephyr device-API indirection is still missing.** The entire UARTE
-  driver layer (20+ functions) and pinctrl writes are missed because the
-  peripheral base lives in a `.rodata` config struct reached only through
-  device-API indirect dispatch, which per-site binding (direct calls only)
-  never resolves. Bare-metal nRF52 recovers the same hardware because its
-  instance is bound through direct calls.
+- **Zephyr device-API indirection, live path: recovered in v3.14.** The
+  UARTE driver layer went 0 -> 65 (live 44/54) via `.rodata`
+  device-config/API-struct resolution seeding per-site clones. Still blind:
+  the 21 non-live functions (no callers in this app — recovering them needs
+  all-slots seeding, a parent decision, since it changes what a finding
+  means from called to callable); the pinctrl GPIO tail 0/10 (the pin array
+  flows through a lookup out-parameter and the loop join destroys per-pin
+  values — redesign, not patch); the ISR→callback BRANCHIND link;
+  stripped-binary enumeration (Slice B needs symbols). Bare-metal nRF52
+  recovers the same hardware because its instance is bound through direct
+  calls.
 - **RP2040 blind spots:** boot stage 2 is never recovered as a function by
   Ghidra (34 MMIO instructions, 0 recovered), and the ARM extractor window
   (0x40000000–0x60000000) excludes SIO at 0xd0000000 (32 spinlock stores
   missed; SIO GPIO data missed on TinyUSB too).
 - **Lean `bmp` mode prints only a boolean** for driver confinement — it
   does not name the violating entry. Read the entry from the report JSON.
-- **PciHostBridge ports 0x514/0x518 are still unidentified** from the
-  binary. The allowlist has not been extended to cover them, and the
-  page/card FAIL stands until the device is identified.
+- **PciHostBridge ports 0x514/0x518: identified** as QEMU fw_cfg DMA
+  address high/low-trigger (0x510 selector, 0x511 data); the allowlist
+  grants the four named ports and PciHostBridge PASSES. This was an
+  allowlist gap, not a finding.
 - **Real mode (16-bit x86) is still open**, as is context-sensitive helper
   resolution and per-site provenance (Prov per-site).
 
 ## Project layout
 
 ```
-ExtractIR.java            # the extractor (Ghidra script, v3.13)
+ExtractIR.java            # the extractor (Ghidra script, v3.14)
 ingest_and_analyze.py     # one-command pipeline: binary -> report JSON
 classify_mmio.py          # local-vs-target classifier + chip profiles
 svd_import.py             # CMSIS-SVD -> chip profile JSON
@@ -280,6 +343,7 @@ loaders/te/               # custom Ghidra TE ("VZ") image loader, v1
 targets/                  # fixtures built from public source (.c + .elf.b64)
 docs/                     # static reports site (GitHub Pages, /docs)
 assets/                   # README diagrams (SVG, text-only by design)
+assets/screenshots/       # terminal captures (SVG, verbatim real output) + helper scripts
 *_profile.json            # chip peripheral profiles (hand + SVD-derived)
 setup.sh                  # JDK + Ghidra + Lean install
 ```
