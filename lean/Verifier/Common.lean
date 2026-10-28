@@ -250,7 +250,15 @@ def inRange (addr lo hi : Nat) : Bool :=
     entries that platform firmware touches during init and bring-up.
     PCI configuration mechanism 1 (0xCF8-0xCFF, address + data bytes);
     legacy interrupt/timer/DMA/keyboard/CMOS (PIC, PIT, DMA pages,
-    keyboard controller, RTC); serial UARTs COM1-COM4. Device registers
+    keyboard controller, RTC); serial UARTs COM1-COM4. QEMU fw_cfg
+    (0x510 selector, 0x511 data, 0x514 DMA address high, 0x518 DMA
+    address low/trigger): identified from PciHostBridgeDxe (OVMF corpus,
+    Oct 2026 — OUT 0x514/0x518 immediates feeding the generic IoWrite32
+    helper, high-then-low 32-bit writes plus control poll, QEMU fw_cfg
+    spec base 0x514) and conditioned on the OVMF-on-QEMU platform, like
+    the COM/legacy entries are conditioned on the PC platform. Only the
+    four documented ports are granted, not the 0x510-0x518 range: the
+    in-between ports are unassigned padding. Device registers
     (parallel, VGA, IDE, floppy) are deliberately NOT included: firmware
     touching them extends this list with a justification comment (the
     allowlist path), it does not get a silent pass. -/
@@ -262,7 +270,8 @@ def x86PortAllowed (p : Nat) : Bool :=
   p == 0x60 || p == 0x64 ||
   inRange p 0x70 0x72 ||
   inRange p 0x3F8 0x400 || inRange p 0x2F8 0x300 ||
-  inRange p 0x3E8 0x3F0 || inRange p 0x2E8 0x2F0
+  inRange p 0x3E8 0x3F0 || inRange p 0x2E8 0x2F0 ||
+  p == 0x510 || p == 0x511 || p == 0x514 || p == 0x518
 
 /-- Architectural x86 MSR allowlist: the firmware-init-relevant core.
     Intel SDM Vol 4 architectural MSRs (TSC, APIC_BASE, BIOS_SIGN_ID,
