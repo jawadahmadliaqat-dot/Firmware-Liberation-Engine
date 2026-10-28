@@ -1,0 +1,71 @@
+{
+  "forbidden_regions": [
+    [
+      "0x40023C00",
+      "0x40023FFF",
+      "FLASH_CONTROLLER"
+    ]
+  ],
+  "formal_proof_status": "LEAN4_GENERIC_PASS: confinement true, clock-enable true, all addresses in MMIO window, masks consistent (extractor v3.14, must-trace only, may excluded)",
+  "provenance": {
+    "extractor_version": "v3.14",
+    "forbidden_rationale": "explicit --forbid ranges only; a block the firmware uses can never be forbidden (overlap-checked)",
+    "generator": "firmware_workspace/manifest_gen.py (reads reports, changes no engine code/shape/CLI)",
+    "lean_generic_verdict_lines": [
+      "trace ops: 10",
+      "trace ops by kind (mmio, port, msr): (10, 0, 0)",
+      "may trace ops: 0",
+      "trace non-empty: true",
+      "masks consistent (ones & zeroes == 0): true",
+      "all addresses in MMIO window: true",
+      "port/MSR sanity (port \u2264 0xFFFF, MSR index < 2^32): true",
+      "port/MSR confinement (every port/MSR in the architectural allowlist): true",
+      "clock-enable (every used peripheral's gate register touched): true",
+      "VERDICT: PASS"
+    ],
+    "name_mapping_applied": {},
+    "profile": "stm32f4_profile.json",
+    "profile_chip": "STM32F4 (PARTIAL profile \u2014 blocks needed for the blink ground truth + common AHB1 blocks)",
+    "range_evidence": {
+      "GPIOA": {
+        "example_function": "main",
+        "must_access_count": 8,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "GPIOA"
+      },
+      "RCC": {
+        "example_function": "main",
+        "must_access_count": 2,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "RCC"
+      }
+    },
+    "range_semantics": "profile blocks (half-open) converted to inclusive manifest ends; block granularity (the engine proves block-level confinement, not register-level); may accesses excluded",
+    "report": "analysis_reports/stm32_blink.elf_report.json",
+    "report_binary_name": "stm32_blink.elf",
+    "report_may_total_excluded": 0,
+    "report_mmio_total": 10
+  },
+  "sha256_hash": "23f553cfc57a0e2b0c504bfe3ac9f45cfa49cf942cb0c26699ca6e6d08b42d23",
+  "target_architecture": "ARM_CORTEX_M4",
+  "verified_mmio_ranges": [
+    [
+      "0x40020000",
+      "0x400203FF",
+      "GPIOA",
+      "read_write"
+    ],
+    [
+      "0x40023800",
+      "0x40023BFF",
+      "RCC",
+      "read_write"
+    ]
+  ]
+}

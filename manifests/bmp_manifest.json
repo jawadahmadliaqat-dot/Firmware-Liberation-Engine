@@ -1,0 +1,232 @@
+{
+  "forbidden_regions": [],
+  "formal_proof_status": "LEAN4_GENERIC_PASS: confinement true, clock-enable true, all addresses in MMIO window, masks consistent (extractor v3.14, must-trace only, may excluded)",
+  "provenance": {
+    "extractor_version": "v3.14",
+    "forbidden_rationale": "explicit --forbid ranges only; a block the firmware uses can never be forbidden (overlap-checked)",
+    "generator": "firmware_workspace/manifest_gen.py (reads reports, changes no engine code/shape/CLI)",
+    "lean_generic_verdict_lines": [
+      "trace ops: 427",
+      "trace ops by kind (mmio, port, msr): (427, 0, 0)",
+      "may trace ops: 13",
+      "trace non-empty: true",
+      "masks consistent (ones & zeroes == 0): true",
+      "all addresses in MMIO window: true",
+      "port/MSR sanity (port \u2264 0xFFFF, MSR index < 2^32): true",
+      "port/MSR confinement (every port/MSR in the architectural allowlist): true",
+      "clock-enable (every used peripheral's gate register touched): true",
+      "VERDICT: PASS"
+    ],
+    "name_mapping_applied": {
+      "GPIOB": "GPIOB_LED"
+    },
+    "profile": "stm32f1_profile.json",
+    "profile_chip": "STM32F1 (STM32F103, public memory map RM0008)",
+    "range_evidence": {
+      "ADC1": {
+        "example_function": "platform_target_voltage_sense",
+        "must_access_count": 35,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "ADC1"
+      },
+      "AFIO": {
+        "example_function": "gpio_primary_remap",
+        "must_access_count": 2,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "AFIO"
+      },
+      "CRC": {
+        "example_function": "stm32_crc32",
+        "must_access_count": 4,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "CRC"
+      },
+      "DMA1": {
+        "example_function": "dma_channel_reset",
+        "must_access_count": 42,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "DMA1"
+      },
+      "EXTI": {
+        "example_function": "exti_set_trigger",
+        "must_access_count": 13,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "EXTI"
+      },
+      "FLASH": {
+        "example_function": "flash_set_ws",
+        "must_access_count": 2,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "FLASH"
+      },
+      "GPIOA": {
+        "example_function": "platform_nrst_set_val",
+        "must_access_count": 109,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "GPIOA"
+      },
+      "GPIOB_LED": {
+        "example_function": "main",
+        "must_access_count": 34,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "GPIOB"
+      },
+      "GPIOC": {
+        "example_function": "platform_target_clk_output_enable",
+        "must_access_count": 7,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "GPIOC"
+      },
+      "RCC": {
+        "example_function": "debug_serial_receive_callback",
+        "must_access_count": 65,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "RCC"
+      },
+      "TIM1": {
+        "example_function": "timer_get_flag",
+        "must_access_count": 50,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "TIM1"
+      },
+      "TIM3": {
+        "example_function": "tim3_isr",
+        "must_access_count": 40,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "TIM3"
+      },
+      "USB": {
+        "example_function": "st_usbfs_v1_usbd_init",
+        "must_access_count": 24,
+        "observed_ops": [
+          "LOAD",
+          "STORE"
+        ],
+        "profile_block": "USB"
+      }
+    },
+    "range_semantics": "profile blocks (half-open) converted to inclusive manifest ends; block granularity (the engine proves block-level confinement, not register-level); may accesses excluded",
+    "report": "analysis_reports/blackmagic-native-v2_0_0.elf_report.json",
+    "report_binary_name": "blackmagic-native-v2_0_0.elf",
+    "report_may_total_excluded": 7,
+    "report_mmio_total": 427
+  },
+  "sha256_hash": "f205406e622f98e0773fe7c3d7f92a81a2c57becd6058fce0df9b49e9257e648",
+  "target_architecture": "ARM_CORTEX_M3",
+  "verified_mmio_ranges": [
+    [
+      "0x40000400",
+      "0x400007FF",
+      "TIM3",
+      "read_write"
+    ],
+    [
+      "0x40005C00",
+      "0x40005FFF",
+      "USB",
+      "read_write"
+    ],
+    [
+      "0x40010000",
+      "0x400103FF",
+      "AFIO",
+      "read_write"
+    ],
+    [
+      "0x40010400",
+      "0x400107FF",
+      "EXTI",
+      "read_write"
+    ],
+    [
+      "0x40010800",
+      "0x40010BFF",
+      "GPIOA",
+      "read_write"
+    ],
+    [
+      "0x40010C00",
+      "0x40010FFF",
+      "GPIOB_LED",
+      "read_write"
+    ],
+    [
+      "0x40011000",
+      "0x400113FF",
+      "GPIOC",
+      "read_write"
+    ],
+    [
+      "0x40012400",
+      "0x400127FF",
+      "ADC1",
+      "read_write"
+    ],
+    [
+      "0x40012C00",
+      "0x40012FFF",
+      "TIM1",
+      "read_write"
+    ],
+    [
+      "0x40020000",
+      "0x400203FF",
+      "DMA1",
+      "read_write"
+    ],
+    [
+      "0x40021000",
+      "0x400213FF",
+      "RCC",
+      "read_write"
+    ],
+    [
+      "0x40022000",
+      "0x400223FF",
+      "FLASH",
+      "read_write"
+    ],
+    [
+      "0x40023000",
+      "0x400233FF",
+      "CRC",
+      "read_write"
+    ]
+  ]
+}
