@@ -12,19 +12,19 @@
 <h2>Zephyr echo_bot <span class="badge pass">PASS</span></h2>
 <p>Interrupt-driven UART echo sample from Zephyr v4.4.2, for the nRF52840 DK, built from public source. Ground truth is derived from the board devicetree: UART0 is UARTE0 at 0x40002000, 115200 baud, TX P0.6 / RTS P0.5 / RX P0.8 / CTS P0.7; the system clock is RTC-based (no SysTick — correctly absent).</p>
 <table class="stats">
-<tr><th>Fixed MMIO</th><td>126</td></tr>
+<tr><th>Fixed MMIO</th><td>127</td></tr>
 <tr><th>May accesses</th><td>0 sites / 0 addresses</td></tr>
 <tr><th>Port / MSR</th><td>0 / 0</td></tr>
-<tr><th>Extractor version</th><td>v3.12</td></tr>
+<tr><th>Extractor version</th><td>v3.13</td></tr>
 <tr><th>Lean mode</th><td>generic</td></tr>
-<tr><th>Classifier (SVD profile)</th><td>126 known / 0 suspect</td></tr>
+<tr><th>Classifier (SVD profile)</th><td>127 known / 0 suspect</td></tr>
 </table>
 <h3>Lean log (verdict lines)</h3>
-<pre>trace ops: 126
+<pre>trace ops: 127
 may trace ops: 0
 VERDICT: PASS</pre>
 <h3>Ground truth</h3>
-<p>126/126 code-true, 0 unexplained extras. Recovered: SoC init errata 29, clock control 59, RTC system timer 32, SoC init 4, NVMC wait 1, GPPI channel-enable 1 (from the UARTE driver — the only recovered UART-layer touch, and it is a PPI register).</p>
+<p>126/126 code-true at v3.12, 0 unexplained extras. At v3.13, +1: RTC1 CC[0] (compare_set STORE 0x40011540), total 127. Recovered: SoC init errata 29, clock control 59, RTC system timer 32, SoC init 4, NVMC wait 1, GPPI channel-enable 1 (from the UARTE driver — the only recovered UART-layer touch, and it is a PPI register).</p>
 <div class="note"><b>Structural miss, stated plainly and not softened.</b> The ENTIRE UARTE driver layer is missing: 20+ functions (init, poll in/out, FIFO fill/read, all interrupt handlers, error check) at 0 findings, and the UARTE0 register bucket has zero findings. Pinctrl/pin-select writes are missing too. Mechanism, source-verified: the peripheral base lives in a read-only config struct, accessed through the device struct, but the device pointer arrives only through device-API indirect dispatch, which per-site binding (direct calls only) never resolves. Bare-metal nRF52 recovers 66 UARTE findings because its instance is bound through direct calls; the clock driver recovers here only because it uses compile-time-constant macros. Generic PASS means only that what was found stayed in-window — here the sample's main peripheral is absent from the result.</div>
 <h3>Provenance</h3>
 <p>Source: Zephyr tag v4.4.2 (HEAD dccb0959), sample <code>samples/drivers/uart/echo_bot</code>, board <code>nrf52840dk/nrf52840</code>. Modules: hal_nordic 44fd3d44, cmsis 512cc7e8, cmsis_6 30a859f4. SVD: nrfx <code>nrf52840/nrf52840.svd</code> (SHA-256 36811b78&hellip;), 84 peripherals via pure SVD import. Toolchain: arm-none-eabi-gcc 13.2.1 via the gnuarmemb variant, -Os default. Built ELF MD5: 96d7bae0635eee8d6b0e9bd5ee4881e6.</p>

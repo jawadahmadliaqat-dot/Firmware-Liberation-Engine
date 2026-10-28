@@ -20,8 +20,8 @@
 <div class="card">
 <h3><a href="bmp.html">Black Magic Probe v2.0.0</a></h3>
 <p><span class="badge pass">PASS</span> bmp mode</p>
-<p>Fixed MMIO: <b>423</b> &middot; May: <b>13 addresses</b></p>
-<p>Extractor v3.12 &middot; STM32F1, ARM Cortex-M</p>
+<p>Fixed MMIO: <b>427</b> &middot; May: <b>13 addresses</b></p>
+<p>Extractor v3.13 &middot; STM32F1, ARM Cortex-M</p>
 <p>The canonical real firmware: official v2.0.0 release, source cross-checked.</p>
 </div>
 <div class="card">
@@ -34,16 +34,16 @@
 <div class="card">
 <h3><a href="stm32f4.html">STM32F4 UART</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
-<p>Fixed MMIO: <b>150</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.12 &middot; STM32CubeF4, built from source (-O0)</p>
-<p>Diagnostic -O2 build: 169. GPIO and USART2 misses documented.</p>
+<p>Fixed MMIO: <b>171</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.13 &middot; STM32CubeF4, built from source (-O0)</p>
+<p>Diagnostic -O2 build: 171. GPIO plane recovered in v3.13; USART2 miss documented.</p>
 </div>
 <div class="card">
 <h3><a href="nrf52.html">nRF52 UART</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
-<p>Fixed MMIO: <b>182</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.12 &middot; nRF5 SDK 17.1.0, nRF52832, built from source</p>
-<p>Ground truth 182/182 code-true. UART TX path missed (stack spill).</p>
+<p>Fixed MMIO: <b>205</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.13 &middot; nRF5 SDK 17.1.0, nRF52832, built from source</p>
+<p>Ground truth 182/182 code-true at v3.12. UART TX path recovered in v3.13 (+23, tail-call sites).</p>
 </div>
 <div class="card">
 <h3><a href="tinyusb.html">TinyUSB cdc_msc</a></h3>
@@ -55,9 +55,9 @@
 <div class="card">
 <h3><a href="zephyr.html">Zephyr echo_bot</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
-<p>Fixed MMIO: <b>126</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.12 &middot; Zephyr v4.4.2, nRF52840 DK, built from source</p>
-<p>Ground truth 126/126 code-true. Entire UARTE driver layer missed — see detail page.</p>
+<p>Fixed MMIO: <b>127</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.13 &middot; Zephyr v4.4.2, nRF52840 DK, built from source</p>
+<p>Ground truth 126/126 code-true at v3.12. Entire UARTE driver layer still missed — see detail page.</p>
 </div>
 </div>
 
@@ -81,9 +81,9 @@
 <div class="card">
 <h3><a href="ovmf-pcihostbridge.html">PciHostBridgeDxe</a></h3>
 <p><span class="badge fail">FAIL</span> generic mode, confinement only</p>
-<p>Fixed MMIO: <b>0</b> &middot; Port: <b>7</b> &middot; MSR: <b>1</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.12 &middot; Trace 8</p>
-<p>FAIL names only ports 0x514 / 0x518, outside the architectural allowlist. Device unidentified.</p>
+<p>Fixed MMIO: <b>0</b> &middot; Port: <b>8</b> &middot; MSR: <b>1</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.13 &middot; Trace 9</p>
+<p>FAIL names ports 0x510 / 0x514 / 0x518, outside the architectural allowlist. 0x510 is QEMU fw_cfg; 0x514 / 0x518 device unidentified.</p>
 </div>
 <div class="card">
 <h3><a href="ovmf-qemuvideo.html">QemuVideoDxe (PE)</a></h3>

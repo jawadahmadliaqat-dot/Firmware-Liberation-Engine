@@ -1680,7 +1680,39 @@ public class ExtractIR extends GhidraScript {
             if (sym.startsWith("OBJ:")) {
                 return adjustObjSym(sym, delta);
             }
+            if (sym.startsWith("SP:")) {
+                long[] p = parseSpSym(sym);
+                if (p == null) return null;
+                return spSym(p[0], p[1] + delta);
+            }
             return null;
+        }
+        // v14 stack slots: abstract stack-pointer symbols.
+        // "SP:<funcEntry>:<delta>" denotes the stack pointer of
+        // the function entered at funcEntry, plus delta bytes
+        // (pointer arithmetic folds into delta, exactly like OBJ
+        // deltas). The entry address makes the symbol unique per
+        // function: a slot address from one activation can never
+        // collide with another function's slots, and stk: cells
+        // are never copied across functions (entries carry only
+        // argument registers + gmem: seeds). Like every symbol,
+        // an SP symbol has ones == 0 && zeroes == 0, so
+        // exactValue() is null and it can never masquerade as a
+        // constant address -- in particular it can never fire
+        // isMmioAddress() or resolve as an MMIO base.
+        static String spSym(long funcEntry, long delta) {
+            return "SP:" + funcEntry + ":" + delta;
+        }
+        static long[] parseSpSym(String sym) {
+            if (sym == null) return null;
+            String[] p = sym.split(":");
+            if (p.length != 3 || !p[0].equals("SP")) return null;
+            try {
+                return new long[] { Long.parseLong(p[1]),
+                    Long.parseLong(p[2]) };
+            } catch (NumberFormatException e) {
+                return null;
+            }
         }
         static Bits unknown() {
             return new Bits(0, 0);
@@ -1972,6 +2004,20 @@ public class ExtractIR extends GhidraScript {
             Bits r = fldLookup(bvals, ab.sym, out.getSize());
             return r != null ? r : Bits.unknown();
         }
+        // v14 stack slots: a load through an SP symbol reads the
+        // function's stk: cells, never image bytes (a stack slot
+        // has no image address, and uninitialized slots must read
+        // unknown, not a stale value). No covering cell ->
+        // unknown (exactly today's behaviour for a stack load,
+        // since the address was never exact).
+        if (ab.sym != null) {
+            long[] sp = Bits.parseSpSym(ab.sym);
+            if (sp != null) {
+                Bits r = stkLookup(bvals, sp[0], sp[1],
+                    out.getSize());
+                return r != null ? r : Bits.unknown();
+            }
+        }
         Long addr = resolveAddressExact(ins[1], bvals);
         if (addr == null) return Bits.unknown();
         // Memory propagation: a memState entry covering the load
@@ -2093,6 +2139,13 @@ public class ExtractIR extends GhidraScript {
                     if (!isa.isMmioAddress(a)) {
                         dropMemRange(bvals, a, out.getSize(), true);
                         Bits vb = resolveBits(ins[0], bvals);
+                        // v14 stack slots: an absolute store of a
+                        // stack address escapes it (same rule as
+                        // the STORE branch below).
+                        if (vb.sym != null &&
+                            Bits.parseSpSym(vb.sym) != null) {
+                            dropAllStk(bvals);
+                        }
                         if (vb.ones != 0 || vb.zeroes != 0) {
                             // v7 cfgspace: strip symbols (see STORE).
                             bvals.put(memKey(a, out.getSize()),
@@ -2340,6 +2393,28 @@ public class ExtractIR extends GhidraScript {
                 Bits vb0 = resolveBits(ins[2], bvals);
                 fldStore(bvals, ab0.sym, ins[2].getSize(), vb0);
                 dropAllMem(bvals);
+            } else if (ab0.sym != null &&
+                Bits.parseSpSym(ab0.sym) != null) {
+                // v14 stack slots: a store through an SP symbol
+                // records the value in the function's stk: cells
+                // (full Bits, symbols included, like fld: cells:
+                // a spilled BAR base or object pointer must
+                // survive as that symbol when reloaded). Stack
+                // stores never touch mem:/gmem: (today's rule,
+                // unchanged: a stack address cannot alias a
+                // global). Overlapping cells drop first, exactly
+                // like dropMemRange; a value with no known bits
+                // and no symbol creates no cell (putKnown drops
+                // it), so a stale cell never survives a
+                // clobbering store.
+                long[] sps = Bits.parseSpSym(ab0.sym);
+                int sz = ins[2].getSize();
+                if (sz > 0 && sz <= 8) {
+                    dropStkRange(bvals, sps[0], sps[1], sz);
+                    putKnown(bvals, stkKey(sps[0], sps[1], sz),
+                        resolveBits(ins[2], bvals));
+                    stkStoreCount++;
+                }
             } else
             // Memory propagation, stage 1 (intra-procedural):
             // a store to a known non-MMIO address records the
@@ -2373,6 +2448,19 @@ public class ExtractIR extends GhidraScript {
                 } else if (addr == null) {
                     dropAllMem(bvals);
                 }
+                // v14 stack slots: storing a stack address into
+                // non-stack memory escapes it (a later call may
+                // read that global and write through the
+                // pointer), so all stk: cells die now. Dropping
+                // at escape time is over-conservative (a later
+                // load in this same function, before any call,
+                // also loses) but sound, and it keeps the CALL
+                // rule below simple.
+                Bits svb = resolveBits(ins[2], bvals);
+                if (svb.sym != null &&
+                    Bits.parseSpSym(svb.sym) != null) {
+                    dropAllStk(bvals);
+                }
             }
         } else if (mnem.equals("CALL") || mnem.equals("CALLIND")) {
             // Caller-saved registers are dead after the call, except
@@ -2405,6 +2493,68 @@ public class ExtractIR extends GhidraScript {
             // every store program-wide agrees on their value, so
             // no callee can change one to a different value.
             dropAllMem(bvals);
+            // v14 stack slots: stk: cells survive a direct CALL
+            // to a known, untainted callee -- the callee's own
+            // frame is disjoint from the caller's slots, and the
+            // SP register itself survives calls (callee-saved
+            // by convention, so the slot keys stay valid). They
+            // die when the callee is unknown, indirect, or
+            // tainted (it may store anywhere), and when a stack
+            // address escapes as a call argument (the callee
+            // then holds a pointer to the caller's slot).
+            // DOCUMENTED RESIDUAL: a callee writing its
+            // incoming stack-argument area could stale a caller
+            // outgoing-arg slot reloaded after the call;
+            // compilers do not reload outgoing-arg slots as
+            // locals (locals live above the outgoing area), so
+            // this does not fire on compiler-generated code,
+            // but it is an assumption, stated here, not a
+            // proof. Same honesty class as the balanced
+            // push/pop residual in the clobber slice.
+            boolean dropStk = true;
+            if (mnem.equals("CALL") && op.ins.length >= 1) {
+                Varnode t = op.ins[0];
+                if (t != null && t.getAddress() != null &&
+                    "ram".equals(t.getAddress().getAddressSpace()
+                        .getName()) && clobberRef != null) {
+                    long to = t.getOffset();
+                    long ts = isa.stripInstructionTag(to);
+                    Set<Long> w = clobberRef.writes.get(to);
+                    if (w == null) w = clobberRef.writes.get(ts);
+                    boolean tainted =
+                        clobberRef.tainted.contains(to) ||
+                        clobberRef.tainted.contains(ts);
+                    if (w != null && !tainted) {
+                        dropStk = false;
+                        long[] argRegs = null;
+                        try {
+                            argRegs = isa.argumentRegisterOffsets(
+                                callConvMap.get(to));
+                            if (argRegs == null) argRegs =
+                                isa.argumentRegisterOffsets(
+                                    callConvMap.get(ts));
+                        } catch (Exception e) {
+                            argRegs = null;
+                        }
+                        if (argRegs != null) {
+                            int ps = isa.pointerSize();
+                            for (long off : argRegs) {
+                                Varnode vn = regVarnode(off, ps);
+                                if (vn == null) continue;
+                                Bits ab = resolveBits(vn, bvals);
+                                if (ab.sym != null &&
+                                    Bits.parseSpSym(ab.sym) != null) {
+                                    dropStk = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            dropStk = true;
+                        }
+                    }
+                }
+            }
+            if (dropStk) dropAllStk(bvals);
             // v7 cfgspace: a callee may reprogram config space, so
             // the latched CF8 address dies at the call. (A memory
             // store does NOT kill it: the latch is CPU state, not
@@ -2723,6 +2873,26 @@ public class ExtractIR extends GhidraScript {
         // constant survives only if no loop-back path redefines it.
         in[0] = (entry == null) ? new HashMap<String, Bits>()
             : new HashMap<String, Bits>(entry);
+        // v14 stack slots: seed the stack pointer with its
+        // function-unique SP symbol. Entry maps never carry it
+        // (they hold only argument registers + gmem: seeds), so
+        // this cannot leak a caller's SP into a callee; and the
+        // symbol is what makes SP-derived addresses computable
+        // through COPY/INT_ADD chains (exact-only arithmetic
+        // could never fold SP + const). A loop back to op 0
+        // meets into this seed: a balanced loop keeps the
+        // symbol, an unbalanced one drops it (sound).
+        if (memSpOff >= 0 && !ops.isEmpty()) {
+            String spKey = isa.registerSpaceName() + ":" +
+                memSpOff + ":" + isa.pointerSize();
+            if (!in[0].containsKey(spKey)) {
+                long entryAddr = isa.stripInstructionTag(
+                    ops.get(0).instrAddr.getOffset());
+                in[0].put(spKey, Bits.symBits(
+                    Bits.spSym(entryAddr, 0),
+                    isa.pointerSize()));
+            }
+        }
 
         // First op index per instruction address (for branch targets).
         Map<String, Integer> firstAt = new HashMap<String, Integer>();
@@ -7409,6 +7579,108 @@ public class ExtractIR extends GhidraScript {
         for (String k : drop) m.remove(k);
     }
 
+    // ---------------- v14 stack slots: stk: cells ----------------
+    // A stack slot is a (function, delta) cell: the SP symbol's
+    // entry address identifies the function, the delta
+    // identifies the slot within its frame. Key form:
+    // "stk:SP:<funcEntry>:<delta>:<size>". Cells live in the
+    // same must-state map, so meet()'s agree-or-drop applies
+    // exactly as to registers and mem: cells. They never
+    // overlap mem:/gmem:/fld: cells (different key prefixes),
+    // and two functions never share a cell (distinct entry
+    // addresses in the symbol). Diagnostics: counts below are
+    // accumulated over every must-fixpoint run in the process
+    // and printed once with the persite summary.
+    private int stkStoreCount = 0;
+    private int stkLoadHitCount = 0;
+
+    private static String stkKey(long funcEntry, long delta,
+        int size) {
+        return "stk:SP:" + funcEntry + ":" + delta + ":" + size;
+    }
+
+    private static long[] parseStkKey(String k) {
+        if (k == null || !k.startsWith("stk:SP:")) return null;
+        String[] p = k.split(":");
+        if (p.length != 5) return null;
+        try {
+            return new long[] { Long.parseLong(p[2]),
+                Long.parseLong(p[3]), Long.parseLong(p[4]) };
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static void dropStkRange(Map<String, Bits> m,
+        long funcEntry, long delta, int size) {
+        long end = delta + size;
+        List<String> drop = new ArrayList<String>();
+        for (String k : m.keySet()) {
+            long[] as = parseStkKey(k);
+            if (as == null || as[0] != funcEntry) continue;
+            if (as[1] < end && delta < as[1] + as[2]) drop.add(k);
+        }
+        for (String k : drop) m.remove(k);
+    }
+
+    private static void dropAllStk(Map<String, Bits> m) {
+        List<String> drop = new ArrayList<String>();
+        for (String k : m.keySet()) {
+            if (k.startsWith("stk:")) drop.add(k);
+        }
+        for (String k : drop) m.remove(k);
+    }
+
+    /** Byte-assembling stk: lookup, mirroring memLookupPrefix:
+        returns null unless stk: cells fully cover
+        [delta, delta+size) for this function's SP symbol
+        (size <= 8, else unrepresentable in Bits). Symbols in
+        cells are NOT assembled (a stored symbol covers its
+        whole cell exactly: partial-symbol reads fall back to
+        the exact-cell case below via the covering check --
+        a symbol cell only satisfies a load of exactly its
+        range; wider/narrower reads over a symbol cell return
+        null, i.e. unknown, which is sound). */
+    private Bits stkLookup(Map<String, Bits> m, long funcEntry,
+        long delta, int size) {
+        if (size <= 0 || size > 8) return null;
+        // Exact-cell fast path (covers the symbol case).
+        Bits exact = m.get(stkKey(funcEntry, delta, size));
+        if (exact != null) {
+            stkLoadHitCount++;
+            return exact;
+        }
+        long end = delta + size;
+        long cov = 0;
+        long ones = 0, zeroes = 0;
+        for (Map.Entry<String, Bits> e : m.entrySet()) {
+            long[] as = parseStkKey(e.getKey());
+            if (as == null || as[0] != funcEntry) continue;
+            long t = as[2];
+            if (t <= 0 || t > 8) continue;
+            Bits eb = e.getValue();
+            if (eb.sym != null) continue;
+            long b = as[1];
+            long is = Math.max(delta, b), ie = Math.min(end, b + t);
+            if (is >= ie) continue;
+            for (long p = is; p < ie; p++) {
+                long ej = p - b;
+                long lb = p - delta;
+                long srcShift = memBigEndian ?
+                    (t - 1 - ej) * 8 : ej * 8;
+                long dstShift = memBigEndian ?
+                    (size - 1 - lb) * 8 : lb * 8;
+                ones |= ((eb.ones >>> srcShift) & 0xffL) << dstShift;
+                zeroes |= ((eb.zeroes >>> srcShift) & 0xffL)
+                    << dstShift;
+                cov |= (1L << lb);
+            }
+        }
+        if (cov != ((1L << size) - 1)) return null;
+        stkLoadHitCount++;
+        return new Bits(ones, zeroes);
+    }
+
     // ---------------- v9 struct: object field cells ----------------
     // Field cells live in the same must-state map as memState, but
     // under "fld:" keys, so the must-meet's agree-or-drop
@@ -8001,7 +8273,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.12\",");
+        w.println("  \"extractor_version\": \"v3.13\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -8180,17 +8452,47 @@ public class ExtractIR extends GhidraScript {
             new HashMap<Long, Set<Long>>();
         Map<Long, Set<Long>> directCallersByCallee =
             new HashMap<Long, Set<Long>>();
+        int tailSitesAdded = 0;
         for (FuncRec rec : funcRecs) {
             List<OpRec> pops = rec.or.ops;
             for (int i = 0; i < pops.size(); i++) {
                 OpRec op = pops.get(i);
-                if (!op.mnem.equals("CALL") || op.ins.length < 1) {
+                boolean isCall = op.mnem.equals("CALL");
+                // v14 tail calls: a direct BRANCH to another
+                // function's entry is a tail call -- control
+                // never returns to the caller, and the argument
+                // registers at the branch ARE the callee's entry
+                // values (the target's RETURN goes to the
+                // caller's caller, not to the branch). Such
+                // sites therefore seed per-site clones exactly
+                // like CALL sites. They are added ONLY to
+                // sitesByCallee: directCallersByCallee and
+                // calleesByCaller are deliberately untouched,
+                // so merged-constprop eligibility, Prov
+                // eligibility, and clobber edges keep today's
+                // behaviour (a tail-involved callee stays
+                // merged-ineligible via the every-caller-direct
+                // guard, since its Ghidra callers are not direct
+                // callers). Retprop/struct agreement over the
+                // enlarged site set is stricter, never looser.
+                // RESIDUAL: a branch to a misidentified
+                // "function" (shared code Ghidra labeled as a
+                // function, noreturn handler entered with
+                // arbitrary registers) would seed a clone from
+                // a non-argument binding. The regression set
+                // (zero lost + every addition verified
+                // code-true) is the backstop; a hallucination
+                // here reverts this block.
+                boolean isTailBranch = op.mnem.equals("BRANCH");
+                if ((!isCall && !isTailBranch) ||
+                    op.ins.length < 1) {
                     continue;
                 }
                 Varnode t = op.ins[0];
-                if (t == null || t.getAddress() == null ||
+                if (t == null) continue;
+                if (isCall && (t.getAddress() == null ||
                     !"ram".equals(t.getAddress().getAddressSpace().
-                        getName())) {
+                        getName()))) {
                     continue;
                 }
                 FuncRec callee = funcByEntry.get(t.getOffset());
@@ -8199,24 +8501,36 @@ public class ExtractIR extends GhidraScript {
                         isa.stripInstructionTag(t.getOffset()));
                 }
                 if (callee == null) continue;
+                if (isTailBranch) {
+                    long selfStripped = isa.stripInstructionTag(
+                        rec.entryKey);
+                    long tgtStripped = isa.stripInstructionTag(
+                        callee.entryKey);
+                    if (selfStripped == tgtStripped) continue;
+                }
                 List<CallSite> sl = sitesByCallee.get(callee.entryKey);
                 if (sl == null) {
                     sl = new ArrayList<CallSite>();
                     sitesByCallee.put(callee.entryKey, sl);
                 }
                 sl.add(new CallSite(rec, i));
-                Set<Long> cb = calleesByCaller.get(rec.entryKey);
-                if (cb == null) {
-                    cb = new HashSet<Long>();
-                    calleesByCaller.put(rec.entryKey, cb);
+                if (isTailBranch) tailSitesAdded++;
+                if (!isTailBranch) {
+                    Set<Long> cb = calleesByCaller.get(rec.entryKey);
+                    if (cb == null) {
+                        cb = new HashSet<Long>();
+                        calleesByCaller.put(rec.entryKey, cb);
+                    }
+                    cb.add(callee.entryKey);
+                    Set<Long> dc = directCallersByCallee.get(
+                        callee.entryKey);
+                    if (dc == null) {
+                        dc = new HashSet<Long>();
+                        directCallersByCallee.put(callee.entryKey,
+                            dc);
+                    }
+                    dc.add(rec.entryKey);
                 }
-                cb.add(callee.entryKey);
-                Set<Long> dc = directCallersByCallee.get(callee.entryKey);
-                if (dc == null) {
-                    dc = new HashSet<Long>();
-                    directCallersByCallee.put(callee.entryKey, dc);
-                }
-                dc.add(rec.entryKey);
             }
         }
         // Guards (see the v2 item #2 header comment).
@@ -9319,6 +9633,10 @@ public class ExtractIR extends GhidraScript {
                 persiteSkippedUnknown + ", skippedCap=" +
                 persiteSkippedCap + ", skippedNonconv=" +
                 persiteSkippedNonconv + ".");
+        println("[*] stackslot: stores=" + stkStoreCount +
+            ", loadHits=" + stkLoadHitCount + ".");
+        println("[*] tailsites: direct-branch tail-call sites " +
+            "added to sitesByCallee=" + tailSitesAdded + ".");
         }
         for (FuncRec rec : funcRecs) {
             Function f = rec.f;

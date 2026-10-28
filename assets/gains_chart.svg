@@ -1,0 +1,45 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='900' height='640' viewBox='0 0 900 640'>
+<title>Fixed findings v3.12 to v3.13</title>
+<rect width='900' height='640' fill='#0d1424'/>
+<text x='40' y='55' font-family='DejaVu Sans, Arial, sans-serif' font-size='28' font-weight='bold' fill='#f1f5f9'>v3.12 → v3.13</text>
+<text x='600' y='50' font-family='DejaVu Sans, Arial, sans-serif' font-size='18' fill='#94a3b8'>MMIO bars: common scale</text>
+<text x='40' y='123' font-family='DejaVu Sans, Arial, sans-serif' font-size='21' font-weight='bold' fill='#f1f5f9'>STM32F4 -O0</text>
+<rect x='220' y='95' width='133' height='20' rx='5' fill='#475569'/>
+<text x='363' y='112' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>150</text>
+<rect x='220' y='121' width='152' height='20' rx='5' fill='#38bdf8'/>
+<text x='382' y='138' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>171</text>
+<text x='700' y='123' font-family='DejaVu Sans, Arial, sans-serif' font-size='21' font-weight='bold' fill='#4ade80'>+21</text>
+<text x='40' y='185' font-family='DejaVu Sans, Arial, sans-serif' font-size='21' font-weight='bold' fill='#f1f5f9'>nRF52</text>
+<rect x='220' y='157' width='161' height='20' rx='5' fill='#475569'/>
+<text x='391' y='174' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>182</text>
+<rect x='220' y='183' width='182' height='20' rx='5' fill='#38bdf8'/>
+<text x='412' y='200' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>205</text>
+<text x='700' y='185' font-family='DejaVu Sans, Arial, sans-serif' font-size='21' font-weight='bold' fill='#4ade80'>+23</text>
+<text x='40' y='247' font-family='DejaVu Sans, Arial, sans-serif' font-size='21' font-weight='bold' fill='#f1f5f9'>BMP</text>
+<rect x='220' y='219' width='376' height='20' rx='5' fill='#475569'/>
+<text x='606' y='236' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>423</text>
+<rect x='220' y='245' width='380' height='20' rx='5' fill='#38bdf8'/>
+<text x='610' y='262' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>427</text>
+<text x='700' y='247' font-family='DejaVu Sans, Arial, sans-serif' font-size='21' font-weight='bold' fill='#4ade80'>+4</text>
+<text x='40' y='309' font-family='DejaVu Sans, Arial, sans-serif' font-size='21' font-weight='bold' fill='#f1f5f9'>BMP stripped</text>
+<rect x='220' y='281' width='277' height='20' rx='5' fill='#475569'/>
+<text x='507' y='298' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>312</text>
+<rect x='220' y='307' width='279' height='20' rx='5' fill='#38bdf8'/>
+<text x='509' y='324' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>314</text>
+<text x='700' y='309' font-family='DejaVu Sans, Arial, sans-serif' font-size='21' font-weight='bold' fill='#4ade80'>+2</text>
+<text x='40' y='371' font-family='DejaVu Sans, Arial, sans-serif' font-size='21' font-weight='bold' fill='#f1f5f9'>Zephyr</text>
+<rect x='220' y='343' width='112' height='20' rx='5' fill='#475569'/>
+<text x='342' y='360' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>126</text>
+<rect x='220' y='369' width='113' height='20' rx='5' fill='#38bdf8'/>
+<text x='343' y='386' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>127</text>
+<text x='700' y='371' font-family='DejaVu Sans, Arial, sans-serif' font-size='21' font-weight='bold' fill='#4ade80'>+1</text>
+<text x='40' y='433' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>PciHostBridge</text>
+<text x='40' y='453' font-family='DejaVu Sans, Arial, sans-serif' font-size='16' fill='#94a3b8'>ports: own scale</text>
+<rect x='220' y='405' width='332' height='20' rx='5' fill='#475569'/>
+<text x='562' y='422' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>7</text>
+<rect x='220' y='431' width='380' height='20' rx='5' fill='#38bdf8'/>
+<text x='610' y='448' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#f1f5f9'>8</text>
+<text x='700' y='433' font-family='DejaVu Sans, Arial, sans-serif' font-size='21' font-weight='bold' fill='#4ade80'>+1</text>
+<rect x='282' y='483' width='337' height='44' rx='12' fill='none' stroke='#4ade80' stroke-width='2'/>
+<text x='306' y='513' font-family='DejaVu Sans, Arial, sans-serif' font-size='24' font-weight='bold' fill='#4ade80'>ZERO LOST FINDINGS</text>
+</svg>

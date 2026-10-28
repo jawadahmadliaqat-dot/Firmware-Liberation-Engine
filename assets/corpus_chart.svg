@@ -1,0 +1,31 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='900' height='470' viewBox='0 0 900 470'>
+<title>Fixed findings by stack, extractor v3.13</title>
+<rect width='900' height='470' fill='#0d1424'/>
+<text x='40' y='55' font-family='DejaVu Sans, Arial, sans-serif' font-size='28' font-weight='bold' fill='#f1f5f9'>FIXED FINDINGS · v3.13</text>
+<text x='40' y='126' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>BMP</text>
+<rect x='190' y='100' width='480' height='34' rx='7' fill='#38bdf8'/>
+<text x='684' y='126' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>427</text>
+<text x='770' y='126' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#4ade80'>✓ PASS</text>
+<text x='40' y='178' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>TinyUSB</text>
+<rect x='190' y='152' width='251' height='34' rx='7' fill='#38bdf8'/>
+<text x='455' y='178' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>224</text>
+<text x='770' y='178' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#4ade80'>✓ PASS</text>
+<text x='40' y='230' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>nRF52</text>
+<rect x='190' y='204' width='230' height='34' rx='7' fill='#38bdf8'/>
+<text x='434' y='230' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>205</text>
+<text x='770' y='230' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#4ade80'>✓ PASS</text>
+<text x='40' y='282' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>RP2040</text>
+<rect x='190' y='256' width='222' height='34' rx='7' fill='#38bdf8'/>
+<text x='426' y='282' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>198</text>
+<text x='770' y='282' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#4ade80'>✓ PASS</text>
+<text x='40' y='334' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>STM32F4</text>
+<rect x='190' y='308' width='192' height='34' rx='7' fill='#38bdf8'/>
+<text x='396' y='334' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>171</text>
+<text x='770' y='334' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#4ade80'>✓ PASS</text>
+<text x='40' y='386' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>Zephyr</text>
+<rect x='190' y='360' width='142' height='34' rx='7' fill='#38bdf8'/>
+<text x='346' y='386' font-family='DejaVu Sans, Arial, sans-serif' font-size='22' font-weight='bold' fill='#f1f5f9'>127</text>
+<text x='770' y='386' font-family='DejaVu Sans, Arial, sans-serif' font-size='20' font-weight='bold' fill='#4ade80'>✓ PASS</text>
+<line x1='40' y1='420' x2='860' y2='420' stroke='#384878' stroke-width='2'/>
+<text x='337' y='464' font-family='DejaVu Sans, Arial, sans-serif' font-size='32' font-weight='bold' fill='#fbbf24'>TOTAL 1,352</text>
+</svg>
