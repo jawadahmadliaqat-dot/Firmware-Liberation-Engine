@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="582" viewBox="0 0 1020 582" style="background:#0b0d10">
+<rect x="16" y="14" width="486" height="504" rx="10" fill="#111318" stroke="#333646"/>
+<rect x="518" y="14" width="486" height="504" rx="10" fill="#111318" stroke="#333646"/>
+<text x="32" y="34" font-family="monospace" font-size="15" font-weight="bold" fill="#e8e8e8">PRE-FIX  (vulnerable)</text>
+<text x="32" y="58" font-family="monospace" font-size="11" fill="#9a9a9a">$ lake exe ingest_check sf32lb_qspi_prefx.elf_report.json generic</text>
+<text x="32" y="86" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops: 89</text>
+<text x="32" y="108" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops by kind (mmio, port, msr): (89, 0, 0)</text>
+<text x="32" y="130" font-family="monospace" font-size="12.5" fill="#e8e8e8">may trace ops: 0</text>
+<text x="32" y="152" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace non-empty: true</text>
+<text x="32" y="174" font-family="monospace" font-size="12.5" fill="#e8e8e8">masks consistent (ones &amp; zeroes == 0): true</text>
+<text x="32" y="196" font-family="monospace" font-size="12.5" fill="#e8e8e8">all addresses in MMIO window: true</text>
+<text x="32" y="218" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR sanity (port ≤ 0xFFFF, MSR index &lt; 2^32): true</text>
+<!-- VERBATIM: port/MSR confinement (every port/MSR in the architectural allowlist): true -->
+<text x="32" y="240" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR confinement (every port/MSR in the architectural allo</text>
+<text x="32" y="262" font-family="monospace" font-size="12.5" fill="#e8e8e8">wlist): true</text>
+<!-- VERBATIM: clock-enable (every used peripheral's gate register touched): true -->
+<text x="32" y="284" font-family="monospace" font-size="12.5" fill="#e8e8e8">clock-enable (every used peripheral's gate register touched): </text>
+<text x="32" y="306" font-family="monospace" font-size="12.5" fill="#e8e8e8">true</text>
+<!-- VERBATIM: bounds (no computed-pointer copy/transfer with unsound-only guard): false -->
+<text x="32" y="328" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds (no computed-pointer copy/transfer with unsound-only gu</text>
+<text x="32" y="350" font-family="monospace" font-size="12.5" fill="#e8e8e8">ard): false</text>
+<text x="32" y="372" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds sites: 3</text>
+<!-- VERBATIM: bounds violations: [flash_sf32lb_mpi_qspi_nor_write arch_dcache_invd_range 0x12018a62 (role addr, offset arg 1, base field 4, no sound guard), flash_sf32lb_mpi_qspi_nor_read memcpy 0x1201d1d6 (role src, offset arg 1, base field 4, no sound guard)] -->
+<text x="32" y="394" font-family="monospace" font-size="12.5" fill="#ffb86b">bounds violations: [flash_sf32lb_mpi_qspi_nor_write arch_dcach</text>
+<text x="32" y="416" font-family="monospace" font-size="12.5" fill="#ffb86b">e_invd_range 0x12018a62 (role addr, offset arg 1, base field 4</text>
+<text x="32" y="438" font-family="monospace" font-size="12.5" fill="#ffb86b">, no sound guard), flash_sf32lb_mpi_qspi_nor_read memcpy 0x120</text>
+<text x="32" y="460" font-family="monospace" font-size="12.5" fill="#ffb86b">1d1d6 (role src, offset arg 1, base field 4, no sound guard)]</text>
+<text x="32" y="482" font-family="monospace" font-size="12.5" fill="#ff5a5a">VERDICT: FAIL</text>
+<text x="534" y="34" font-family="monospace" font-size="15" font-weight="bold" fill="#e8e8e8">FIXED  (909eb56)</text>
+<text x="534" y="58" font-family="monospace" font-size="11" fill="#9a9a9a">$ lake exe ingest_check sf32lb_qspi_fixed.elf_report.json generic</text>
+<text x="534" y="86" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops: 89</text>
+<text x="534" y="108" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops by kind (mmio, port, msr): (89, 0, 0)</text>
+<text x="534" y="130" font-family="monospace" font-size="12.5" fill="#e8e8e8">may trace ops: 0</text>
+<text x="534" y="152" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace non-empty: true</text>
+<text x="534" y="174" font-family="monospace" font-size="12.5" fill="#e8e8e8">masks consistent (ones &amp; zeroes == 0): true</text>
+<text x="534" y="196" font-family="monospace" font-size="12.5" fill="#e8e8e8">all addresses in MMIO window: true</text>
+<text x="534" y="218" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR sanity (port ≤ 0xFFFF, MSR index &lt; 2^32): true</text>
+<!-- VERBATIM: port/MSR confinement (every port/MSR in the architectural allowlist): true -->
+<text x="534" y="240" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR confinement (every port/MSR in the architectural allo</text>
+<text x="534" y="262" font-family="monospace" font-size="12.5" fill="#e8e8e8">wlist): true</text>
+<!-- VERBATIM: clock-enable (every used peripheral's gate register touched): true -->
+<text x="534" y="284" font-family="monospace" font-size="12.5" fill="#e8e8e8">clock-enable (every used peripheral's gate register touched): </text>
+<text x="534" y="306" font-family="monospace" font-size="12.5" fill="#e8e8e8">true</text>
+<!-- VERBATIM: bounds (no computed-pointer copy/transfer with unsound-only guard): true -->
+<text x="534" y="328" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds (no computed-pointer copy/transfer with unsound-only gu</text>
+<text x="534" y="350" font-family="monospace" font-size="12.5" fill="#e8e8e8">ard): true</text>
+<text x="534" y="372" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds sites: 3</text>
+<text x="534" y="394" font-family="monospace" font-size="12.5" fill="#4ade80">VERDICT: PASS</text>
+<text x="16" y="546" font-family="monospace" font-size="12.5" fill="#9a9a9a">Bounds v2 (v3.16): pre-fix FAIL names BOTH the read site (memcpy) and the write site</text>
+<text x="16" y="566" font-family="monospace" font-size="12.5" fill="#9a9a9a">(arch_dcache_invd_range); fixed PASS keeps both sites, guarded (signed-check).</text>
+</svg>

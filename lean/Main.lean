@@ -21,9 +21,11 @@
   Reports without the field (old reports) fall back to the historical
   ARM window 0x40000000-0x60000000, so old verdicts are unchanged.
   Bmp mode keeps its own hardcoded ARM window via checkGeneric.
-  Generic mode also runs the bounds check (v3.15): the report's
-  top-level "copy_sites" field, absent on pre-v3.15 reports (then the
-  bounds line passes vacuously with 0 sites -- visible, not hidden).
+  Generic mode also runs the bounds check (v3.15; v3.16 extends
+  the site set from memcpy/memmove copies to cache-range
+  transfers): the report's top-level "copy_sites" field, absent
+  on pre-v3.15 reports (then the bounds line passes vacuously
+  with 0 sites -- visible, not hidden).
 -/
 
 import Verifier.Common
@@ -65,8 +67,8 @@ def printGeneric (lang : Option String) (windows : List (Nat × Nat)) (trace : L
       s!"{v.access.func} {kindName v.access.kind} {natToHex v.access.addr} ({v.gate.name} needs {natToHex v.gate.gateAddr} bit {v.gate.gateBit})"
     IO.println s!"clock-enable violations: {names}"
   let bounds := checkBounds sites
-  IO.println s!"bounds (no computed-pointer copy with unsound-only guard): {bounds}"
-  IO.println s!"bounds copy sites: {sites.length}"
+  IO.println s!"bounds (no computed-pointer copy/transfer with unsound-only guard): {bounds}"
+  IO.println s!"bounds sites: {sites.length}"
   let boundsVios := boundsViolations sites
   if !boundsVios.isEmpty then
     let names := boundsVios.map fun s =>

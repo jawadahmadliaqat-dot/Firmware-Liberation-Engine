@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.15-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.16-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -85,6 +85,24 @@ maintenance, not a CPU copy) is out of scope for v1. Version bumped
 v3.14 -> v3.15 because report JSON gains fields. (Full design notes are
 kept in local working notes, not in the repo.)
 
+**v3.16 changes:** bounds write-path coverage + precision measurement.
+Copy sites now also include cache-range transfers (`arch_dcache_invd_range`
+and siblings, role `addr`, arg0 only) with loop-carried offsets via new
+`ROOT(n)` provenance (ARG plus unknown loop accumulation); the fixpoint
+now sweeps in reverse postorder (a listing-order bug poisoned the fixed
+write's loop to the empty fixpoint). Proof pair extended: CVE-2026-11743
+pre-fix FAILs naming BOTH the read site (memcpy) and the write site
+(cache invalidate, no sound guard); fixed firmware PASSes with both sites
+guarded (`signed-check`). Precision measured on a synthetic ground-truth
+corpus (labeled, not real firmware): TP=6, FP=1, FN=0, TN=6 — the one FP
+(`wide_guarded`: a 64-bit check lowering to a multi-word compare on 32-bit
+ARM) needs multi-word compare recognition, a v3 item. A corpus-wide census
+(new permanent JSON field `transfer_call_forms`) shows why v1 could never
+be validated on the corpus: 47 transfer calls, zero FIELD+ARG copies, and
+TOP-heavy provenance. Deliberately excluded from v2: DMA reload calls and
+command-address programming. Version bumped v3.15 -> v3.16 because report
+JSON gains a field and sites gain new kinds/roles.
+
 **Clock-enable-before-use (Lean-side, generic mode; no extractor change, no
 JSON change, no new flags):** every MUST access to a mapped STM32 peripheral's
 register block requires a MUST STORE to that peripheral's clock-gate register
@@ -119,6 +137,9 @@ Fresh recount of the v3.14 regression log (`python3 assets/screenshots/regress_c
 
 ![BOUNDS pre-fix FAIL vs fixed PASS](assets/screenshots/bounds_screenshot.svg)
 v3.15 bounds verdict on CVE-2026-11743 firmware (`lake exe ingest_check <report> generic`, run from `lean/`): pre-fix FAILs naming the vulnerable read site (`flash_sf32lb_mpi_qspi_nor_read memcpy 0x1201d1d6, no sound guard`); fixed firmware (909eb56) PASSes with the same site guarded (`signed-check`).
+
+![BOUNDS v2 pre-fix FAIL vs fixed PASS](assets/screenshots/bounds_screenshot_v2.svg)
+v3.16 bounds verdict on the same CVE pair: pre-fix FAILs naming BOTH the read site (memcpy) and the write site (`flash_sf32lb_mpi_qspi_nor_write arch_dcache_invd_range 0x12018a62, no sound guard`); fixed firmware PASSes with both sites guarded.
 
 ## Honest zeros
 

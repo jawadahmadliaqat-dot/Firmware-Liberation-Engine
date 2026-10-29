@@ -197,7 +197,12 @@ import java.util.Set;
  * (signed offset-vs-0 check, wide ZEXT/SEXT check, or guard-call).
  * Emitted per function as "copy_sites" and top-level as "copy_sites"
  * + "copy_site_total" + "bounds_flagged_total"; the Lean verifier
- * gains a bounds verdict line in generic mode. See
+ * gains a bounds verdict line in generic mode.
+ * v3.16 extends the site set to cache-range transfers (address
+ * argument = computed pointer) and adds the loop-rooted offset
+ * form (ROOT: ARG plus loop accumulation, produced only by the
+ * must-join of ARG with an ADD-chain rooted in it), plus a
+ * per-kind pointer-form census ("transfer_call_forms"). See
  * ~/workspace/v24-bounds/design.md for semantics and limits.
  * Version bump v3.14 -> v3.15 because report JSON gains fields.
  */
@@ -8218,7 +8223,13 @@ public class ExtractIR extends GhidraScript {
 
     /** Symbolic provenance expression for the bounds scan. */
     private static class BExpr {
-        final String kind; // TOP, ARG, CONST, FIELD, ADD, SUB, EXT
+        // TOP, ARG, CONST, FIELD, ADD, SUB, EXT, ROOT (v3.16:
+        // ARG(n) plus unknown loop accumulation -- produced ONLY
+        // by the must-join of a value that IS ARG(n)/ROOT(n) with
+        // a value containing ARG(n); see containsArgRoot. A path
+        // with exactly ARG(n) reaches the join, so the v1 escape
+        // argument still holds.)
+        final String kind;
         final int argIdx;
         final long constVal;
         final BExpr base; // FIELD base, EXT inner, ADD/SUB left
@@ -8234,6 +8245,9 @@ public class ExtractIR extends GhidraScript {
         static BExpr arg(int i) {
             return new BExpr("ARG", i, 0, null, null, 0, 0);
         }
+        static BExpr root(int i) {
+            return new BExpr("ROOT", i, 0, null, null, 0, 0);
+        }
         static BExpr cnst(long v) {
             return new BExpr("CONST", -1, v, null, null, 0, 0);
         }
@@ -8241,6 +8255,28 @@ public class ExtractIR extends GhidraScript {
             return new BExpr("FIELD", -1, 0, b, null, o, 0);
         }
         static BExpr add(BExpr l, BExpr r) {
+            // ROOT absorption, except across a FIELD: a FIELD
+            // addend turns the sum into a POINTER (base + offset
+            // -- the site shape), not an offset, so collapsing it
+            // to ROOT would hide the base field from the site
+            // matcher. Any non-FIELD addend is accumulation, so
+            // ADD(ROOT, accumulation) stays ROOT (offset-like).
+            if (l.kind.equals("ROOT") && !r.kind.equals("FIELD")) {
+                return l;
+            }
+            if (r.kind.equals("ROOT") && !l.kind.equals("FIELD")) {
+                return r;
+            }
+            // Preserve ADD(ARG, unknown): the join needs to see
+            // the ARG root through an unknown accumulation (the
+            // loop-carried offset case: offset += chunk_len with
+            // chunk_len unknown). The site matcher still requires
+            // ARG or ROOT as the offset side, so a straight-line
+            // ADD(ARG, TOP) never matches a site by itself.
+            if ((l.kind.equals("ARG") && r == TOP) ||
+                (r.kind.equals("ARG") && l == TOP)) {
+                return new BExpr("ADD", -1, 0, l, r, 0, 0);
+            }
             if (l == TOP || r == TOP) return TOP;
             if (l.kind.equals("CONST") && r.kind.equals("CONST")) {
                 return cnst(l.constVal + r.constVal);
@@ -8251,6 +8287,7 @@ public class ExtractIR extends GhidraScript {
         }
         static BExpr sub(BExpr l, BExpr r) {
             if (l == TOP || r == TOP) return TOP;
+            if (l.kind.equals("ROOT")) return l;
             if (l.kind.equals("CONST") && r.kind.equals("CONST")) {
                 return cnst(l.constVal - r.constVal);
             }
@@ -8267,6 +8304,7 @@ public class ExtractIR extends GhidraScript {
         String key() {
             if (kind.equals("TOP")) return "TOP";
             if (kind.equals("ARG")) return "A" + argIdx;
+            if (kind.equals("ROOT")) return "R" + argIdx;
             if (kind.equals("CONST")) return "C" + constVal;
             if (kind.equals("FIELD")) {
                 return "F(" + base.key() + "," + off + ")";
@@ -8288,10 +8326,15 @@ public class ExtractIR extends GhidraScript {
             return null;
         }
         /** True iff this expression contains EXT(offsetArg) wider
-            than pointer size (a 64-bit-style range check operand). */
+            than pointer size (a 64-bit-style range check operand).
+            A ROOT base counts: a widened loop-carried offset is
+            still the same argument's guard. */
         boolean containsWideExt(BExpr offsetArg, int ptrSize) {
             if (kind.equals("EXT")) {
-                return base.equals(offsetArg) && extSize > ptrSize;
+                return (base.equals(offsetArg) ||
+                    (base.kind.equals("ROOT") &&
+                     base.argIdx == offsetArg.argIdx)) &&
+                    extSize > ptrSize;
             }
             if (kind.equals("ADD") || kind.equals("SUB")) {
                 return base.containsWideExt(offsetArg, ptrSize) ||
@@ -8342,6 +8385,12 @@ public class ExtractIR extends GhidraScript {
         final List<BoundsCmp> cmps = new ArrayList<BoundsCmp>();
         final List<BoundsSiteRec> sites = new ArrayList<BoundsSiteRec>();
         boolean hasSignedArgCheck = false;
+        // Transfer-call form census (v3.16): key "kind:form" per
+        // pointer argument, plus the transfer-call count. Only
+        // the main pass reads these (the pre-pass ignores them).
+        final Map<String, Integer> formCounts =
+            new HashMap<String, Integer>();
+        int transferCalls = 0;
     }
 
     /** Provenance of one varnode under the bounds scan. Constants
@@ -8406,6 +8455,77 @@ public class ExtractIR extends GhidraScript {
         first: they are local to one instruction (same rule as the
         value fixpoint), so a stale unique from a predecessor
         instruction must never be readable here. */
+    /** True iff e is, or additively contains, argument n (ARG,
+        ROOT, or an ADD chain with n as a term). Used only by the
+        must-join: joining a value that IS ARG(n)/ROOT(n) with a
+        value containing ARG(n) yields ROOT(n), because a path
+        carrying exactly ARG(n) reaches the join (entry edge of a
+        loop, or the untouched branch), so the v1 escape argument
+        still holds for the rooted form. Values with no exact-ARG
+        path (two ADD-chains, a constant, another argument) do
+        NOT merge -- they drop, as before. */
+    private boolean containsArgRoot(BExpr e, int n) {
+        if (e == null) return false;
+        if (e.kind.equals("ARG") || e.kind.equals("ROOT")) {
+            return e.argIdx == n;
+        }
+        if (e.kind.equals("ADD")) {
+            return containsArgRoot(e.base, n) ||
+                containsArgRoot(e.other, n);
+        }
+        return false;
+    }
+
+    /** True iff e is offset argument n itself (ARG) or its
+        loop-carried rooted form (ROOT) -- guards written against
+        the entry value match both. */
+    private boolean boundsIsOffset(BExpr e, int n) {
+        return e != null && ((e.kind.equals("ARG") ||
+            e.kind.equals("ROOT")) && e.argIdx == n);
+    }
+
+    /** Cache-range calls: range operations on a pointer+length,
+        the transfer generalisation of memcpy/memmove (v3.16).
+        Explicit name set -- no pattern guessing. DMA reload
+        calls are NOT in the set: their arguments carry no
+        computed pointer in the CVE case (source = caller buffer,
+        dest = controller register), and DMA names are
+        driver-specific, so no canonical set exists. */
+    private boolean isBoundsCacheCall(String name) {
+        return name.equals("arch_dcache_invd_range") ||
+            name.equals("arch_dcache_flush_range") ||
+            name.equals("arch_dcache_clean_range") ||
+            name.equals("sys_cache_data_invd_range") ||
+            name.equals("sys_cache_data_flush_range") ||
+            name.equals("sys_cache_instr_invd_range");
+    }
+
+    private boolean isBoundsTransferCall(String name) {
+        return name.equals("memcpy") || name.equals("memmove") ||
+            isBoundsCacheCall(name);
+    }
+
+    /** Pointer-form census class for one transfer-call argument:
+        site = ADD(FIELD, ARG|ROOT) (matches a site); plain_arg,
+        field_only, const, top, other = everything else. */
+    private String boundsFormOf(BExpr p) {
+        if (p == null) return "top";
+        if (p.kind.equals("ADD") &&
+            ((p.base.kind.equals("FIELD") &&
+              (p.other.kind.equals("ARG") ||
+               p.other.kind.equals("ROOT"))) ||
+             (p.other.kind.equals("FIELD") &&
+              (p.base.kind.equals("ARG") ||
+               p.base.kind.equals("ROOT"))))) {
+            return "site";
+        }
+        if (p.kind.equals("ARG")) return "plain_arg";
+        if (p.kind.equals("FIELD")) return "field_only";
+        if (p.kind.equals("CONST")) return "const";
+        if (p.kind.equals("TOP")) return "top";
+        return "other";
+    }
+
     private Map<String, BExpr> boundsTransfer(Map<String, BExpr> in,
         OpRec op, long[] saved, boolean stripUniques) {
         Map<String, BExpr> prov = new HashMap<String, BExpr>(in);
@@ -8539,27 +8659,116 @@ public class ExtractIR extends GhidraScript {
                 !ops.get(i).instrAddr.equals(ops.get(i - 1).instrAddr);
         }
         boolean converged = false;
+        // Reverse-postorder sweeps + visited-pred joins (v3.16
+        // fixes): outStates start EMPTY, so a loop head joined
+        // against an unprocessed back edge in sweep 1 would
+        // poison its IN to empty and never recover (must-joins
+        // only remove). Skipping unvisited preds makes sweep 1
+        // optimistic -- but listing order is NOT topological:
+        // the FIXED write lays its loop latch (0x12018a6c)
+        // before its chunk-setup block (0x12018a76) in address
+        // order, so a listing-order sweep processes the latch
+        // (spurious empty OUT, downstream of the empty head)
+        // before chunk-setup and the join poisons chunk-setup,
+        // the head, and the whole loop body to the trivial empty
+        // fixpoint. RPO processes every forward pred before its
+        // successors, so pass 1 seeds the loop with the entry
+        // value and later passes refine it to ROOT; by
+        // convergence every pred has been visited, so the final
+        // INs are exact joins -- the greatest fixpoint.
+        java.util.List<Integer> rpo =
+            new java.util.ArrayList<Integer>();
+        {
+            boolean[] seen = new boolean[n];
+            java.util.List<Integer> post =
+                new java.util.ArrayList<Integer>();
+            java.util.ArrayDeque<int[]> st =
+                new java.util.ArrayDeque<int[]>();
+            if (n > 0) {
+                st.push(new int[] { 0, 0 });
+                seen[0] = true;
+            }
+            while (!st.isEmpty()) {
+                int[] top = st.peek();
+                int u = top[0];
+                java.util.List<Integer> ss;
+                if (succ != null) {
+                    ss = succ.get(u);
+                } else {
+                    ss = new java.util.ArrayList<Integer>();
+                    if (u + 1 < n) ss.add(u + 1);
+                }
+                if (top[1] < ss.size()) {
+                    int v = ss.get(top[1]++);
+                    if (v >= 0 && v < n && !seen[v]) {
+                        seen[v] = true;
+                        st.push(new int[] { v, 0 });
+                    }
+                } else {
+                    post.add(u);
+                    st.pop();
+                }
+            }
+            for (int i = post.size() - 1; i >= 0; i--) {
+                rpo.add(post.get(i));
+            }
+            for (int i = 0; i < n; i++) {
+                if (!seen[i]) rpo.add(i);
+            }
+        }
+        boolean[] visited = new boolean[n];
         for (int sweep = 0; sweep < 500 && !converged; sweep++) {
             boolean changed = false;
-            outStates[0] = boundsTransfer(inStates[0], ops.get(0),
-                saved, true);
-            for (int i = 1; i < n; i++) {
+            for (int ri = 0; ri < rpo.size(); ri++) {
+                int i = rpo.get(ri);
+                if (i == 0) {
+                    outStates[0] = boundsTransfer(inStates[0],
+                        ops.get(0), saved, true);
+                    visited[0] = true;
+                    continue;
+                }
                 List<Integer> ps = pred.get(i);
                 Map<String, BExpr> joined;
-                if (ps.isEmpty()) {
+                java.util.List<Integer> vps =
+                    new java.util.ArrayList<Integer>();
+                for (int p : ps) {
+                    if (visited[p]) vps.add(p);
+                }
+                if (vps.isEmpty()) {
                     joined = new HashMap<String, BExpr>();
                 } else {
                     joined =
-                        new HashMap<String, BExpr>(outStates[ps.get(0)]);
-                    for (int k = 1; k < ps.size(); k++) {
-                        Map<String, BExpr> o = outStates[ps.get(k)];
+                        new HashMap<String, BExpr>(outStates[vps.get(0)]);
+                    for (int k = 1; k < vps.size(); k++) {
+                        Map<String, BExpr> o = outStates[vps.get(k)];
                         java.util.Iterator<Map.Entry<String, BExpr>> it =
                             joined.entrySet().iterator();
                         while (it.hasNext()) {
                             Map.Entry<String, BExpr> e = it.next();
                             BExpr v = o.get(e.getKey());
-                            if (v == null || !v.equals(e.getValue())) {
+                            if (v == null) {
                                 it.remove();
+                            } else if (!v.equals(e.getValue())) {
+                                // Rooted merge (v3.16): a value that
+                                // IS ARG(n)/ROOT(n) joined with a
+                                // value containing ARG(n) keeps
+                                // ROOT(n) instead of dropping.
+                                BExpr old = e.getValue();
+                                int rn = -1;
+                                if (old.kind.equals("ARG") ||
+                                    old.kind.equals("ROOT")) {
+                                    rn = old.argIdx;
+                                } else if (v.kind.equals("ARG") ||
+                                    v.kind.equals("ROOT")) {
+                                    rn = v.argIdx;
+                                }
+                                if (rn >= 0 &&
+                                    containsArgRoot(old, rn) &&
+                                    containsArgRoot(v, rn)) {
+                                    e.setValue(BExpr.root(rn));
+                                } else {
+                                    it.remove();
+                                }
                             }
                         }
                     }
@@ -8570,6 +8779,7 @@ public class ExtractIR extends GhidraScript {
                 }
                 outStates[i] = boundsTransfer(inStates[i], ops.get(i),
                     saved, isInstrStart[i]);
+                visited[i] = true;
             }
             if (!changed) converged = true;
         }
@@ -8643,32 +8853,39 @@ public class ExtractIR extends GhidraScript {
                     }
                 }
                 if (calleeName != null &&
-                    (calleeName.equals("memcpy") ||
-                        calleeName.equals("memmove"))) {
+                    isBoundsTransferCall(calleeName)) {
+                    boolean isCache = isBoundsCacheCall(calleeName);
                     // Snapshot argument registers from the IN state
-                    // (before the call clobber).
+                    // (before the call clobber). Cache-range calls
+                    // take (address, length): only arg0 is a
+                    // pointer candidate, role "addr".
                     BExpr dst = boundsProvOf(
                         regVarnode(argOffs[0], 4), prov);
-                    BExpr src = boundsProvOf(
+                    BExpr src = isCache ? BExpr.TOP : boundsProvOf(
                         regVarnode(argOffs[1], 4), prov);
-                    // One site per call, role = src if the source
-                    // is computed, else dst; both -> "both".
-                    BExpr[] ptrs = new BExpr[] { src, dst };
-                    String[] roles = new String[] { "src", "dst" };
+                    // One site per call, memcpy/memmove role = src
+                    // if the source is computed, else dst; both ->
+                    // "both". Cache role = "addr".
+                    BExpr[] ptrs = isCache ? new BExpr[] { dst } :
+                        new BExpr[] { src, dst };
+                    String[] roles = isCache ? new String[] { "addr" } :
+                        new String[] { "src", "dst" };
                     BExpr offArg = null;
                     BExpr structBase = null;
                     long baseOff = 0;
                     String role = null;
-                    for (int pi = 0; pi < 2; pi++) {
+                    for (int pi = 0; pi < ptrs.length; pi++) {
                         BExpr p = ptrs[pi];
                         if (!p.kind.equals("ADD")) continue;
                         BExpr f = null;
                         BExpr o = null;
                         if (p.base.kind.equals("FIELD") &&
-                            p.other.kind.equals("ARG")) {
+                            (p.other.kind.equals("ARG") ||
+                             p.other.kind.equals("ROOT"))) {
                             f = p.base; o = p.other;
                         } else if (p.other.kind.equals("FIELD") &&
-                            p.base.kind.equals("ARG")) {
+                            (p.base.kind.equals("ARG") ||
+                             p.base.kind.equals("ROOT"))) {
                             f = p.other; o = p.base;
                         }
                         if (f == null) continue;
@@ -8680,6 +8897,11 @@ public class ExtractIR extends GhidraScript {
                         }
                     }
                     if (role != null) {
+                        // Matching reference: the original argument
+                        // (a ROOT offset was ARG at function entry,
+                        // so entry checks/guards match against ARG).
+                        int offIdx = offArg.argIdx;
+                        BExpr offRef = BExpr.arg(offIdx);
                         // Unsound check: unsigned comparison of
                         // ADD(offArg, X) vs FIELD(structBase, _).
                         boolean unsound = false;
@@ -8687,11 +8909,19 @@ public class ExtractIR extends GhidraScript {
                         for (BoundsCmp c : res.cmps) {
                             if (!c.isUnsigned()) continue;
                             BExpr fld = null;
-                            if (c.a.addOtherSide(offArg) != null &&
+                            // The check's non-offset side must be
+                            // known (v1 semantics preserved): an
+                            // ADD(ARG, TOP) sum is not an unsound
+                            // check, only a sum with a known side.
+                            BExpr otherSide = c.a.addOtherSide(offRef);
+                            if (otherSide != null &&
+                                !otherSide.kind.equals("TOP") &&
                                 c.b.kind.equals("FIELD") &&
                                 c.b.base.equals(structBase)) {
                                 fld = c.b;
-                            } else if (c.b.addOtherSide(offArg) != null &&
+                            } else if ((otherSide =
+                                c.b.addOtherSide(offRef)) != null &&
+                                !otherSide.kind.equals("TOP") &&
                                 c.a.kind.equals("FIELD") &&
                                 c.a.base.equals(structBase)) {
                                 fld = c.a;
@@ -8703,13 +8933,15 @@ public class ExtractIR extends GhidraScript {
                             }
                         }
                         // Sound guards (any one suppresses).
+                        // Signed checks match the entry argument
+                        // or its loop-carried rooted form.
                         String guard = "none";
                         for (BoundsCmp c : res.cmps) {
                             if (!c.isSigned()) continue;
-                            if ((c.a.equals(offArg) &&
+                            if ((boundsIsOffset(c.a, offIdx) &&
                                 c.b.kind.equals("CONST") &&
                                 c.b.constVal == 0) ||
-                                (c.b.equals(offArg) &&
+                                (boundsIsOffset(c.b, offIdx) &&
                                     c.a.kind.equals("CONST") &&
                                     c.a.constVal == 0)) {
                                 guard = "signed-check";
@@ -8720,11 +8952,11 @@ public class ExtractIR extends GhidraScript {
                             for (BoundsCmp c : res.cmps) {
                                 if (!c.isUnsigned()) continue;
                                 boolean wide = false;
-                                if (c.a.containsWideExt(offArg, ptrSize) &&
+                                if (c.a.containsWideExt(offRef, ptrSize) &&
                                     c.b.kind.equals("FIELD") &&
                                     c.b.base.equals(structBase)) {
                                     wide = true;
-                                } else if (c.b.containsWideExt(offArg,
+                                } else if (c.b.containsWideExt(offRef,
                                     ptrSize) &&
                                     c.a.kind.equals("FIELD") &&
                                     c.a.base.equals(structBase)) {
@@ -8787,6 +9019,24 @@ public class ExtractIR extends GhidraScript {
                         sb.append("}");
                         res.sites.add(new BoundsSiteRec(
                             sb.toString(), flagged));
+                    }
+                    // Transfer-call form census (v3.16): every
+                    // transfer call's pointer args, matched or not.
+                    {
+                        String formKind = isCache ? "cache" :
+                            calleeName.equals("memmove") ? "memmove" :
+                            "memcpy";
+                        BExpr[] formArgs = isCache ?
+                            new BExpr[] { dst } :
+                            new BExpr[] { src, dst };
+                        for (BExpr fa : formArgs) {
+                            String fk = formKind + ":" +
+                                boundsFormOf(fa);
+                            Integer prev = res.formCounts.get(fk);
+                            res.formCounts.put(fk,
+                                prev == null ? 1 : prev + 1);
+                        }
+                        res.transferCalls++;
                     }
                 } else if (mnem.equals("CALL") && callee != null) {
                     long ent;
@@ -8976,7 +9226,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.15\",");
+        w.println("  \"extractor_version\": \"v3.16\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -9017,6 +9267,9 @@ public class ExtractIR extends GhidraScript {
         int totalCopySites = 0;
         int totalBoundsFlagged = 0;
         List<String> allCopySites = new ArrayList<String>();
+        Map<String, Integer> totalFormCounts =
+            new HashMap<String, Integer>();
+        int totalTransferCalls = 0;
         // v3.5 pass 1: function-pointer store map for the whole
         // program, before any function is printed (may-edges need
         // cross-function stores). Best-effort: a failure here only
@@ -10661,6 +10914,13 @@ public class ExtractIR extends GhidraScript {
                     for (BoundsSiteRec sr : copySites) {
                         if (sr.flagged) copyFlagged++;
                     }
+                    for (Map.Entry<String, Integer> fe :
+                        bs.formCounts.entrySet()) {
+                        Integer prev = totalFormCounts.get(fe.getKey());
+                        totalFormCounts.put(fe.getKey(), prev == null ?
+                            fe.getValue() : prev + fe.getValue());
+                    }
+                    totalTransferCalls += bs.transferCalls;
                 }
             } catch (Exception e) {
                 // copySites stays empty; report continues.
@@ -11408,6 +11668,26 @@ public class ExtractIR extends GhidraScript {
         w.println("  ],");
         w.println("  \"copy_site_total\": " + totalCopySites + ",");
         w.println("  \"bounds_flagged_total\": " + totalBoundsFlagged + ",");
+        w.println("  \"transfer_call_forms\": {");
+        w.println("    \"total_transfer_calls\": " + totalTransferCalls + ",");
+        {
+            String[] formKinds = new String[] { "memcpy", "memmove",
+                "cache" };
+            String[] forms = new String[] { "site", "plain_arg",
+                "field_only", "const", "top", "other" };
+            for (int ki = 0; ki < formKinds.length; ki++) {
+                w.print("    \"" + formKinds[ki] + "\": {");
+                for (int fi = 0; fi < forms.length; fi++) {
+                    if (fi > 0) w.print(", ");
+                    Integer cv = totalFormCounts.get(
+                        formKinds[ki] + ":" + forms[fi]);
+                    w.print("\"" + forms[fi] + "\": " +
+                        (cv == null ? 0 : cv.intValue()));
+                }
+                w.println("}" + (ki + 1 < formKinds.length ? "," : ""));
+            }
+        }
+        w.println("  },");
         w.println("  \"literal_scan\": {");
         w.println("    \"literal_count\": " + litScan.literalCount + ",");
         w.print("    \"attributed\": {");

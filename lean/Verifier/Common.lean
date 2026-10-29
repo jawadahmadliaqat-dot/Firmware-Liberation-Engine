@@ -588,10 +588,13 @@ def checkClockEnable (trace : List MmioAccess) : Bool :=
     wrapping way, with no candidate sound guard anywhere before the
     copy. PASS on this line means "no proven-bad shape in the traced
     copies" -- never "all copies proven safe": copies the extractor
-    could not track (stack-spilled offsets, DMA, indirect calls) are
-    simply absent, and a site with no in-function check at all is
-    emitted unflagged because a caller-side validation cannot be
-    excluded. The top-level "copy_sites" field is optional: absent
+    could not track (stack-spilled offsets, DMA transfers,
+    command-address programming via integer offsets, indirect
+    calls) are simply absent, and a site with no in-function check
+    at all is emitted unflagged because a caller-side validation
+    cannot be excluded. Since v3.16 the site set also covers
+    cache-range transfers (address argument = computed pointer).
+    The top-level "copy_sites" field is optional: absent
     (pre-v3.15 reports) means no bounds data, not an error -- the
     line then passes vacuously and the site count (0) shows it. A
     present-but-malformed field is an error, like port/MSR. -/
