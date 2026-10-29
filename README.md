@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.17-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.18-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -126,6 +126,37 @@ Decompiler Switch Analysis and recover less code until diagnosed. Version
 bumped v3.16 -> v3.17 because guard semantics changed on the wide-check
 input class.
 
+**v3.18 changes:** bounds Phase 1 completes the transfer-site model with
+three new pieces. DMA transfers (role `dma`): a callee that programs a
+passed computed pointer into a constant address is a site, with the same
+unsound-check / sound-guard evidence as copies. Command-address
+programming (role `cmdaddr`): a callee that programs a passed bare offset
+into a constant address (VALUE form, `base+offset` re-derived) or uses it
+as a store address (ADDRESS form, `base_field` null — the Lean parser now
+reads `base_field` as `Option Nat`; verdict logic unchanged). Inter-
+procedural caller validation: a flagged site is suppressed with guard
+`caller-check` when every known direct caller validates the same (base,
+offset, size) triple with a sound guard (signed, ZEXT-wide, or multi-
+word); unsigned-only caller validation does not count, and the old
+flag-by-design case (`unsigned_only_caller_validated`) now closes as TN.
+A regression-caught false flag shaped two gates: cmdaddr sites are
+emitted only with an unsound check, and suppressed when the caller
+dereferences the passed slot (pointer use, not offset use) — the Zephyr
+list-unlink case (`z_thread_abort` -> `sys_dlist_remove`) that proved the
+gate is mirrored synthetically (`holder_remove`). Precision on the
+synthetic ground-truth corpus (now 33 cases, labeled, not real
+firmware): TP=17, FP=0, FN=0, TN=16 — DMA, cmdaddr, and 8 caller-
+validation cases (wrong-offset / wrong-size / wrong-base / partial /
+mixed callers still flag) alongside the unchanged old 16. CVE-2026-11743
+pair unchanged: pre-fix FAILs naming both sites, fixed PASSes. Full
+regression exact on 36 targets, zero bounds flips; no real target gains
+a site (all bounds 0/0 — caller-check is proven synthetically only).
+Deliberate non-coverage, miss direction only: indirect calls (including
+the CVE firmware's own DMA / command-instruction calls), PLT-only
+callees, grandchild programming. Version bumped v3.17 -> v3.18 because
+new site kinds, a new guard label, a flagged-to-suppressed semantic
+flip, and a JSON shape old Lean cannot parse (null `base_field`).
+
 **Clock-enable-before-use (Lean-side, generic mode; no extractor change, no
 JSON change, no new flags):** every MUST access to a mapped STM32 peripheral's
 register block requires a MUST STORE to that peripheral's clock-gate register
@@ -166,6 +197,9 @@ v3.16 bounds verdict on the same CVE pair: pre-fix FAILs naming BOTH the read si
 
 ![BOUNDS v3 refinement: precision + CVE pair](assets/screenshots/bounds_screenshot_ref.svg)
 v3.17 bounds verdict on the same CVE pair (unchanged: pre-fix FAILs naming BOTH sites, fixed PASSes), plus the refined precision pane: `wide_guarded` flagged again (sign-extending, no negative rejection), zero-extending and signed+wide cases unflagged, TP=8 FP=0 FN=0 TN=8.
+
+![BOUNDS Phase 1: DMA + command-address + caller validation](assets/screenshots/bounds_screenshot_phase1.svg)
+v3.18 bounds Phase 1 on the same CVE pair (unchanged: pre-fix FAILs naming BOTH sites, fixed PASSes), plus the extended precision pane: 33 cases, TP=17 FP=0 FN=0 TN=16 — DMA sites, cmdaddr sites (including `base field none`), and caller-check suppressions, with wrong-triple / partial / mixed callers still flagging.
 
 ## Honest zeros
 

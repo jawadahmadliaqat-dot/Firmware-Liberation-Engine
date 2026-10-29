@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="2212" viewBox="0 0 1020 2212">
+<rect x="0" y="0" width="1020" height="2212" fill="#0b0d10"/>
+<rect x="16" y="58" width="988" height="1296" rx="10" fill="#111318" stroke="#333646"/>
+<rect x="16" y="1366" width="988" height="416" rx="10" fill="#111318" stroke="#333646"/>
+<rect x="16" y="1794" width="988" height="350" rx="10" fill="#111318" stroke="#333646"/>
+<text x="16" y="34" font-family="monospace" font-size="17" font-weight="bold" fill="#ffffff">Bounds Phase 1 — DMA + command-address + caller validation</text>
+<text x="32" y="84" font-family="monospace" font-size="15" font-weight="bold" fill="#e8e8e8">PRECISION CORPUS — 33 cases (TP=17 FP=0 FN=0 TN=16)</text>
+<text x="32" y="108" font-family="monospace" font-size="11" fill="#9a9a9a">$ python3 v25-bounds-v2/precision/score_precision.py</text>
+<text x="32" y="136" font-family="monospace" font-size="12.5" fill="#e8e8e8">version: v3.17 | sites: 27 | flagged: 17</text>
+<!-- VERBATIM: forms: {"total_transfer_calls": 30, "memcpy": {"site": 17, "plain_arg": 19, "field_only": 0, "const": 1, "top": 1, "other": 0}, "memmove": {"site": 1, "plain_arg": 1, "field_only": 0, "const": 0, "top": 0, "other": 0}, "cache": {"site": 3, "plain_arg": 1, "field_only": 0, "const": 0, "top": 0, "other": 0}, "dma": {"site": 3, "plain_arg": 0, "field_only": 0, "const": 0, "top": 0, "other": 0}, "cmdaddr": {"site": 3, "plain_arg": 0, "field_only": 0, "const": 0, "top": 0, "other": 0}} -->
+<text x="32" y="158" font-family="monospace" font-size="12.5" fill="#e8e8e8">forms: {"total_transfer_calls": 30, "memcpy": {"site": 17, "plain_arg": 19, "field_only": 0, "const": 1, "top": 1, "othe</text>
+<text x="32" y="180" font-family="monospace" font-size="12.5" fill="#e8e8e8">r": 0}, "memmove": {"site": 1, "plain_arg": 1, "field_only": 0, "const": 0, "top": 0, "other": 0}, "cache": {"site": 3, </text>
+<text x="32" y="202" font-family="monospace" font-size="12.5" fill="#e8e8e8">"plain_arg": 1, "field_only": 0, "const": 0, "top": 0, "other": 0}, "dma": {"site": 3, "plain_arg": 0, "field_only": 0, </text>
+<text x="32" y="224" font-family="monospace" font-size="12.5" fill="#e8e8e8">"const": 0, "top": 0, "other": 0}, "cmdaddr": {"site": 3, "plain_arg": 0, "field_only": 0, "const": 0, "top": 0, "other"</text>
+<text x="32" y="246" font-family="monospace" font-size="12.5" fill="#e8e8e8">: 0}}</text>
+<text x="32" y="268" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       unvalidated_src                  expect=FLAG   :: 0x8000234 memcpy/src unsound=True guard=none flagged=True</text>
+<text x="32" y="290" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       unvalidated_dst                  expect=FLAG   :: 0x8000258 memcpy/dst unsound=True guard=none flagged=True</text>
+<text x="32" y="312" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       unvalidated_memmove              expect=FLAG   :: 0x8000280 memmove/src unsound=True guard=none flagged=True</text>
+<text x="32" y="334" font-family="monospace" font-size="12.5" fill="#4ade80">TN       caller_validated                 expect=NOFLAG :: 0x8000298 memcpy/src unsound=False guard=none flagged=False</text>
+<!-- VERBATIM: TN       unsigned_only_caller_validated   expect=NOFLAG :: 0x80002e0 memcpy/src unsound=True guard=caller-check flagged=False -->
+<text x="32" y="356" font-family="monospace" font-size="12.5" fill="#4ade80">TN       unsigned_only_caller_validated   expect=NOFLAG :: 0x80002e0 memcpy/src unsound=True guard=caller-check flagged=</text>
+<text x="32" y="378" font-family="monospace" font-size="12.5" fill="#4ade80">False</text>
+<text x="32" y="400" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       wide_guarded                     expect=FLAG   :: 0x800033a memcpy/src unsound=True guard=none flagged=True</text>
+<!-- VERBATIM: TN       wide_zero_guarded                expect=NOFLAG :: 0x800036a memcpy/src unsound=True guard=multiword-check flagged=False -->
+<text x="32" y="422" font-family="monospace" font-size="12.5" fill="#4ade80">TN       wide_zero_guarded                expect=NOFLAG :: 0x800036a memcpy/src unsound=True guard=multiword-check flagg</text>
+<text x="32" y="444" font-family="monospace" font-size="12.5" fill="#4ade80">ed=False</text>
+<!-- VERBATIM: TN       wide_signed_guarded              expect=NOFLAG :: 0x80003a2 memcpy/src unsound=True guard=signed-check flagged=False -->
+<text x="32" y="466" font-family="monospace" font-size="12.5" fill="#4ade80">TN       wide_signed_guarded              expect=NOFLAG :: 0x80003a2 memcpy/src unsound=True guard=signed-check flagged=</text>
+<text x="32" y="488" font-family="monospace" font-size="12.5" fill="#4ade80">False</text>
+<text x="32" y="510" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       wide_nogate                      expect=FLAG   :: 0x80003e0 memcpy/src unsound=True guard=none flagged=True</text>
+<!-- VERBATIM: TN       guardcall_guarded                expect=NOFLAG :: 0x8000412 memcpy/src unsound=False guard=guard-call flagged=False -->
+<text x="32" y="532" font-family="monospace" font-size="12.5" fill="#4ade80">TN       guardcall_guarded                expect=NOFLAG :: 0x8000412 memcpy/src unsound=False guard=guard-call flagged=F</text>
+<text x="32" y="554" font-family="monospace" font-size="12.5" fill="#4ade80">alse</text>
+<text x="32" y="576" font-family="monospace" font-size="12.5" fill="#4ade80">TN       plain_ptr                        expect=NOSITE :: (no site)</text>
+<text x="32" y="598" font-family="monospace" font-size="12.5" fill="#4ade80">TN       const_ptr                        expect=NOSITE :: (no site)</text>
+<!-- VERBATIM: TP       invd_straight                    expect=FLAG   :: 0x8000450 arch_dcache_invd_range/addr unsound=True guard=none flagged=True -->
+<text x="32" y="620" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       invd_straight                    expect=FLAG   :: 0x8000450 arch_dcache_invd_range/addr unsound=True guard=none</text>
+<text x="32" y="642" font-family="monospace" font-size="12.5" fill="#ffb86b"> flagged=True</text>
+<!-- VERBATIM: TP       invd_loop                        expect=FLAG   :: 0x8000480 arch_dcache_invd_range/addr unsound=True guard=none flagged=True -->
+<text x="32" y="664" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       invd_loop                        expect=FLAG   :: 0x8000480 arch_dcache_invd_range/addr unsound=True guard=none</text>
+<text x="32" y="686" font-family="monospace" font-size="12.5" fill="#ffb86b"> flagged=True</text>
+<!-- VERBATIM: TN       invd_guarded_loop                expect=NOFLAG :: 0x80004b6 arch_dcache_invd_range/addr unsound=True guard=signed-check flagged=False -->
+<text x="32" y="708" font-family="monospace" font-size="12.5" fill="#4ade80">TN       invd_guarded_loop                expect=NOFLAG :: 0x80004b6 arch_dcache_invd_range/addr unsound=True guard=sign</text>
+<text x="32" y="730" font-family="monospace" font-size="12.5" fill="#4ade80">ed-check flagged=False</text>
+<text x="32" y="752" font-family="monospace" font-size="12.5" fill="#4ade80">TN       invd_plain                       expect=NOSITE :: (no site)</text>
+<text x="32" y="774" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       dma_unvalidated                  expect=FLAG   :: 0x8000530 dma_setup/dma unsound=True guard=none flagged=True</text>
+<!-- VERBATIM: TN       dma_guarded                      expect=NOFLAG :: 0x800055a dma_setup/dma unsound=True guard=signed-check flagged=False -->
+<text x="32" y="796" font-family="monospace" font-size="12.5" fill="#4ade80">TN       dma_guarded                      expect=NOFLAG :: 0x800055a dma_setup/dma unsound=True guard=signed-check flagg</text>
+<text x="32" y="818" font-family="monospace" font-size="12.5" fill="#4ade80">ed=False</text>
+<text x="32" y="840" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       dma_loop                         expect=FLAG   :: 0x800058c dma_setup/dma unsound=True guard=none flagged=True</text>
+<text x="32" y="862" font-family="monospace" font-size="12.5" fill="#4ade80">TN       dma_plain_helper                 expect=NOSITE :: (no site)</text>
+<!-- VERBATIM: TP       cmdaddr_unvalidated              expect=FLAG   :: 0x80005ce qspi_prog_addr/cmdaddr unsound=True guard=none flagged=True -->
+<text x="32" y="884" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       cmdaddr_unvalidated              expect=FLAG   :: 0x80005ce qspi_prog_addr/cmdaddr unsound=True guard=none flag</text>
+<text x="32" y="906" font-family="monospace" font-size="12.5" fill="#ffb86b">ged=True</text>
+<!-- VERBATIM: TN       cmdaddr_guarded                  expect=NOFLAG :: 0x80005ea qspi_prog_addr/cmdaddr unsound=True guard=signed-check flagged=False -->
+<text x="32" y="928" font-family="monospace" font-size="12.5" fill="#4ade80">TN       cmdaddr_guarded                  expect=NOFLAG :: 0x80005ea qspi_prog_addr/cmdaddr unsound=True guard=signed-ch</text>
+<text x="32" y="950" font-family="monospace" font-size="12.5" fill="#4ade80">eck flagged=False</text>
+<!-- VERBATIM: TP       cmdaddr_store                    expect=FLAG   :: 0x800060e cmd_write/cmdaddr unsound=True guard=none flagged=True -->
+<text x="32" y="972" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       cmdaddr_store                    expect=FLAG   :: 0x800060e cmd_write/cmdaddr unsound=True guard=none flagged=T</text>
+<text x="32" y="994" font-family="monospace" font-size="12.5" fill="#ffb86b">rue</text>
+<text x="32" y="1016" font-family="monospace" font-size="12.5" fill="#4ade80">TN       cmdaddr_plain                    expect=NOSITE :: (no site)</text>
+<text x="32" y="1038" font-family="monospace" font-size="12.5" fill="#4ade80">TN       holder_remove                    expect=NOSITE :: (no site)</text>
+<text x="32" y="1060" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       ucv_wrongoff                     expect=FLAG   :: 0x8000674 memcpy/src unsound=True guard=none flagged=True</text>
+<!-- VERBATIM: TN       ucv_mw                           expect=NOFLAG :: 0x800069c memcpy/src unsound=True guard=caller-check flagged=False -->
+<text x="32" y="1082" font-family="monospace" font-size="12.5" fill="#4ade80">TN       ucv_mw                           expect=NOFLAG :: 0x800069c memcpy/src unsound=True guard=caller-check flagged=</text>
+<text x="32" y="1104" font-family="monospace" font-size="12.5" fill="#4ade80">False</text>
+<text x="32" y="1126" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       ucv_wrongsize                    expect=FLAG   :: 0x80006c4 memcpy/src unsound=True guard=none flagged=True</text>
+<text x="32" y="1148" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       ucv_wrongbase                    expect=FLAG   :: 0x80006ec memcpy/src unsound=True guard=none flagged=True</text>
+<text x="32" y="1170" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       ucv_partial                      expect=FLAG   :: 0x8000714 memcpy/src unsound=True guard=none flagged=True</text>
+<text x="32" y="1192" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       ucv_mixed                        expect=FLAG   :: 0x800073c memcpy/src unsound=True guard=none flagged=True</text>
+<!-- VERBATIM: TN       ucv_two_a                        expect=NOFLAG :: 0x8000764 memcpy/src unsound=True guard=caller-check flagged=False -->
+<text x="32" y="1214" font-family="monospace" font-size="12.5" fill="#4ade80">TN       ucv_two_a                        expect=NOFLAG :: 0x8000764 memcpy/src unsound=True guard=caller-check flagged=</text>
+<text x="32" y="1236" font-family="monospace" font-size="12.5" fill="#4ade80">False</text>
+<text x="32" y="1258" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       ucv_two_b                        expect=FLAG   :: 0x800078c memcpy/src unsound=True guard=none flagged=True</text>
+<text x="32" y="1280" font-family="monospace" font-size="12.5" fill="#4ade80">TP=17 FP=0 FN=0 TN=16 UNTESTED=0 SITE-FP=0</text>
+<!-- VERBATIM: NOTE (Phase 1): unsigned_only_caller_validated now counts TN (caller-check); the v2 flag-by-design caveat is closed by item 3 — see design-phase1.md §3. -->
+<text x="32" y="1302" font-family="monospace" font-size="12.5" fill="#e8e8e8">NOTE (Phase 1): unsigned_only_caller_validated now counts TN (caller-check); the v2 flag-by-design caveat is closed by i</text>
+<text x="32" y="1324" font-family="monospace" font-size="12.5" fill="#e8e8e8">tem 3 — see design-phase1.md §3.</text>
+<text x="32" y="1392" font-family="monospace" font-size="15" font-weight="bold" fill="#e8e8e8">CVE PRE-FIX (unchanged verdict: FAIL, both sites)</text>
+<text x="32" y="1416" font-family="monospace" font-size="11" fill="#9a9a9a">$ lake exe ingest_check ../analysis_reports/sf32lb_qspi_prefx.elf_report.json generic  (from lean/)</text>
+<text x="32" y="1444" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops: 89</text>
+<text x="32" y="1466" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops by kind (mmio, port, msr): (89, 0, 0)</text>
+<text x="32" y="1488" font-family="monospace" font-size="12.5" fill="#e8e8e8">may trace ops: 0</text>
+<text x="32" y="1510" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace non-empty: true</text>
+<text x="32" y="1532" font-family="monospace" font-size="12.5" fill="#e8e8e8">masks consistent (ones &amp; zeroes == 0): true</text>
+<text x="32" y="1554" font-family="monospace" font-size="12.5" fill="#e8e8e8">all addresses in MMIO window: true</text>
+<text x="32" y="1576" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR sanity (port ≤ 0xFFFF, MSR index &lt; 2^32): true</text>
+<text x="32" y="1598" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR confinement (every port/MSR in the architectural allowlist): true</text>
+<text x="32" y="1620" font-family="monospace" font-size="12.5" fill="#e8e8e8">clock-enable (every used peripheral's gate register touched): true</text>
+<text x="32" y="1642" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds (no computed-pointer copy/transfer with unsound-only guard): false</text>
+<text x="32" y="1664" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds sites: 3</text>
+<!-- VERBATIM: bounds violations: [flash_sf32lb_mpi_qspi_nor_write arch_dcache_invd_range 0x12018a62 (role addr, offset arg 1, base field 4, no sound guard), flash_sf32lb_mpi_qspi_nor_read memcpy 0x1201d1d6 (role src, offset arg 1, base field 4, no sound guard)] -->
+<text x="32" y="1686" font-family="monospace" font-size="12.5" fill="#ffb86b">bounds violations: [flash_sf32lb_mpi_qspi_nor_write arch_dcache_invd_range 0x12018a62 (role addr, offset arg 1, base fie</text>
+<text x="32" y="1708" font-family="monospace" font-size="12.5" fill="#ffb86b">ld 4, no sound guard), flash_sf32lb_mpi_qspi_nor_read memcpy 0x1201d1d6 (role src, offset arg 1, base field 4, no sound </text>
+<text x="32" y="1730" font-family="monospace" font-size="12.5" fill="#ffb86b">guard)]</text>
+<text x="32" y="1752" font-family="monospace" font-size="12.5" fill="#ff5a5a">VERDICT: FAIL</text>
+<text x="32" y="1820" font-family="monospace" font-size="15" font-weight="bold" fill="#e8e8e8">CVE FIXED (unchanged verdict: PASS)</text>
+<text x="32" y="1844" font-family="monospace" font-size="11" fill="#9a9a9a">$ lake exe ingest_check ../analysis_reports/sf32lb_qspi_fixed.elf_report.json generic  (from lean/)</text>
+<text x="32" y="1872" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops: 89</text>
+<text x="32" y="1894" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops by kind (mmio, port, msr): (89, 0, 0)</text>
+<text x="32" y="1916" font-family="monospace" font-size="12.5" fill="#e8e8e8">may trace ops: 0</text>
+<text x="32" y="1938" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace non-empty: true</text>
+<text x="32" y="1960" font-family="monospace" font-size="12.5" fill="#e8e8e8">masks consistent (ones &amp; zeroes == 0): true</text>
+<text x="32" y="1982" font-family="monospace" font-size="12.5" fill="#e8e8e8">all addresses in MMIO window: true</text>
+<text x="32" y="2004" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR sanity (port ≤ 0xFFFF, MSR index &lt; 2^32): true</text>
+<text x="32" y="2026" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR confinement (every port/MSR in the architectural allowlist): true</text>
+<text x="32" y="2048" font-family="monospace" font-size="12.5" fill="#e8e8e8">clock-enable (every used peripheral's gate register touched): true</text>
+<text x="32" y="2070" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds (no computed-pointer copy/transfer with unsound-only guard): true</text>
+<text x="32" y="2092" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds sites: 3</text>
+<text x="32" y="2114" font-family="monospace" font-size="12.5" fill="#4ade80">VERDICT: PASS</text>
+<text x="16" y="2156" font-family="monospace" font-size="12.5" fill="#9a9a9a">Phase 1: DMA sites (dma_setup/dma), cmdaddr sites (qspi_prog_addr/cmd_write, incl. base field none),</text>
+<text x="16" y="2176" font-family="monospace" font-size="12.5" fill="#9a9a9a">caller-check suppressions (unsigned_only_caller_validated, ucv_mw, ucv_two_a); wrong-triple / partial / mixed controls still flag.</text>
+<text x="16" y="2196" font-family="monospace" font-size="12.5" fill="#9a9a9a">CVE pair unchanged: pre-fix FAIL still names BOTH sites (write 0x12018a62 + read 0x1201d1d6); fixed still PASS.</text>
+</svg>

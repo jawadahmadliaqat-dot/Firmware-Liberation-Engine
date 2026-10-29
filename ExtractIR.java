@@ -8202,7 +8202,16 @@ public class ExtractIR extends GhidraScript {
     //   (false negative) but cannot invent provenance it never saw.
     // A copy site is a direct CALL (or tail BRANCH) to a function named
     // memcpy/memmove where the dst or src argument register holds
-    // ADD(FIELD(structPtr,baseOff), ARG(n)) at the call. The site is
+    // ADD(FIELD(structPtr,baseOff), ARG(n)) at the call. Bounds
+    // Phase 1 extends the site set (same scan, same guards): DMA
+    // sites (any callee that programs a computed-pointer argument
+    // into a constant address, role "dma") and command-address
+    // sites (any callee that programs a bare ARG|ROOT offset into
+    // a constant address or uses it as a store address, role
+    // "cmdaddr"), plus inter-procedural caller validation
+    // (a flagged site is suppressed with guard "caller-check"
+    // when every known direct caller validates the same
+    // (base, offset, size) triple). The site is
     // FLAGGED iff the same function also contains, before the call,
     // the unsound check shape -- an unsigned INT_LESS/INT_LESSEQUAL
     // between ADD(ARG(n),X) and FIELD(structPtr,sizeOff) -- and no
@@ -8389,6 +8398,95 @@ public class ExtractIR extends GhidraScript {
         BoundsSiteRec(String j, boolean f) { json = j; flagged = f; }
     }
 
+    /** Result of evaluating one site's check/guard evidence
+        (bounds Phase 1 refactor: the memcpy/cache block, the DMA
+        block and the cmdaddr block all share this evaluation, so
+        guard semantics cannot drift between site kinds).
+        checkFieldBase is the FIELD base of the matched unsound
+        check (for pointer sites it equals the pointer's struct
+        base by construction; for cmdaddr sites it is the only
+        struct base in evidence). */
+    private static class BoundsEval {
+        boolean unsound = false;
+        long sizeOff = -1;
+        String guard = "none";
+        BExpr checkFieldBase = null;
+    }
+
+    /** One direct call edge out of a scanned function (bounds
+        Phase 1, item 3): the call op index, the callee entry key,
+        and the provenance of every argument slot at the call
+        (before the call clobber). Recorded for every resolved
+        direct CALL/BRANCH, transfer or not. */
+    private static class BoundsCallEdge {
+        final int idx;
+        final long entry;
+        final BExpr[] slotProv;
+        BoundsCallEdge(int i, long e, BExpr[] s) {
+            idx = i; entry = e; slotProv = s;
+        }
+    }
+
+    /** Callee-side register-programming evidence (bounds Phase 1,
+        items 1-2): which argument slots the callee stores to a
+        constant address (valueProg), uses as a store address
+        (addrProg), and re-derives as ADD(FIELD, slot) (baseOff).
+        Computed by a linear listing-order walk, so it is
+        over-approximate (see boundsCalleeProg). */
+    private static class BoundsCalleeProg {
+        final java.util.Set<Integer> valueProg =
+            new java.util.HashSet<Integer>();
+        final java.util.Set<Integer> addrProg =
+            new java.util.HashSet<Integer>();
+        // Bounds Phase 1 fix (length-site false flags): a slot
+        // whose value is stored BARE into a fixed address (e.g. a
+        // DMA length, or any config value) is not address
+        // programming. addrForm marks slots whose stored value is
+        // an ADD combining the slot with a FIELD or CONST base
+        // (base+offset re-derivation, or constant-base + offset)
+        // — the value shape that proves the slot is an address
+        // component, not a length/config value.
+        final java.util.Set<Integer> addrForm =
+            new java.util.HashSet<Integer>();
+        final Map<Integer, Long> baseOff =
+            new HashMap<Integer, Long>();
+    }
+
+    /** Per-function caller-validation record (bounds Phase 1,
+        item 3), built by the pre-pass scan: signed-checked
+        argument indices (ARG or ROOT vs CONST 0), the function's
+        full compare list (for wide/multiword evaluation at
+        suppression time), its ops + branch targets (for group-map
+        rebuild), its outgoing call edges, and its pointer size. */
+    private static class BoundsValid {
+        final java.util.Set<Integer> signedArgs =
+            new java.util.HashSet<Integer>();
+        // Bounds Phase 1, cmdaddr pointer-use gate: argument
+        // slots this function dereferences (load/store address
+        // base positions), from the pre-pass scan. A slot in
+        // these sets is a POINTER, not an offset integer.
+        final java.util.Set<Integer> derefArgs =
+            new java.util.HashSet<Integer>();
+        final java.util.Set<Integer> derefRoots =
+            new java.util.HashSet<Integer>();
+        List<BoundsCmp> cmps = null;
+        List<OpRec> ops = null;
+        Map<Integer, List<Integer>> branchTargets = null;
+        List<BoundsCallEdge> edges = null;
+        int ptrSize = 4;
+    }
+
+    /** Instruction-group maps for the multi-word guard matcher
+        (bounds Phase 1 refactor: shared by boundsScan's own walk
+        and by caller-side multiword evaluation). */
+    private static class BoundsGroups {
+        int[] opGroup = new int[0];
+        List<Integer> grpStarts = new ArrayList<Integer>();
+        Map<String, Integer> addrToGroup =
+            new HashMap<String, Integer>();
+        List<List<Integer>> grpSucc = null;
+    }
+
     /** Result of one bounds scan: comparison events, copy sites, and
         whether the function contains a signed ARG-vs-0 comparison
         (the guard-call pre-pass reads only this last field). */
@@ -8396,6 +8494,20 @@ public class ExtractIR extends GhidraScript {
         final List<BoundsCmp> cmps = new ArrayList<BoundsCmp>();
         final List<BoundsSiteRec> sites = new ArrayList<BoundsSiteRec>();
         boolean hasSignedArgCheck = false;
+        // Bounds Phase 1, item 3: signed-checked argument indices
+        // (ARG or ROOT vs CONST 0), outgoing direct-call edges,
+        // and pointer size, for the pre-pass validation records.
+        final java.util.Set<Integer> signedArgs =
+            new java.util.HashSet<Integer>();
+        final List<BoundsCallEdge> edges =
+            new ArrayList<BoundsCallEdge>();
+        int ptrSize = 4;
+        // Bounds Phase 1, cmdaddr pointer-use gate: slots this
+        // function dereferences (see BoundsValid above).
+        final java.util.Set<Integer> derefArgs =
+            new java.util.HashSet<Integer>();
+        final java.util.Set<Integer> derefRoots =
+            new java.util.HashSet<Integer>();
         // Transfer-call form census (v3.16): key "kind:form" per
         // pointer argument, plus the transfer-call count. Only
         // the main pass reads these (the pre-pass ignores them).
@@ -8501,7 +8613,10 @@ public class ExtractIR extends GhidraScript {
         calls are NOT in the set: their arguments carry no
         computed pointer in the CVE case (source = caller buffer,
         dest = controller register), and DMA names are
-        driver-specific, so no canonical set exists. */
+        driver-specific, so no canonical set exists. DMA transfers
+        are instead covered since Phase 1 by the structural
+        callee-programming rule (see boundsCalleeProg), with no
+        name set at all. */
     private boolean isBoundsCacheCall(String name) {
         return name.equals("arch_dcache_invd_range") ||
             name.equals("arch_dcache_flush_range") ||
@@ -8535,6 +8650,560 @@ public class ExtractIR extends GhidraScript {
         if (p.kind.equals("CONST")) return "const";
         if (p.kind.equals("TOP")) return "top";
         return "other";
+    }
+
+    /** True iff BExpr e contains ARG(p) or ROOT(p) as a VALUE
+        contribution (ADD/SUB term, direct, or ZEXT/SEXT inner).
+        A FIELD base does NOT count: a callee that merely loads a
+        field through slot p (e.g. storing d->base + off, where
+        slot 0 is the struct pointer) is programming the OFFSET
+        (slot 1), not the struct pointer — counting FIELD bases
+        would emit a noise site for every struct-pointer slot of
+        every register-programming helper. Distinct from
+        containsArgRoot (the must-join predicate). */
+    private boolean boundsContainsArg(BExpr e, int p) {
+        if (e == null) return false;
+        if (e.kind.equals("ARG") || e.kind.equals("ROOT")) {
+            return e.argIdx == p;
+        }
+        if (e.kind.equals("ADD") || e.kind.equals("SUB")) {
+            return boundsContainsArg(e.base, p) ||
+                boundsContainsArg(e.other, p);
+        }
+        if (e.kind.equals("ZEXT") || e.kind.equals("SEXT")) {
+            return boundsContainsArg(e.base, p);
+        }
+        return false;
+    }
+
+    /** Slots appearing in BASE positions of a BExpr address
+        (bounds Phase 1, cmdaddr pointer-use gate): a direct
+        ARG/ROOT, a FIELD base, an ADD/SUB base, or an EXT inner.
+        The OFFSET side of an ADD/SUB is deliberately NOT
+        traversed: buf[off] uses off as an integer index, and
+        marking it pointer-like would block true cmdaddr sites
+        whose offset also indexes a buffer. */
+    private void boundsBaseSlots(BExpr e,
+        java.util.Set<String> out) {
+        if (e == null) return;
+        if (e.kind.equals("ARG") || e.kind.equals("ROOT")) {
+            out.add(e.kind + ":" + e.argIdx);
+            return;
+        }
+        if (e.kind.equals("FIELD")) {
+            boundsBaseSlots(e.base, out);
+            return;
+        }
+        if (e.kind.equals("ADD") || e.kind.equals("SUB")) {
+            boundsBaseSlots(e.base, out);
+            return;
+        }
+        if (e.kind.equals("ZEXT") || e.kind.equals("SEXT")) {
+            boundsBaseSlots(e.base, out);
+            return;
+        }
+    }
+
+    /** Callee-side register-programming walk (bounds Phase 1,
+        items 1-2). Seeds the callee's argument registers with
+        ARG(i) and walks its ops once in listing order (uniques
+        stripped at each instruction start, CALL/CALLIND clobber
+        via boundsTransfer). At each STORE (ins[1] = address,
+        ins[2] = value): a FIXED address with a value containing
+        ARG(p) marks valueProg(p); an address containing ARG(p)
+        marks addrProg(p); a value of shape ADD(FIELD, ARG|ROOT(p))
+        records baseOff(p) = the FIELD offset. "Fixed" means
+        CONST provenance OR fixed-base provenance (see below).
+        Fixed-base tracking: real peripheral code (and the
+        synthetic corpus) reaches register addresses through
+        literal-pool loads, which Ghidra lifts as COPY from a ram
+        varnode (the pool slot) — provenance TOP, since the main
+        scan does not track memory. A register COPY'd from a ram
+        varnode is therefore tracked as fixed-base, and
+        ADD/SUB(fixed-base, CONST) stays fixed-base, mirroring
+        the provenance walk (uniques tracked within a group,
+        caller-saved cleared on CALL/CALLIND, LOAD clears). This
+        deliberately conflates pool-loaded peripheral bases with
+        pool-loaded global addresses (both are link-time
+        constants; the walk cannot tell a global from a register):
+        a helper storing an argument into a global also counts as
+        programming. That over-approx is bounded by the
+        caller-side unsound-only shape (a flag still needs it)
+        and measured by the regression (new flagged sites on real
+        targets would be the signal). NOT a fixpoint: values can
+        leak across branches, so the result is over-approximate
+        (adds candidates, never removes a true one). Returns an
+        empty program when the callee has no ops or no modelled
+        convention. */
+    private BoundsCalleeProg boundsCalleeProg(FuncRec calleeRec,
+        long[] calleeArgOffs) {
+        BoundsCalleeProg prog = new BoundsCalleeProg();
+        if (calleeRec == null || calleeRec.or == null ||
+            calleeRec.or.ops == null || calleeArgOffs == null ||
+            calleeArgOffs.length < 1) {
+            return prog;
+        }
+        List<OpRec> cops = calleeRec.or.ops;
+        Map<String, BExpr> working = new HashMap<String, BExpr>();
+        Map<String, Boolean> fixed = new HashMap<String, Boolean>();
+        for (int k = 0; k < calleeArgOffs.length; k++) {
+            working.put("register:" + calleeArgOffs[k],
+                BExpr.arg(k));
+        }
+        long[] saved = null;
+        try {
+            saved = isa.callerSavedRegisterOffsets();
+        } catch (Exception e) {
+            saved = null;
+        }
+        for (int i = 0; i < cops.size(); i++) {
+            OpRec op = cops.get(i);
+            boolean isStart = i == 0 ||
+                !op.instrAddr.equals(cops.get(i - 1).instrAddr);
+            if (isStart) {
+                java.util.Iterator<String> it =
+                    working.keySet().iterator();
+                while (it.hasNext()) {
+                    if (it.next().startsWith("unique:")) {
+                        it.remove();
+                    }
+                }
+                java.util.Iterator<String> fit =
+                    fixed.keySet().iterator();
+                while (fit.hasNext()) {
+                    if (fit.next().startsWith("unique:")) {
+                        fit.remove();
+                    }
+                }
+            }
+            if (op.mnem.equals("STORE") && op.ins.length >= 3) {
+                BExpr addr = boundsProvOf(op.ins[1], working);
+                BExpr val = boundsProvOf(op.ins[2], working);
+                boolean addrFixed = addr.kind.equals("CONST") ||
+                    Boolean.TRUE.equals(
+                        fixed.get(boundsVnKey(op.ins[1])));
+                for (int p = 0; p < calleeArgOffs.length; p++) {
+                    if (addrFixed &&
+                        boundsContainsArg(val, p)) {
+                        prog.valueProg.add(p);
+                        if (val.kind.equals("ADD")) {
+                            BExpr f = null;
+                            BExpr o = null;
+                            if (val.base.kind.equals("FIELD") &&
+                                (val.other.kind.equals("ARG") ||
+                                 val.other.kind.equals("ROOT")) &&
+                                val.other.argIdx == p) {
+                                f = val.base; o = val.other;
+                            } else if (val.other.kind.equals("FIELD") &&
+                                (val.base.kind.equals("ARG") ||
+                                 val.base.kind.equals("ROOT")) &&
+                                val.base.argIdx == p) {
+                                f = val.other; o = val.base;
+                            }
+                            if (f != null && o != null &&
+                                !prog.baseOff.containsKey(p)) {
+                                prog.baseOff.put(p, f.off);
+                            }
+                            // Address-derivation shape: the slot
+                            // is ADD-combined with a FIELD or
+                            // CONST base (bare stores do not
+                            // qualify — see addrForm).
+                            boolean argBase =
+                                (val.base.kind.equals("ARG") ||
+                                 val.base.kind.equals("ROOT")) &&
+                                val.base.argIdx == p;
+                            boolean argOther =
+                                (val.other.kind.equals("ARG") ||
+                                 val.other.kind.equals("ROOT")) &&
+                                val.other.argIdx == p;
+                            boolean baseFieldOrConst =
+                                val.base.kind.equals("FIELD") ||
+                                val.base.kind.equals("CONST");
+                            boolean otherFieldOrConst =
+                                val.other.kind.equals("FIELD") ||
+                                val.other.kind.equals("CONST");
+                            if ((argBase && otherFieldOrConst) ||
+                                (argOther && baseFieldOrConst)) {
+                                prog.addrForm.add(p);
+                            }
+                        }
+                    }
+                    if (boundsContainsArg(addr, p)) {
+                        prog.addrProg.add(p);
+                    }
+                }
+            }
+            // Fixed-base update for this op, from pre-op state
+            // (STORE ops have no out, so this is a no-op for
+            // them; evaluation above already used pre-op state).
+            if (op.out != null) {
+                String outKey = boundsVnKey(op.out);
+                boolean outFixed = false;
+                if (op.mnem.equals("COPY") && op.ins.length == 1) {
+                    try {
+                        String sp = op.ins[0].getAddress()
+                            .getAddressSpace().getName();
+                        if (sp.equals("ram")) {
+                            outFixed = true;
+                        } else {
+                            outFixed = Boolean.TRUE.equals(fixed.get(
+                                boundsVnKey(op.ins[0])));
+                        }
+                    } catch (Exception e) {
+                        outFixed = false;
+                    }
+                } else if ((op.mnem.equals("INT_ADD") ||
+                    op.mnem.equals("INT_SUB")) &&
+                    op.ins.length == 2) {
+                    BExpr p0 = boundsProvOf(op.ins[0], working);
+                    BExpr p1 = boundsProvOf(op.ins[1], working);
+                    boolean f0 = Boolean.TRUE.equals(fixed.get(
+                        boundsVnKey(op.ins[0])));
+                    boolean f1 = Boolean.TRUE.equals(fixed.get(
+                        boundsVnKey(op.ins[1])));
+                    outFixed = (f0 && p1.kind.equals("CONST")) ||
+                        (f1 && p0.kind.equals("CONST"));
+                }
+                if (outFixed) fixed.put(outKey, Boolean.TRUE);
+                else fixed.remove(outKey);
+            }
+            if ((op.mnem.equals("CALL") ||
+                op.mnem.equals("CALLIND")) && saved != null) {
+                for (long ro : saved) {
+                    String pfx = "register:" + ro + ":";
+                    java.util.Iterator<String> cit =
+                        fixed.keySet().iterator();
+                    while (cit.hasNext()) {
+                        if (cit.next().startsWith(pfx)) {
+                            cit.remove();
+                        }
+                    }
+                }
+            }
+            working = boundsTransfer(working, op, saved, false);
+        }
+        return prog;
+    }
+
+    /** Instruction-group maps from an op list + op successors
+        (bounds Phase 1 refactor of the inline construction in
+        boundsScan; identical semantics: group = one machine
+        instruction, successors mapped to groups). */
+    private BoundsGroups boundsGroupMaps(List<OpRec> ops,
+        List<List<Integer>> succ) {
+        BoundsGroups bg = new BoundsGroups();
+        int n = ops.size();
+        bg.opGroup = new int[n];
+        for (int i = 0; i < n; i++) {
+            boolean isStart = i == 0 ||
+                !ops.get(i).instrAddr.equals(
+                    ops.get(i - 1).instrAddr);
+            if (isStart) bg.grpStarts.add(i);
+            bg.opGroup[i] = bg.grpStarts.size() - 1;
+        }
+        for (int g = 0; g < bg.grpStarts.size(); g++) {
+            bg.addrToGroup.put(
+                ops.get(bg.grpStarts.get(g)).instrAddr.toString(),
+                g);
+        }
+        if (succ != null) {
+            bg.grpSucc = new ArrayList<List<Integer>>();
+            for (int g = 0; g < bg.grpStarts.size(); g++) {
+                bg.grpSucc.add(new ArrayList<Integer>());
+            }
+            for (int g = 0; g < bg.grpStarts.size(); g++) {
+                int gs = bg.grpStarts.get(g);
+                int ge = (g + 1 < bg.grpStarts.size()) ?
+                    bg.grpStarts.get(g + 1) : n;
+                java.util.Set<Integer> ss =
+                    new java.util.HashSet<Integer>();
+                for (int i = gs; i < ge; i++) {
+                    for (int s : succ.get(i)) {
+                        if (s >= 0 && s < n) ss.add(bg.opGroup[s]);
+                    }
+                }
+                bg.grpSucc.get(g).addAll(ss);
+            }
+        }
+        return bg;
+    }
+
+    /** Shared check/guard evaluation for one site (bounds Phase 1
+        refactor of the previously inline memcpy/cache block;
+        semantics verbatim: unsound = unsigned ADD(offset,X-known)
+        vs same-struct FIELD; guards in order signed, wide (ZEXT
+        only), guard-call, multi-word; multiword sizeOff -1 means
+        any size field, >= 0 requires the matched FIELD offset). */
+    private BoundsEval boundsEvalSite(List<BoundsCmp> cmps,
+        List<BoundsCall> calls, List<Integer> cbranchIdx,
+        Map<Long, Boolean> signedCheckByEntry, List<OpRec> ops,
+        int[] opGroup, List<Integer> grpStarts,
+        List<List<Integer>> grpSucc,
+        Map<String, Integer> addrToGroup, int callOpIdx,
+        int offIdx, BExpr structBase, int ptrSize) {
+        BoundsEval ev = new BoundsEval();
+        BExpr offRef = BExpr.arg(offIdx);
+        // structBase == null (cmdaddr sites: no pointer FIELD in
+        // the call) means ANY FIELD base qualifies for the unsound
+        // check; the matched FIELD's base then becomes the guard
+        // base below. Pointer sites always pass a non-null base,
+        // so their behaviour is unchanged.
+        for (BoundsCmp c : cmps) {
+            if (!c.isUnsigned()) continue;
+            BExpr fld = null;
+            BExpr otherSide = c.a.addOtherSide(offRef);
+            if (otherSide != null &&
+                !otherSide.kind.equals("TOP") &&
+                c.b.kind.equals("FIELD") &&
+                (structBase == null ||
+                 c.b.base.equals(structBase))) {
+                fld = c.b;
+            } else if ((otherSide =
+                c.b.addOtherSide(offRef)) != null &&
+                !otherSide.kind.equals("TOP") &&
+                c.a.kind.equals("FIELD") &&
+                (structBase == null ||
+                 c.a.base.equals(structBase))) {
+                fld = c.a;
+            }
+            if (fld != null) {
+                ev.unsound = true;
+                ev.sizeOff = fld.off;
+                ev.checkFieldBase = fld.base;
+                break;
+            }
+        }
+        BExpr guardBase =
+            structBase != null ? structBase : ev.checkFieldBase;
+        String guard = "none";
+        for (BoundsCmp c : cmps) {
+            if (!c.isSigned()) continue;
+            if ((boundsIsOffset(c.a, offIdx) &&
+                c.b.kind.equals("CONST") &&
+                c.b.constVal == 0) ||
+                (boundsIsOffset(c.b, offIdx) &&
+                    c.a.kind.equals("CONST") &&
+                    c.a.constVal == 0)) {
+                guard = "signed-check";
+                break;
+            }
+        }
+        if (guard.equals("none")) {
+            for (BoundsCmp c : cmps) {
+                if (!c.isUnsigned()) continue;
+                boolean wide = false;
+                if (c.a.containsWideExt(offRef, ptrSize) &&
+                    c.b.kind.equals("FIELD") &&
+                    c.b.base.equals(guardBase)) {
+                    wide = true;
+                } else if (c.b.containsWideExt(offRef,
+                    ptrSize) && c.a.kind.equals("FIELD") &&
+                    c.a.base.equals(guardBase)) {
+                    wide = true;
+                }
+                if (wide) {
+                    guard = "wide-check";
+                    break;
+                }
+            }
+        }
+        if (guard.equals("none") &&
+            signedCheckByEntry != null) {
+            for (BoundsCall gc : calls) {
+                Boolean sc =
+                    signedCheckByEntry.get(gc.entry);
+                if (sc == null || !sc) continue;
+                for (int cb : cbranchIdx) {
+                    if (cb > gc.idx && cb < callOpIdx) {
+                        guard = "guard-call";
+                        break;
+                    }
+                }
+                if (!guard.equals("none")) break;
+            }
+        }
+        if (guard.equals("none") &&
+            signedCheckByEntry != null) {
+            String mw = boundsMultiwordGuard(cmps,
+                ops, opGroup, grpStarts, grpSucc,
+                addrToGroup, opGroup[callOpIdx], offIdx,
+                guardBase, -1);
+            if (mw != null) guard = mw;
+        }
+        ev.guard = guard;
+        return ev;
+    }
+
+    /** One call edge's validation of one callee site (bounds
+        Phase 1, item 3): the value passed in the site's offset
+        slot must be the caller's own argument m (value flow),
+        and the caller must hold a sound guard for m — signed
+        (struct-independent), or wide-EXT / multi-word against
+        the same size field (sizeOff) and the same struct value
+        (mapped = the value passed in the site's struct slot).
+        Wide/multi-word are skipped when the size is unknown or
+        the struct base is not a plain ARG slot (signed still
+        applies). Returns true iff this edge validates. */
+    private boolean boundsEdgeValidates(BoundsCallEdge ed,
+        BoundsValid fv, int offIdx, long sizeOff,
+        BExpr structBase) {
+        if (ed == null || fv == null || ed.slotProv == null) {
+            return false;
+        }
+        if (offIdx < 0 || offIdx >= ed.slotProv.length) {
+            return false;
+        }
+        BExpr passed = ed.slotProv[offIdx];
+        if (passed == null) return false;
+        int m = -1;
+        if (passed.kind.equals("ARG") || passed.kind.equals("ROOT")) {
+            m = passed.argIdx;
+        } else {
+            return false;
+        }
+        if (fv.signedArgs.contains(m)) return true;
+        if (sizeOff < 0 || fv.cmps == null) return false;
+        BExpr mapped = null;
+        if (structBase != null && structBase.kind.equals("ARG")) {
+            int s = structBase.argIdx;
+            if (s >= 0 && s < ed.slotProv.length) {
+                mapped = ed.slotProv[s];
+            }
+        }
+        if (mapped == null || mapped.kind.equals("TOP")) {
+            return false;
+        }
+        BExpr offRef = BExpr.arg(m);
+        for (BoundsCmp c : fv.cmps) {
+            if (!c.isUnsigned()) continue;
+            boolean wide = false;
+            if (c.a.containsWideExt(offRef, fv.ptrSize) &&
+                c.b.kind.equals("FIELD") && c.b.off == sizeOff &&
+                c.b.base.equals(mapped)) {
+                wide = true;
+            } else if (c.b.containsWideExt(offRef, fv.ptrSize) &&
+                c.a.kind.equals("FIELD") && c.a.off == sizeOff &&
+                c.a.base.equals(mapped)) {
+                wide = true;
+            }
+            if (wide) return true;
+        }
+        if (fv.ops == null || fv.branchTargets == null) {
+            return false;
+        }
+        try {
+            List<List<Integer>> succ =
+                buildSucc(fv.ops, fv.branchTargets);
+            BoundsGroups bg = boundsGroupMaps(fv.ops, succ);
+            if (bg.grpSucc == null ||
+                ed.idx < 0 || ed.idx >= fv.ops.size()) {
+                return false;
+            }
+            String mw = boundsMultiwordGuard(fv.cmps, fv.ops,
+                bg.opGroup, bg.grpStarts, bg.grpSucc,
+                bg.addrToGroup, bg.opGroup[ed.idx], m, mapped,
+                sizeOff);
+            if (mw != null) return true;
+        } catch (Exception e) {
+            return false;
+        }
+        return false;
+    }
+
+    /** Caller validation for one callee site (bounds Phase 1,
+        item 3): returns "caller-check" iff the callee has at
+        least one known caller and EVERY known caller validates
+        the site on EVERY direct edge to the callee. Known
+        callers = union of Ghidra's calling-functions (callerSets)
+        and the pre-pass direct edges; a caller with no record,
+        no edge, or any non-validating edge blocks suppression
+        (fail-closed). A sentinel entry (Long.MIN_VALUE) in
+        callerSets marks an unmappable caller and always blocks.
+        Null maps (pre-pass) mean no suppression. */
+    private String boundsCallerGuard(long selfEntry, int offIdx,
+        long sizeOff, BExpr structBase,
+        Map<Long, BoundsValid> validByEntry,
+        Map<Long, Set<Long>> callerSets) {
+        if (validByEntry == null || callerSets == null) {
+            return null;
+        }
+        Set<Long> known = callerSets.get(selfEntry);
+        if (known == null) {
+            try {
+                known = callerSets.get(
+                    isa.stripInstructionTag(selfEntry));
+            } catch (Exception e) {
+                known = null;
+            }
+        }
+        Map<Long, List<BoundsCallEdge>> direct =
+            new HashMap<Long, List<BoundsCallEdge>>();
+        for (Map.Entry<Long, BoundsValid> e :
+            validByEntry.entrySet()) {
+            if (e.getValue() == null ||
+                e.getValue().edges == null) continue;
+            for (BoundsCallEdge ed : e.getValue().edges) {
+                boolean match = ed.entry == selfEntry;
+                if (!match) {
+                    try {
+                        match = isa.stripInstructionTag(ed.entry) ==
+                            isa.stripInstructionTag(selfEntry);
+                    } catch (Exception ex) {
+                        match = false;
+                    }
+                }
+                if (!match) continue;
+                List<BoundsCallEdge> l = direct.get(e.getKey());
+                if (l == null) {
+                    l = new ArrayList<BoundsCallEdge>();
+                    direct.put(e.getKey(), l);
+                }
+                l.add(ed);
+            }
+        }
+        java.util.Set<Long> must = new java.util.HashSet<Long>();
+        if (known != null) must.addAll(known);
+        must.addAll(direct.keySet());
+        if (must.isEmpty()) return null;
+        for (Long ce : must) {
+            BoundsValid fv = validByEntry.get(ce);
+            if (fv == null) return null;
+            List<BoundsCallEdge> eds = direct.get(ce);
+            if (eds == null || eds.isEmpty()) return null;
+            for (BoundsCallEdge ed : eds) {
+                if (!boundsEdgeValidates(ed, fv, offIdx, sizeOff,
+                    structBase)) return null;
+            }
+        }
+        return "caller-check";
+    }
+
+    /** Site JSON builder (bounds Phase 1 refactor; byte-identical
+        format to the previously inline builder). baseOffNull
+        means base_field renders as JSON null (cmdaddr sites with
+        no recovered base field). */
+    private String boundsSiteJson(String func, String addrHex,
+        String kind, String role, int offIdx, Long baseOff,
+        long sizeOff, boolean unsound, String guard,
+        boolean flagged) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"func\": \"");
+        sb.append(esc(func));
+        sb.append("\", \"instr\": \"").append(addrHex);
+        sb.append("\", \"kind\": \"").append(kind).append("\"");
+        sb.append(", \"role\": \"").append(role).append("\"");
+        sb.append(", \"offset_arg\": ").append(offIdx);
+        sb.append(", \"base_field\": ");
+        if (baseOff == null) sb.append("null");
+        else sb.append(baseOff.longValue());
+        sb.append(", \"size_field\": ");
+        if (sizeOff >= 0) sb.append(sizeOff);
+        else sb.append("null");
+        sb.append(", \"unsound_check\": ").append(unsound);
+        sb.append(", \"sound_guard\": \"").append(guard).append("\"");
+        sb.append(", \"flagged\": ").append(flagged);
+        sb.append("}");
+        return sb.toString();
     }
 
     /** Varnode identity key for matcher bookkeeping
@@ -8607,7 +9276,8 @@ public class ExtractIR extends GhidraScript {
     private String boundsMultiwordGuard(List<BoundsCmp> cmps,
         List<OpRec> ops, int[] opGroup, List<Integer> grpStarts,
         List<List<Integer>> grpSucc, Map<String, Integer> addrToGroup,
-        int callGroup, int offIdx, BExpr structBase) {
+        int callGroup, int offIdx, BExpr structBase,
+        long sizeOff) {
         if (grpSucc == null) return null;
         BExpr offRef = BExpr.arg(offIdx);
         int nGroups = grpStarts.size();
@@ -8630,6 +9300,11 @@ public class ExtractIR extends GhidraScript {
                 fld = c.a;
             }
             if (fld == null) continue;
+            // Caller-side size agreement (bounds Phase 1, item 3):
+            // when sizeOff >= 0 the matched low compare must be
+            // against that size field; -1 (site-guard calls)
+            // preserves the old any-field behaviour.
+            if (sizeOff >= 0 && fld.off != sizeOff) continue;
             int g0 = opGroup[c.idx];
             int g1 = g0 + 1;
             int g2 = g0 + 2;
@@ -8993,7 +9668,9 @@ public class ExtractIR extends GhidraScript {
     private BoundsScan boundsScan(Function callerFn, List<OpRec> ops,
         Map<Integer, List<Integer>> branchTargets, long[] argOffs,
         Map<Long, FuncRec> funcByEntry,
-        Map<Long, Boolean> signedCheckByEntry) {
+        Map<Long, Boolean> signedCheckByEntry,
+        long selfEntry, Map<Long, BoundsValid> validByEntry,
+        Map<Long, Set<Long>> callerSets) {
         BoundsScan res = new BoundsScan();
         if (argOffs == null || argOffs.length < 3) return res;
         int n = ops.size();
@@ -9175,45 +9852,26 @@ public class ExtractIR extends GhidraScript {
         } catch (Exception e) {
             ptrSize = 4;
         }
+        res.ptrSize = ptrSize;
         // Instruction-group maps for the multi-word guard check
         // (bounds v3): op index -> group index, group start op
         // indices, group-level successors from buildSucc, and
         // group-start address -> group index. If buildSucc failed
         // (succ == null), grpSucc stays null and the multi-word
         // guard is disabled (miss direction).
-        int[] opGroup = new int[n];
-        List<Integer> grpStarts = new ArrayList<Integer>();
-        for (int i = 0; i < n; i++) {
-            if (isInstrStart[i]) grpStarts.add(i);
-            opGroup[i] = grpStarts.size() - 1;
-        }
-        Map<String, Integer> addrToGroup = new HashMap<String, Integer>();
-        for (int g = 0; g < grpStarts.size(); g++) {
-            addrToGroup.put(
-                ops.get(grpStarts.get(g)).instrAddr.toString(), g);
-        }
-        List<List<Integer>> grpSucc = null;
-        if (succ != null) {
-            grpSucc = new ArrayList<List<Integer>>();
-            for (int g = 0; g < grpStarts.size(); g++) {
-                grpSucc.add(new ArrayList<Integer>());
-            }
-            for (int g = 0; g < grpStarts.size(); g++) {
-                int gs = grpStarts.get(g);
-                int ge = (g + 1 < grpStarts.size()) ?
-                    grpStarts.get(g + 1) : n;
-                java.util.Set<Integer> ss =
-                    new java.util.HashSet<Integer>();
-                for (int i = gs; i < ge; i++) {
-                    for (int s : succ.get(i)) {
-                        if (s >= 0 && s < n) ss.add(opGroup[s]);
-                    }
-                }
-                grpSucc.get(g).addAll(ss);
-            }
-        }
+        // (bounds Phase 1 refactor: group maps via the shared
+        // helper; identical semantics to the old inline block.)
+        BoundsGroups bg = boundsGroupMaps(ops, succ);
+        int[] opGroup = bg.opGroup;
+        List<Integer> grpStarts = bg.grpStarts;
+        Map<String, Integer> addrToGroup = bg.addrToGroup;
+        List<List<Integer>> grpSucc = bg.grpSucc;
         List<BoundsCall> calls = new ArrayList<BoundsCall>();
         List<Integer> cbranchIdx = new ArrayList<Integer>();
+        // Bounds Phase 1, items 1-2: per-callee programming
+        // evidence, computed lazily once per callee per scan.
+        Map<Long, BoundsCalleeProg> progCache =
+            new HashMap<Long, BoundsCalleeProg>();
         // Phase 2 walks instruction by instruction: the working map
         // starts from the first op's IN state with uniques stripped,
         // then advances op by op within the instruction, so a
@@ -9251,6 +9909,54 @@ public class ExtractIR extends GhidraScript {
                         a.constVal == 0))) {
                     res.hasSignedArgCheck = true;
                 }
+                // Bounds Phase 1, item 3: signed-checked argument
+                // indices for caller validation (ARG or ROOT vs
+                // CONST 0; a superset of the hasSignedArgCheck
+                // bit, which stays ARG-only for guard-call use).
+                if (mnem.equals("INT_SLESS") ||
+                    mnem.equals("INT_SLESSEQUAL")) {
+                    if ((a.kind.equals("ARG") ||
+                        a.kind.equals("ROOT")) &&
+                        b.kind.equals("CONST") &&
+                        b.constVal == 0) {
+                        res.signedArgs.add(a.argIdx);
+                    } else if ((b.kind.equals("ARG") ||
+                        b.kind.equals("ROOT")) &&
+                        a.kind.equals("CONST") &&
+                        a.constVal == 0) {
+                        res.signedArgs.add(b.argIdx);
+                    }
+                }
+            }
+            // Bounds Phase 1, cmdaddr pointer-use gate: a slot
+            // used as a load/store address base in this function
+            // is a POINTER, not an offset integer. Recorded for
+            // every LOAD/STORE (pre-op provenance), regardless
+            // of convergence, like cmps above: the pre-pass
+            // record must cover the whole function, since a
+            // dereference after the call still proves
+            // pointer-ness. Only BASE positions count (see
+            // boundsBaseSlots).
+            if ((mnem.equals("LOAD") || mnem.equals("STORE")) &&
+                op.ins.length >= 2) {
+                BExpr ad = boundsProvOf(op.ins[1], prov);
+                java.util.Set<String> bs =
+                    new java.util.HashSet<String>();
+                boundsBaseSlots(ad, bs);
+                for (String s : bs) {
+                    try {
+                        int ci = s.indexOf(':');
+                        int si = Integer.parseInt(
+                            s.substring(ci + 1));
+                        if (s.startsWith("ARG")) {
+                            res.derefArgs.add(si);
+                        } else {
+                            res.derefRoots.add(si);
+                        }
+                    } catch (Exception e) {
+                        // Ignore malformed slot keys.
+                    }
+                }
             }
             if (converged) {
             if (mnem.equals("CALL") || mnem.equals("BRANCH")) {
@@ -9274,6 +9980,24 @@ public class ExtractIR extends GhidraScript {
                     } catch (Exception e) {
                         callee = null;
                     }
+                }
+                // Bounds Phase 1, item 3: record every resolved
+                // direct call edge (transfer or not) with the
+                // per-slot passed provenance at the call.
+                if (callee != null) {
+                    BExpr[] slots = new BExpr[argOffs.length];
+                    for (int k = 0; k < argOffs.length; k++) {
+                        slots[k] = boundsProvOf(
+                            regVarnode(argOffs[k], 4), prov);
+                    }
+                    long ent;
+                    try {
+                        ent = callee.entryKey;
+                    } catch (Exception e) {
+                        ent = -1;
+                    }
+                    res.edges.add(new BoundsCallEdge(i, ent,
+                        slots));
                 }
                 if (calleeName != null &&
                     isBoundsTransferCall(calleeName)) {
@@ -9320,107 +10044,33 @@ public class ExtractIR extends GhidraScript {
                         }
                     }
                     if (role != null) {
+                        // (bounds Phase 1 refactor: evaluation via
+                        // the shared helper; semantics verbatim.)
                         // Matching reference: the original argument
                         // (a ROOT offset was ARG at function entry,
                         // so entry checks/guards match against ARG).
                         int offIdx = offArg.argIdx;
-                        BExpr offRef = BExpr.arg(offIdx);
-                        // Unsound check: unsigned comparison of
-                        // ADD(offArg, X) vs FIELD(structBase, _).
-                        boolean unsound = false;
-                        long sizeOff = -1;
-                        for (BoundsCmp c : res.cmps) {
-                            if (!c.isUnsigned()) continue;
-                            BExpr fld = null;
-                            // The check's non-offset side must be
-                            // known (v1 semantics preserved): an
-                            // ADD(ARG, TOP) sum is not an unsound
-                            // check, only a sum with a known side.
-                            BExpr otherSide = c.a.addOtherSide(offRef);
-                            if (otherSide != null &&
-                                !otherSide.kind.equals("TOP") &&
-                                c.b.kind.equals("FIELD") &&
-                                c.b.base.equals(structBase)) {
-                                fld = c.b;
-                            } else if ((otherSide =
-                                c.b.addOtherSide(offRef)) != null &&
-                                !otherSide.kind.equals("TOP") &&
-                                c.a.kind.equals("FIELD") &&
-                                c.a.base.equals(structBase)) {
-                                fld = c.a;
-                            }
-                            if (fld != null) {
-                                unsound = true;
-                                sizeOff = fld.off;
-                                break;
-                            }
-                        }
-                        // Sound guards (any one suppresses).
-                        // Signed checks match the entry argument
-                        // or its loop-carried rooted form.
-                        String guard = "none";
-                        for (BoundsCmp c : res.cmps) {
-                            if (!c.isSigned()) continue;
-                            if ((boundsIsOffset(c.a, offIdx) &&
-                                c.b.kind.equals("CONST") &&
-                                c.b.constVal == 0) ||
-                                (boundsIsOffset(c.b, offIdx) &&
-                                    c.a.kind.equals("CONST") &&
-                                    c.a.constVal == 0)) {
-                                guard = "signed-check";
-                                break;
-                            }
-                        }
-                        if (guard.equals("none")) {
-                            for (BoundsCmp c : res.cmps) {
-                                if (!c.isUnsigned()) continue;
-                                boolean wide = false;
-                                if (c.a.containsWideExt(offRef, ptrSize) &&
-                                    c.b.kind.equals("FIELD") &&
-                                    c.b.base.equals(structBase)) {
-                                    wide = true;
-                                } else if (c.b.containsWideExt(offRef,
-                                    ptrSize) &&
-                                    c.a.kind.equals("FIELD") &&
-                                    c.a.base.equals(structBase)) {
-                                    wide = true;
-                                }
-                                if (wide) {
-                                    guard = "wide-check";
-                                    break;
-                                }
-                            }
-                        }
-                        if (guard.equals("none") &&
-                            signedCheckByEntry != null) {
-                            for (BoundsCall gc : calls) {
-                                Boolean sc =
-                                    signedCheckByEntry.get(gc.entry);
-                                if (sc == null || !sc) continue;
-                                for (int cb : cbranchIdx) {
-                                    if (cb > gc.idx && cb < i) {
-                                        guard = "guard-call";
-                                        break;
-                                    }
-                                }
-                                if (!guard.equals("none")) break;
-                            }
-                        }
-                        // Multi-word compare guard (bounds v3):
-                        // last, so existing guard behaviour is
-                        // preserved exactly when an earlier guard
-                        // fires; skipped in the pre-pass (which
-                        // ignores sites) via the null check.
-                        if (guard.equals("none") &&
-                            signedCheckByEntry != null) {
-                            String mw = boundsMultiwordGuard(res.cmps,
-                                ops, opGroup, grpStarts, grpSucc,
-                                addrToGroup, opGroup[i], offIdx,
-                                structBase);
-                            if (mw != null) guard = mw;
-                        }
+                        BoundsEval ev = boundsEvalSite(res.cmps,
+                            calls, cbranchIdx, signedCheckByEntry,
+                            ops, opGroup, grpStarts, grpSucc,
+                            addrToGroup, i, offIdx, structBase,
+                            ptrSize);
+                        boolean unsound = ev.unsound;
+                        long sizeOff = ev.sizeOff;
+                        String guard = ev.guard;
                         boolean flagged = unsound &&
                             guard.equals("none");
+                        // Bounds Phase 1, item 3: inter-procedural
+                        // caller validation may suppress a flag.
+                        if (flagged) {
+                            String cg = boundsCallerGuard(selfEntry,
+                                offIdx, sizeOff, ev.checkFieldBase,
+                                validByEntry, callerSets);
+                            if (cg != null) {
+                                guard = cg;
+                                flagged = false;
+                            }
+                        }
                         String addrHex;
                         try {
                             addrHex = "0x" + Long.toHexString(
@@ -9428,33 +10078,19 @@ public class ExtractIR extends GhidraScript {
                         } catch (Exception e) {
                             addrHex = "0x0";
                         }
-                        StringBuilder sb = new StringBuilder();
-                        sb.append("{\"func\": \"");
                         // The site lives in the CALLER function.
+                        String funcName;
                         try {
-                            sb.append(esc(callerFn.getName()));
+                            funcName = callerFn.getName();
                         } catch (Exception e) {
-                            sb.append("?");
+                            funcName = "?";
                         }
-                        sb.append("\", \"instr\": \"").append(addrHex);
-                        sb.append("\", \"kind\": \"")
-                            .append(calleeName).append("\"");
-                        sb.append(", \"role\": \"").append(role)
-                            .append("\"");
-                        sb.append(", \"offset_arg\": ")
-                            .append(offArg.argIdx);
-                        sb.append(", \"base_field\": ").append(baseOff);
-                        sb.append(", \"size_field\": ");
-                        if (sizeOff >= 0) sb.append(sizeOff);
-                        else sb.append("null");
-                        sb.append(", \"unsound_check\": ")
-                            .append(unsound);
-                        sb.append(", \"sound_guard\": \"").append(guard)
-                            .append("\"");
-                        sb.append(", \"flagged\": ").append(flagged);
-                        sb.append("}");
                         res.sites.add(new BoundsSiteRec(
-                            sb.toString(), flagged));
+                            boundsSiteJson(funcName, addrHex,
+                                calleeName, role, offArg.argIdx,
+                                baseOff, sizeOff, unsound, guard,
+                                flagged),
+                            flagged));
                     }
                     // Transfer-call form census (v3.16): every
                     // transfer call's pointer args, matched or not.
@@ -9473,6 +10109,225 @@ public class ExtractIR extends GhidraScript {
                                 prev == null ? 1 : prev + 1);
                         }
                         res.transferCalls++;
+                    }
+                } else if (signedCheckByEntry != null &&
+                    callee != null) {
+                    // Bounds Phase 1, items 1-2: DMA / cmdaddr
+                    // sites on direct calls to non-transfer
+                    // callees. Skipped in the pre-pass (null
+                    // signedCheckByEntry), like the multi-word
+                    // guard. Precedence: known-transfer calls
+                    // above; a call matching neither form below
+                    // is not a site. A call matching both forms
+                    // on different slots emits both sites (one
+                    // transfer call in the census).
+                    BoundsCalleeProg prog = null;
+                    try {
+                        prog = progCache.get(callee.entryKey);
+                    } catch (Exception e) {
+                        prog = null;
+                    }
+                    if (prog == null) {
+                        long[] caOffs = null;
+                        try {
+                            caOffs = boundsArgOffsets(callee);
+                        } catch (Exception e) {
+                            caOffs = null;
+                        }
+                        prog = boundsCalleeProg(callee, caOffs);
+                        try {
+                            progCache.put(callee.entryKey, prog);
+                        } catch (Exception e) {
+                            // Uncached; recomputed per site.
+                        }
+                    }
+                    boolean countedCall = false;
+                    String addrHex2;
+                    try {
+                        addrHex2 = "0x" + Long.toHexString(
+                            op.instrAddr.getOffset());
+                    } catch (Exception e) {
+                        addrHex2 = "0x0";
+                    }
+                    String funcName2;
+                    try {
+                        funcName2 = callerFn.getName();
+                    } catch (Exception e) {
+                        funcName2 = "?";
+                    }
+                    // DMA: some slot holds ADD(FIELD, ARG|ROOT)
+                    // and the callee programs that slot's value
+                    // to a constant address.
+                    for (int p = 0; p < argOffs.length; p++) {
+                        BExpr pv = boundsProvOf(
+                            regVarnode(argOffs[p], 4), prov);
+                        if (!pv.kind.equals("ADD")) continue;
+                        BExpr f = null;
+                        BExpr o = null;
+                        if (pv.base.kind.equals("FIELD") &&
+                            (pv.other.kind.equals("ARG") ||
+                             pv.other.kind.equals("ROOT"))) {
+                            f = pv.base; o = pv.other;
+                        } else if (pv.other.kind.equals("FIELD") &&
+                            (pv.base.kind.equals("ARG") ||
+                             pv.base.kind.equals("ROOT"))) {
+                            f = pv.other; o = pv.base;
+                        }
+                        if (f == null) continue;
+                        if (!prog.valueProg.contains(p)) continue;
+                        int offIdx = o.argIdx;
+                        BoundsEval ev = boundsEvalSite(res.cmps,
+                            calls, cbranchIdx, signedCheckByEntry,
+                            ops, opGroup, grpStarts, grpSucc,
+                            addrToGroup, i, offIdx, f.base,
+                            ptrSize);
+                        String guard = ev.guard;
+                        boolean flagged = ev.unsound &&
+                            guard.equals("none");
+                        if (flagged) {
+                            String cg = boundsCallerGuard(selfEntry,
+                                offIdx, ev.sizeOff,
+                                ev.checkFieldBase, validByEntry,
+                                callerSets);
+                            if (cg != null) {
+                                guard = cg;
+                                flagged = false;
+                            }
+                        }
+                        res.sites.add(new BoundsSiteRec(
+                            boundsSiteJson(funcName2, addrHex2,
+                                calleeName, "dma", offIdx, f.off,
+                                ev.sizeOff, ev.unsound, guard,
+                                flagged),
+                            flagged));
+                        Integer prev =
+                            res.formCounts.get("dma:site");
+                        res.formCounts.put("dma:site",
+                            prev == null ? 1 : prev + 1);
+                        if (!countedCall) {
+                            res.transferCalls++;
+                            countedCall = true;
+                        }
+                    }
+                    // Cmdaddr: some slot holds a bare ARG|ROOT
+                    // and the callee programs that slot as an
+                    // ADDRESS component — either used as a store
+                    // address (addrProg), or ADD-combined with a
+                    // FIELD/CONST base into a fixed address
+                    // (addrForm). A bare store of the slot into
+                    // a fixed address does NOT qualify: that is
+                    // a length/config value, not an address (the
+                    // DMA-length false flags proved this).
+                    // The struct base for guard matching is the
+                    // unsound check's FIELD base (boundsEvalSite
+                    // with a null base accepts any FIELD and
+                    // returns it).
+                    for (int p = 0; p < argOffs.length; p++) {
+                        BExpr pv = boundsProvOf(
+                            regVarnode(argOffs[p], 4), prov);
+                        if (!pv.kind.equals("ARG") &&
+                            !pv.kind.equals("ROOT")) continue;
+                        // Bounds Phase 1, cmdaddr pointer-use
+                        // gate: if this caller dereferences the
+                        // passed slot (load/store address base),
+                        // the slot is a POINTER, not an offset
+                        // integer — the Zephyr sys_dlist_remove
+                        // false flag (pointer passed, address-vs-
+                        // head comparison mistaken for a bounds
+                        // check). Fail-closed when the caller's
+                        // pre-pass record is missing.
+                        BoundsValid cv = null;
+                        if (validByEntry != null) {
+                            try {
+                                cv = validByEntry.get(selfEntry);
+                            } catch (Exception ex) {
+                                cv = null;
+                            }
+                        }
+                        boolean ptrLike = true;
+                        if (cv != null) {
+                            if (pv.kind.equals("ARG")) {
+                                ptrLike = cv.derefArgs.contains(
+                                    pv.argIdx);
+                            } else {
+                                ptrLike = cv.derefRoots.contains(
+                                    pv.argIdx);
+                            }
+                        }
+                        if (ptrLike) continue;
+                        if (!prog.addrForm.contains(p) &&
+                            !prog.addrProg.contains(p)) continue;
+                        int offIdx = pv.argIdx;
+                        BoundsEval ev = boundsEvalSite(res.cmps,
+                            calls, cbranchIdx, signedCheckByEntry,
+                            ops, opGroup, grpStarts, grpSucc,
+                            addrToGroup, i, offIdx, null,
+                            ptrSize);
+                        String guard = ev.guard;
+                        boolean flagged = ev.unsound &&
+                            guard.equals("none");
+                        if (flagged) {
+                            String cg = boundsCallerGuard(selfEntry,
+                                offIdx, ev.sizeOff,
+                                ev.checkFieldBase, validByEntry,
+                                callerSets);
+                            if (cg != null) {
+                                guard = cg;
+                                flagged = false;
+                            }
+                        }
+                        // Bounds Phase 1 emission rule (cmdaddr
+                        // only): a bare integer carries no offset
+                        // evidence by itself — unlike the pointer
+                        // shape, which proves offset-ness — so a
+                        // cmdaddr site is emitted ONLY when the
+                        // caller has the unsound check for this
+                        // arg: the unsigned ADD(arg, X) vs FIELD
+                        // comparison is what identifies the bare
+                        // arg AS a bounded offset. Without this
+                        // gate, every pointer-storing helper call
+                        // (list removal, memset, ...) emits a
+                        // noise site (47 such sites on the CVE
+                        // firmware, all unsound=False); a
+                        // guard-only gate still admits one
+                        // (gmtime_r -> memset, via a coincidental
+                        // guard-call). A guarded cmdaddr call
+                        // with no unsound check at all is
+                        // therefore not emitted (miss direction
+                        // for that shape, not a flag). DMA sites
+                        // keep unconditional emission: their
+                        // pointer shape is self-identifying.
+                        if (ev.unsound) {
+                            Long bf = prog.baseOff.get(p);
+                            res.sites.add(new BoundsSiteRec(
+                                boundsSiteJson(funcName2, addrHex2,
+                                    calleeName, "cmdaddr", offIdx, bf,
+                                    ev.sizeOff, ev.unsound, guard,
+                                    flagged),
+                                flagged));
+                            Integer prev = res.formCounts.get(
+                                "cmdaddr:site");
+                            res.formCounts.put("cmdaddr:site",
+                                prev == null ? 1 : prev + 1);
+                            if (!countedCall) {
+                                res.transferCalls++;
+                                countedCall = true;
+                            }
+                        }
+                    }
+                    // Preserve the old guard-call recording:
+                    // non-transfer CALLs (not tail BRANCHes) are
+                    // guard-call candidates for LATER transfers.
+                    // Added AFTER site evaluation so the current
+                    // call is never its own guard candidate.
+                    if (mnem.equals("CALL")) {
+                        long ent;
+                        try {
+                            ent = callee.entryKey;
+                        } catch (Exception e) {
+                            ent = -1;
+                        }
+                        calls.add(new BoundsCall(i, ent));
                     }
                 } else if (mnem.equals("CALL") && callee != null) {
                     long ent;
@@ -9662,7 +10517,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.17\",");
+        w.println("  \"extractor_version\": \"v3.18\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -11269,7 +12124,22 @@ public class ExtractIR extends GhidraScript {
         // report.
         Map<Long, Boolean> signedCheckByEntry =
             new HashMap<Long, Boolean>();
+        // Bounds Phase 1, item 3: per-function caller-validation
+        // records (built from the same pre-pass scans) and the
+        // Ghidra-known caller sets. A caller set that cannot be
+        // built, or that names a function with no FuncRec, gets
+        // the Long.MIN_VALUE sentinel, which always blocks
+        // suppression (fail-closed).
+        Map<Long, BoundsValid> validByEntry =
+            new HashMap<Long, BoundsValid>();
+        Map<Long, Set<Long>> callerSets =
+            new HashMap<Long, Set<Long>>();
         try {
+            Map<Function, Long> funcToEntry =
+                new HashMap<Function, Long>();
+            for (FuncRec gr : funcRecs) {
+                funcToEntry.put(gr.f, gr.entryKey);
+            }
             for (FuncRec gr : funcRecs) {
                 try {
                     long[] goffs = boundsArgOffsets(gr);
@@ -11278,16 +12148,47 @@ public class ExtractIR extends GhidraScript {
                         continue;
                     }
                     BoundsScan gs = boundsScan(gr.f, gr.or.ops,
-                        gr.branchTargets, goffs, funcByEntry, null);
+                        gr.branchTargets, goffs, funcByEntry, null,
+                        gr.entryKey, null, null);
                     signedCheckByEntry.put(gr.entryKey,
                         gs.hasSignedArgCheck);
+                    BoundsValid bv = new BoundsValid();
+                    bv.signedArgs.addAll(gs.signedArgs);
+                    bv.derefArgs.addAll(gs.derefArgs);
+                    bv.derefRoots.addAll(gs.derefRoots);
+                    bv.cmps = gs.cmps;
+                    bv.ops = gr.or.ops;
+                    bv.branchTargets = gr.branchTargets;
+                    bv.edges = gs.edges;
+                    bv.ptrSize = gs.ptrSize;
+                    validByEntry.put(gr.entryKey, bv);
                 } catch (Exception e) {
                     // Unknown for this function; guard-call lookup
-                    // treats a missing entry as "not a guard".
+                    // treats a missing entry as "not a guard", and
+                    // caller validation treats it as unvalidated.
                 }
             }
+            for (FuncRec gr : funcRecs) {
+                Set<Long> cs = new HashSet<Long>();
+                try {
+                    Set<Function> callers =
+                        gr.f.getCallingFunctions(monitor);
+                    for (Function cf : callers) {
+                        Long ce = funcToEntry.get(cf);
+                        if (ce == null) {
+                            cs.add(Long.MIN_VALUE);
+                        } else {
+                            cs.add(ce);
+                        }
+                    }
+                } catch (Exception e) {
+                    cs.add(Long.MIN_VALUE);
+                }
+                callerSets.put(gr.entryKey, cs);
+            }
         } catch (Exception e) {
-            // Map stays partial; guard-call lookup tolerates it.
+            // Maps stay partial; guard-call lookup tolerates it,
+            // and caller validation fails closed on missing data.
         }
         for (FuncRec rec : funcRecs) {
             Function f = rec.f;
@@ -11345,7 +12246,8 @@ public class ExtractIR extends GhidraScript {
                 long[] boffs = boundsArgOffsets(rec);
                 if (boffs != null && boffs.length >= 3) {
                     BoundsScan bs = boundsScan(f, ops, rec.branchTargets,
-                        boffs, funcByEntry, signedCheckByEntry);
+                        boffs, funcByEntry, signedCheckByEntry,
+                        rec.entryKey, validByEntry, callerSets);
                     copySites = bs.sites;
                     for (BoundsSiteRec sr : copySites) {
                         if (sr.flagged) copyFlagged++;
@@ -12107,8 +13009,11 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"transfer_call_forms\": {");
         w.println("    \"total_transfer_calls\": " + totalTransferCalls + ",");
         {
+            // Bounds Phase 1: "dma"/"cmdaddr" buckets count matched
+            // sites only (no bounded callee set to census); the
+            // other forms stay 0, explicit.
             String[] formKinds = new String[] { "memcpy", "memmove",
-                "cache" };
+                "cache", "dma", "cmdaddr" };
             String[] forms = new String[] { "site", "plain_arg",
                 "field_only", "const", "top", "other" };
             for (int ki = 0; ki < formKinds.length; ki++) {

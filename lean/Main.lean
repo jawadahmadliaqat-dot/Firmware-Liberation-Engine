@@ -72,7 +72,8 @@ def printGeneric (lang : Option String) (windows : List (Nat × Nat)) (trace : L
   let boundsVios := boundsViolations sites
   if !boundsVios.isEmpty then
     let names := boundsVios.map fun s =>
-      s!"{s.func} {s.kind} {natToHex s.instr} (role {s.role}, offset arg {s.offsetArg}, base field {s.baseField}, no sound guard)"
+      let bfs := match s.baseField with | some n => toString n | none => "none"
+      s!"{s.func} {s.kind} {natToHex s.instr} (role {s.role}, offset arg {s.offsetArg}, base field {bfs}, no sound guard)"
     IO.println s!"bounds violations: {names}"
   pure (nonempty && masks && window && sanity && confined && clock && bounds)
 

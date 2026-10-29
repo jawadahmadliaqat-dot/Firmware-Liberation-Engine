@@ -600,6 +600,22 @@ def checkClockEnable (trace : List MmioAccess) : Bool :=
     at all is emitted unflagged because a caller-side validation
     cannot be excluded. Since v3.16 the site set also covers
     cache-range transfers (address argument = computed pointer).
+    Since Phase 1 (extractor v3.18) the site set also
+    covers direct DMA transfers (role "dma": any callee that
+    programs a computed-pointer argument into a constant address)
+    and direct command-address programming (role "cmdaddr": any
+    callee that programs a bare offset argument into a constant
+    address or uses it as a store address; `baseField` is none
+    when the callee never re-derives base+offset, so the field is
+    `Option Nat` since Phase 1), and a flagged site is suppressed
+    with soundGuard "caller-check" when every known direct caller
+    validates the same (base, offset, size) triple (signed,
+    ZEXT-wide, or multi-word guard in the caller; unsigned-only
+    caller validation does not count). Indirect calls (CALLIND,
+    e.g. through a driver ops struct) are still not sites: the
+    callee cannot be resolved from inside the caller scan. Verdict
+    logic is unchanged: only `flagged` decides, and `baseField` is
+    never read by it.
     The top-level "copy_sites" field is optional: absent
     (pre-v3.15 reports) means no bounds data, not an error -- the
     line then passes vacuously and the site count (0) shows it. A
@@ -610,7 +626,7 @@ structure BoundsSite where
   kind : String
   role : String
   offsetArg : Nat
-  baseField : Nat
+  baseField : Option Nat
   sizeField : Option Nat
   unsoundCheck : Bool
   soundGuard : String
@@ -624,7 +640,10 @@ def extractBoundsSite (j : Json) : Except String BoundsSite := do
   let kind ← j.getObjVal? "kind" >>= Json.getStr?
   let role ← j.getObjVal? "role" >>= Json.getStr?
   let offsetArg ← j.getObjVal? "offset_arg" >>= Json.getNat?
-  let baseField ← j.getObjVal? "base_field" >>= Json.getNat?
+  let baseField ← match j.getObjVal? "base_field" with
+    | .ok .null => pure none
+    | .ok v => some <$> Json.getNat? v
+    | .error e => Except.error e
   let sizeField ← match j.getObjVal? "size_field" with
     | .ok .null => pure none
     | .ok v => some <$> Json.getNat? v
