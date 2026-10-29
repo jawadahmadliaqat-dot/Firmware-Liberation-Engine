@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.19-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.20-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -184,6 +184,52 @@ because real-target outputs changed (new port entry, MMIO totals,
 new functions, new MMIO bands); JSON shape unchanged, no Lean change
 needed.
 
+**v3.20 changes:** Phase 4 security-boundary property, vendor-neutral by
+design. The ARM adapter gains the Private Peripheral Bus band
+(0xE0000000–0xE0100000) as the first instantiation of a generic
+internal-peripheral-window kind (window = where to look, decoder = what
+it means); a static boundary profile (V1) declares regions with domain,
+minimum privilege and permissions, image defaults, veneer functions and
+DMA controllers, delivered by script arg or sidecar with no new CLI flags;
+agents come from the image default, SG-at-entry veneers (verified: Ghidra
+11.4 does lift SG) or per-function overrides; DMA transfers get a
+two-judgment rule (programming leg as CPU, transfer leg as DMA agent);
+and must accesses inside a profile region but outside every MMIO window
+(e.g. SEC_RAM at 0x30000000) are judged as boundary candidates without
+becoming MMIO ops. Lean generic gains a `boundary` verdict line
+(verdict = confinement ∧ clock-enable ∧ bounds ∧ boundary) with
+violation, unknown-agent and unknown-region counts. Synthetic contract
+16/16: the nonsecure image FAILs (exit 1) with exactly 5 violations —
+domain 3 including the SEC_RAM read, privilege 1, DMA read-leg 1 —
+unknown-agent 1, unknown-region 0, checked 17; the secure image PASSes
+(exit 0), 0/0 unknowns, checked 4. Real target: Zephyr MPU + userspace
+on v2m_musca_b1 (Cortex-M33) — Lean generic FAILs only on boundary
+with exactly 1 violation (`user_write_ppb` write 0xE000ED0C, privilege
+leg, PPB), unknowns 0/0, trace 215; the privileged same-address control
+is compliant, and flipping the control region to privileged-only in a
+probe profile flags it too, so the control is a genuine judgment.
+The PPB lens band adds recordings on 8 targets (BMP 427 → 447, stripped
+314 → 327, F4 171 → 186/187, nRF52 205 → 220, RP2040 220 → 236, TinyUSB
+303 → 324, Zephyr 196 → 282), bounds 0/0 everywhere, boundary true on
+all unprofiled targets, full 36-target regression exact. BMP bmp-mode
+is restored to PASS by the core family fix: PPB/SCS registers are
+processor-internal core, not a platform peripheral, so the PPB band is
+granted only to the `platform_` bring-up functions (VTOR vector-table
+base, DEMCR trace enable, SysTick boot-request poll) — NOT a blanket
+allowance (a USB driver touching SCB still fails, and the synthetic
+arm-violation still FAILs as negative control); BMP-generic was never
+affected and PASSED throughout. Precision unchanged (TP=17, FP=0,
+FN=0, TN=16); CVE-2026-11743 pair unchanged (pre-fix FAILs naming both
+sites, fixed PASSes); CVE-2026-78119 pair still PASS/PASS (the engine
+does not flag eSPI — expected, not a regression). Honest limits: V1
+is a static profile only (config-write learning, true two-stage
+SAU/MPU composition and thread-entry learning are V1.5/V2 work); the
+SAU second target is next; and a boundary violation is a necessary
+condition for privilege escalation, NOT proof of an exploit. Version
+bumped v3.19 -> v3.20 because outputs changed (PPB recordings on 8
+targets, new boundary JSON fields on profiled runs, new Lean lines in
+generic mode, and the bmp-mode verdict flip).
+
 **Clock-enable-before-use (Lean-side, generic mode; no extractor change, no
 JSON change, no new flags):** every MUST access to a mapped STM32 peripheral's
 register block requires a MUST STORE to that peripheral's clock-gate register
@@ -227,6 +273,9 @@ v3.17 bounds verdict on the same CVE pair (unchanged: pre-fix FAILs naming BOTH 
 
 ![BOUNDS Phase 1: DMA + command-address + caller validation](assets/screenshots/bounds_screenshot_phase1.svg)
 v3.18 bounds Phase 1 on the same CVE pair (unchanged: pre-fix FAILs naming BOTH sites, fixed PASSes), plus the extended precision pane: 33 cases, TP=17 FP=0 FN=0 TN=16 — DMA sites, cmdaddr sites (including `base field none`), and caller-check suppressions, with wrong-triple / partial / mixed callers still flagging.
+
+![Phase 4 boundary: NS FAIL, SEC PASS, Zephyr MPU 1 violation](assets/screenshots/boundary_screenshot.svg)
+v3.20 Phase 4 boundary verdicts (`lake exe ingest_check <report> generic`, run from `lean/`): synthetic nonsecure image FAILs with exactly 5 violations, secure image PASSes, and the Zephyr MPU + userspace target FAILs only on boundary with exactly 1 violation (`user_write_ppb` write 0xE000ED0C, privilege leg).
 
 ## Honest zeros
 

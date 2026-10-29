@@ -239,9 +239,22 @@ def extractMmioWindows (j : Json) : Except String (List (Nat × Nat)) := do
         if lo < hi then pure (lo, hi)
         else throw s!"bad mmio window (start >= end): {w}")
 
+/-- Bmp mode only (its sole caller is printBmp; generic mode uses the
+    report's bands via checkWindowBands). The hardcoded ARM window plus
+    the ARM Private Peripheral Bus band [0xE0000000, 0xE0100000): the
+    PPB is the processor core's own System Control Space (SysTick,
+    NVIC, SCB), a fixed architectural band, not a platform
+    peripheral window. Admitting the band here is a WINDOW fact only:
+    WHICH family may touch it is still gated by checkBmpConfinement
+    below (the core-family rule) — a named driver family touching
+    the PPB still fails there. Added Oct 30, 2026 (Phase 4 core
+    family fix): the Phase 4 PPB lens band made 20 genuine BMP core
+    accesses visible, and the old single-window check rejected all
+    of them. -/
 def checkGeneric (trace : List MmioAccess) : Bool :=
   !trace.isEmpty && checkMasksConsistent trace &&
-  checkWindow 0x40000000 0x60000000 trace
+  trace.all fun a => (decide (0x40000000 ≤ a.addr) && decide (a.addr < 0x60000000)) ||
+    (decide (0xE0000000 ≤ a.addr) && decide (a.addr < 0xE0100000))
 
 def inRange (addr lo hi : Nat) : Bool :=
   decide (lo ≤ addr) && decide (addr < hi)
@@ -353,7 +366,24 @@ def extractLanguage (j : Json) : Option String :=
     every driver family touches only its own peripherals. This is the
     first firmware-specific property: it proves no driver family can
     scribble on another family's registers. Locked here so future
-    pipeline runs must match the same profile (regression gate). -/
+    pipeline runs must match the same profile (regression gate).
+    CORE FAMILY RULE (Oct 30, 2026, Phase 4 fix): the PPB/SCS band
+    [0xE0000000, 0xE0100000) is processor-INTERNAL ("core"), not a
+    platform peripheral, so it is granted ONLY to the platform_
+    bring-up functions — and to no other named family. Grounded in
+    the 6 diagnosed BMP ops (fresh v3.19 report): platform_init
+    STOREs SCB VTOR 0xE000ED08 (vector-table base) and LOAD/STOREs
+    SCB DEMCR 0xE000EDFC (TRCENA bit 24 set, enabling DWT trace),
+    and platform_request_boot LOADs SysTick CTRL 0xE000E010 twice
+    (boot-request timing poll). Board bring-up configuring the core
+    itself is not a cross-family scribble. This is NOT a blanket
+    PPB allowance: jtagtap, rcc_, st_usbfs, swdptap and aux_serial
+    keep their narrow ranges, so a USB driver (st_usbfs_*) touching
+    SCB still FAILS here. Functions matching no branch (nvic_*,
+    systick_*, scb_*, reset_handler — the other 14 PPB ops) still
+    pass via else true: that pre-existing passthrough is UNCHANGED
+    by this fix, not endorsed by it; constraining it is separate
+    profile-tightening work. -/
 def checkBmpConfinement (trace : List MmioAccess) : Bool :=
   trace.all fun a =>
     if a.func.startsWith "jtagtap" then
@@ -367,7 +397,8 @@ def checkBmpConfinement (trace : List MmioAccess) : Bool :=
     else if a.func == "aux_serial_set_led" || a.func == "aux_serial_clear_led" then
       inRange a.addr 0x40010C00 0x40011000
     else if a.func.startsWith "platform_" then
-      inRange a.addr 0x40010800 0x40011400 || inRange a.addr 0x40012400 0x40012800
+      inRange a.addr 0x40010800 0x40011400 || inRange a.addr 0x40012400 0x40012800 ||
+      inRange a.addr 0xE0000000 0xE0100000
     else true
 
 /-- Clock-enable-before-use, v1 (generalization of the blink theorem).
@@ -670,6 +701,61 @@ def boundsViolations (sites : List BoundsSite) : List BoundsSite :=
 /-- Bounds check: true iff no flagged copy site. -/
 def checkBounds (sites : List BoundsSite) : Bool :=
   (boundsViolations sites).isEmpty
+
+/-- Phase 4 V1: security-boundary property (design-phase4.md).
+    The extractor emits only VIOLATIONS in "boundary_sites"
+    (compliant accesses are not emitted), plus the two unknown
+    counts and the checked total. A violation is a NECESSARY
+    condition for privilege escalation, never proof of an exploit.
+    Unknown agents / unknown regions are miss + count on the
+    extractor side: they never appear here as violations, and the
+    counts are surfaced by Main so a report that covers little
+    says so out loud. Absent fields (pre-Phase-4 reports) mean
+    no boundary data, not an error -- the line then passes
+    vacuously with 0 sites, same policy as bounds. -/
+structure BoundarySite where
+  func : String
+  addr : Nat
+  agent : String
+  region : String
+  kind : String
+  leg : String
+deriving Repr
+
+def extractBoundarySite (j : Json) : Except String BoundarySite := do
+  let func ← j.getObjVal? "function" >>= Json.getStr?
+  let addrS ← j.getObjVal? "address" >>= Json.getStr?
+  let addr ← parseHex addrS
+  let agent ← j.getObjVal? "agent" >>= Json.getStr?
+  let region ← j.getObjVal? "region" >>= Json.getStr?
+  let kind ← j.getObjVal? "kind" >>= Json.getStr?
+  let leg ← j.getObjVal? "leg" >>= Json.getStr?
+  pure { func := func, addr := addr, agent := agent, region := region,
+         kind := kind, leg := leg }
+
+def extractBoundarySites (j : Json) : Except String (List BoundarySite) := do
+  match j.getObjVal? "boundary_sites" with
+  | .ok v => do
+    let arr ← Json.getArr? v
+    arr.toList.mapM extractBoundarySite
+  | .error _ => pure []
+
+/-- One boundary count field, absent = 0 (pre-Phase-4 reports). -/
+def extractBoundaryCount (j : Json) (field : String) : Nat :=
+  match j.getObjVal? field with
+  | .ok v => match Json.getNat? v with
+    | .ok n => n
+    | .error _ => 0
+  | .error _ => 0
+
+/-- The boundary violations: the emitted sites ARE the violations. -/
+def boundaryViolations (sites : List BoundarySite) : List BoundarySite :=
+  sites
+
+/-- Boundary check: true iff no emitted violation site. -/
+def checkBoundary (sites : List BoundarySite) : Bool :=
+  (boundaryViolations sites).isEmpty
+
 
 /-- Non-vacuity: a GPIOA use with only an APB1 gate touched (APB2 never
     touched) fails — the synthetic-control shape. -/

@@ -15,6 +15,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.lang.RegisterValue;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolIterator;
+import java.io.File;
 import java.io.FileWriter;
 import java.io.PrintWriter;
 import java.util.ArrayList;
@@ -251,9 +252,21 @@ public class ExtractIR extends GhidraScript {
         String formatCodeAddress(long addr);
         /** True when an address is in the ISA's peripheral/MMIO window. */
         boolean isMmioAddress(long addr);
+        /** Window kinds (Phase 4, vendor-neutral): a window is a
+            declared band the lens records, with a role, not
+            hardcoded per-device logic. Two kinds exist: the
+            peripheral window (device MMIO) and the
+            INTERNAL-PERIPHERAL window (core-private config space
+            such as ARM's Private Peripheral Bus). The ARM PPB band
+            below is the FIRST instantiation of the internal kind;
+            other ISAs instantiate it only when they have such a
+            band. The band is a LENS window only: PPB accesses are
+            judged by the boundary property's configurator/PPB rule,
+            not by the generic window rule. */
         /** The ISA's peripheral/MMIO bands as [start, end) pairs,
-            in the same order isMmioAddress tests them (ARM: the single
-            Cortex-M window; RISC-V/MIPS: the configured band list).
+            in the same order isMmioAddress tests them (ARM: the
+            Cortex-M window plus the internal-peripheral PPB band;
+            RISC-V/MIPS: the configured band list).
             Emitted into the report as "mmio_windows" so the Lean
             verifier can check the trace against the platform's bands
             instead of a hardcoded ARM window. */
@@ -757,15 +770,34 @@ public class ExtractIR extends GhidraScript {
             // recordings for addresses the code provably
             // touches); the regression measures whether any
             // non-RP2040 ARM target touches these ranges.
+            // Phase 4 adds the PPB band (see
+            // internalPeripheralWindow, the generic
+            // internal-peripheral-window kind's first
+            // instantiation); PPB accesses are judged by the
+            // boundary property, not the generic window rule.
             return (addr >= 0x40000000L && addr < 0x60000000L) ||
                 (addr >= 0xD0000000L && addr < 0xD0000180L) ||
-                (addr >= 0x18000000L && addr < 0x18000100L);
+                (addr >= 0x18000000L && addr < 0x18000100L) ||
+                (addr >= 0xE0000000L && addr < 0xE0100000L);
+        }
+        /** Phase 4 (PPB BAND FIRST): the ARM Private Peripheral
+            Bus band, the first instantiation of the generic
+            internal-peripheral-window kind. SAU/MPU/NVIC/SCB
+            registers live here (0xE0000000-0xE00FFFFF); without
+            this band the lens records NONE of them, so
+            config-register writes are invisible by construction
+            (the design's PPB gap). Sound in the must direction
+            (it can only ADD recordings); the Phase 4 regression
+            measures and explains every new recording. */
+        public static long[] internalPeripheralWindow() {
+            return new long[] {0xE0000000L, 0xE0100000L};
         }
         public List<long[]> mmioWindows() {
             List<long[]> wins = new ArrayList<long[]>();
             wins.add(new long[] {0x40000000L, 0x60000000L});
             wins.add(new long[] {0xD0000000L, 0xD0000180L});
             wins.add(new long[] {0x18000000L, 0x18000100L});
+            wins.add(internalPeripheralWindow());
             return wins;
         }
         public int fallthroughIndex(List<OpRec> ops, int i) {
@@ -7287,7 +7319,9 @@ public class ExtractIR extends GhidraScript {
         List<String> mmio, List<String> portIo, List<String> msr,
         List<String> barRel,
         List<String> mmioIds, List<String> portIds,
-        List<String> msrIds, List<String> barIds) {
+        List<String> msrIds, List<String> barIds,
+        List<BoundaryAccess> bnd, List<BoundaryAccess> bndExt,
+        BoundaryProfile bndProfile) {
         boolean mustRecorded = false;
         if (bvals == null) return false;
         // ---- MMIO recording (LOAD/STORE) ----
@@ -7323,6 +7357,30 @@ public class ExtractIR extends GhidraScript {
                     mmioIds.add("mmio:" + op.instrAddr + ":0x" +
                         Long.toHexString(addr));
                     mustRecorded = true;
+                    // Phase 4 V1: boundary candidate, aligned
+                    // 1:1 with the mmio entry just appended.
+                    if (bnd != null) {
+                        bnd.add(new BoundaryAccess(
+                            op.instrAddr.toString(), op.mnem,
+                            addr.longValue(), exact));
+                    }
+                } else if (addr != null && bndProfile != null &&
+                    bndProfile.regionFor(addr.longValue()) != null) {
+                    // Phase 4 RAM-region extension, replay form
+                    // (same rule as the emission loop; mmio
+                    // strings are untouched, so the replay
+                    // guard cannot trip on this).
+                    Long extExact = null;
+                    if (op.mnem.equals("STORE") &&
+                        op.ins.length >= 3) {
+                        extExact = valBits.exactValue(sizeMask(
+                            op.ins[2].getSize()));
+                    }
+                    if (bndExt != null) {
+                        bndExt.add(new BoundaryAccess(
+                            op.instrAddr.toString(), op.mnem,
+                            addr.longValue(), extExact));
+                    }
                 }
             }
         }
@@ -7355,6 +7413,22 @@ public class ExtractIR extends GhidraScript {
                     ", \"value_known_zeroes\": " + Long.toUnsignedString(valBits.zeroes) + "}");
                 mmioIds.add("mmio:" + op.instrAddr + ":0x" +
                     Long.toHexString(a));
+                // Phase 4 V1: boundary candidate, COPY form.
+                if (bnd != null) {
+                    bnd.add(new BoundaryAccess(
+                        op.instrAddr.toString(), op.mnem, a, exact));
+                }
+            } else if (bndProfile != null &&
+                bndProfile.regionFor(a) != null) {
+                // Phase 4 RAM-region extension, COPY form.
+                if (bndExt != null) {
+                    Bits valBits = resolveBits(op.ins[0], bvals);
+                    int sz = op.out.getSize();
+                    Long extExact = valBits.exactValue(
+                        sizeMask(sz == 0 ? 4 : sz));
+                    bndExt.add(new BoundaryAccess(
+                        op.instrAddr.toString(), op.mnem, a, extExact));
+                }
             }
         }
         // ---- Port I/O + MSR recording (x86 CALLOTHER) ----
@@ -10471,6 +10545,602 @@ public class ExtractIR extends GhidraScript {
         return res;
     }
 
+    // ============ Phase 4 V1: security-boundary property ============
+    // Design: ~/workspace/v32-phase4/design-phase4.md (approved).
+    // V1 sources ONLY: static profile regions + image-level agent +
+    // profile veneer list (+ SG-at-entry when Ghidra lifts it) +
+    // DMA transfer synthesis for profile-declared programming
+    // functions. NOT in V1: static-table learning, config-write
+    // learning with must-precede, thread-entry attribution,
+    // CONTROL/PSR tracking, PRIMASK/FAULTMASK/handler-ness/name
+    // heuristics (REJECTED, never implemented here).
+    // Violation rule (design §3, all six conditions required):
+    // must-proven address, known agent, known region (or profile
+    // default), agent not allowed on some leg (domain, privilege,
+    // permission), no legitimate-crossing evidence, static regions.
+    // Unknown agent / unknown region: NEVER a flag, ALWAYS counted
+    // (boundary_unknown_agent_total /
+    // boundary_unknown_region_total) — the zero-silent-gaps rule.
+    // A violation is a NECESSARY condition for privilege
+    // escalation, never proof of an exploit.
+    //
+    // Profile delivery (no new CLI flags, no ingest change): an
+    // optional Ghidra script arg boundary_profile=<path>
+    // (precedent: the existing mmio=/abi= script args), else a
+    // sidecar <workspace>/binaries/<binary>.boundary.json derived
+    // from the report output path. No profile -> boundary fields
+    // are empty/zero and the Lean line passes vacuously (same
+    // class as clock v1 no-RCC: no configured boundary to cross).
+
+    /** Minimal JSON parser for boundary profiles (objects, arrays,
+        strings with escapes, booleans, null, integers). No
+        third-party dependency; a parse failure is reported by the
+        caller and yields no profile, never a half-profile. */
+    private static class MiniJson {
+        final String s; int i;
+        MiniJson(String s) { this.s = s; }
+        Object parse() throws Exception {
+            skip(); Object v = value(); skip();
+            if (i != s.length()) throw new Exception("trailing data");
+            return v;
+        }
+        void skip() {
+            while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
+        }
+        Object value() throws Exception {
+            skip();
+            if (i >= s.length()) throw new Exception("unexpected end");
+            char c = s.charAt(i);
+            if (c == '{') return obj();
+            if (c == '[') return arr();
+            if (c == '"') return str();
+            if (c == 't') { expect("true"); return Boolean.TRUE; }
+            if (c == 'f') { expect("false"); return Boolean.FALSE; }
+            if (c == 'n') { expect("null"); return null; }
+            return num();
+        }
+        void expect(String w) throws Exception {
+            if (!s.startsWith(w, i)) throw new Exception("bad literal");
+            i += w.length();
+        }
+        Map<String, Object> obj() throws Exception {
+            Map<String, Object> m = new HashMap<String, Object>();
+            i++; skip();
+            if (i < s.length() && s.charAt(i) == '}') { i++; return m; }
+            while (true) {
+                skip();
+                String k = str(); skip();
+                if (i >= s.length() || s.charAt(i) != ':')
+                    throw new Exception("expected ':'");
+                i++; Object v = value(); m.put(k, v); skip();
+                if (i < s.length() && s.charAt(i) == ',') { i++; continue; }
+                if (i < s.length() && s.charAt(i) == '}') { i++; return m; }
+                throw new Exception("expected ',' or '}'");
+            }
+        }
+        List<Object> arr() throws Exception {
+            List<Object> a = new ArrayList<Object>();
+            i++; skip();
+            if (i < s.length() && s.charAt(i) == ']') { i++; return a; }
+            while (true) {
+                a.add(value()); skip();
+                if (i < s.length() && s.charAt(i) == ',') { i++; continue; }
+                if (i < s.length() && s.charAt(i) == ']') { i++; return a; }
+                throw new Exception("expected ',' or ']'");
+            }
+        }
+        String str() throws Exception {
+            if (s.charAt(i) != '"') throw new Exception("expected string");
+            i++; StringBuilder b = new StringBuilder();
+            while (i < s.length()) {
+                char c = s.charAt(i++);
+                if (c == '"') return b.toString();
+                if (c == '\\') {
+                    if (i >= s.length()) break;
+                    char e = s.charAt(i++);
+                    if (e == 'u') {
+                        b.append((char) Integer.parseInt(
+                            s.substring(i, i + 4), 16)); i += 4;
+                    } else if (e == 'n') b.append('\n');
+                    else if (e == 't') b.append('\t');
+                    else if (e == 'r') b.append('\r');
+                    else b.append(e);
+                } else b.append(c);
+            }
+            throw new Exception("unterminated string");
+        }
+        Object num() throws Exception {
+            int st = i;
+            while (i < s.length() && "-+0123456789.eE".indexOf(
+                s.charAt(i)) >= 0) i++;
+            String t = s.substring(st, i);
+            try {
+                if (t.contains(".") || t.contains("e") || t.contains("E"))
+                    return Double.parseDouble(t);
+                return Long.parseLong(t);
+            } catch (Exception e) {
+                throw new Exception("bad number: " + t);
+            }
+        }
+    }
+
+    private static String mjStr(Map<String, Object> m, String k) {
+        Object v = m.get(k);
+        return (v instanceof String) ? (String) v : null;
+    }
+    private static Map<String, Object> mjObj(Object v) {
+        if (v instanceof Map) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> m = (Map<String, Object>) v;
+            return m;
+        }
+        return null;
+    }
+    private static List<Object> mjArr(Object v) {
+        if (v instanceof List) {
+            @SuppressWarnings("unchecked")
+            List<Object> a = (List<Object>) v;
+            return a;
+        }
+        return null;
+    }
+    private static long mjHex(Object v, long dflt) {
+        if (v instanceof Number) return ((Number) v).longValue();
+        if (v instanceof String) {
+            String t = ((String) v).trim();
+            try {
+                if (t.startsWith("0x") || t.startsWith("0X"))
+                    return Long.parseLong(t.substring(2), 16);
+                return Long.parseLong(t);
+            } catch (Exception e) { return dflt; }
+        }
+        return dflt;
+    }
+    private static boolean mjBool(Map<String, Object> m, String k,
+        boolean dflt) {
+        Object v = m.get(k);
+        return (v instanceof Boolean) ? ((Boolean) v).booleanValue() : dflt;
+    }
+
+    private static class BoundaryRegion {
+        String name; long start, end; String domain, minPriv;
+        boolean read, write; long number; String source, mechanism;
+        String json() {
+            return "{\"name\": \"" + esc(name) + "\", \"start\": \"0x" +
+                Long.toHexString(start) + "\", \"end\": \"0x" +
+                Long.toHexString(end) + "\", \"domain\": \"" + domain +
+                "\", \"min_privilege\": \"" + minPriv + "\", \"read\": " +
+                read + ", \"write\": " + write + ", \"number\": " + number +
+                ", \"source\": \"" + esc(source) + "\", \"mechanism\": \"" +
+                esc(mechanism) + "\"}";
+        }
+    }
+
+    /** One must-proven data access, for boundary judgment. The
+        value is the STORE's exact value when known (null for LOADs
+        and unknown values); DMA endpoint synthesis needs it. */
+    private static class BoundaryAccess {
+        String instr, op; long addr; Long value;
+        BoundaryAccess(String instr, String op, long addr, Long value) {
+            this.instr = instr; this.op = op; this.addr = addr;
+            this.value = value;
+        }
+    }
+
+    private static class BoundaryProfile {
+        List<BoundaryRegion> regions = new ArrayList<BoundaryRegion>();
+        boolean highestWins = true;
+        boolean hasDefault = false;
+        String defDomain, defPriv;
+        String imageSec, imagePriv; // null = unknown
+        boolean mpuPrivdefena = false;
+        String source;
+        Map<String, String> overrides = new HashMap<String, String>();
+        Set<String> veneerNames = new HashSet<String>();
+        // controller name -> [domain, privilege]
+        Map<String, String[]> dmaControllers =
+            new HashMap<String, String[]>();
+        /** Winning region covering addr under the set's precedence
+            (highest number wins by default, lowest wins for a
+            PMP-style set). Null when no region covers addr. */
+        BoundaryRegion regionFor(long addr) {
+            BoundaryRegion win = null;
+            for (BoundaryRegion r : regions) {
+                if (addr < r.start || addr >= r.end) continue;
+                if (win == null) { win = r; continue; }
+                if (highestWins ? r.number > win.number
+                    : r.number < win.number) win = r;
+            }
+            return win;
+        }
+        /** Region for judgment: the winning region, else the
+            profile default as a pseudo-region, else null (UNKNOWN
+            region — counted, never flagged). The MPU background
+            rule is NOT folded in here; the evaluator applies it
+            explicitly so the two cases stay distinguishable. */
+        BoundaryRegion resolveOrDefault(long addr) {
+            BoundaryRegion r = regionFor(addr);
+            if (r != null) return r;
+            if (!hasDefault) return null;
+            BoundaryRegion d = new BoundaryRegion();
+            d.name = "default"; d.start = addr; d.end = addr + 1;
+            d.domain = defDomain; d.minPriv = defPriv;
+            d.read = true; d.write = true; d.number = -1;
+            d.source = "profile-default"; d.mechanism = "profile-only";
+            return d;
+        }
+    }
+
+    private BoundaryProfile loadBoundaryProfile(String outputJson) {
+        String explicit = null;
+        for (String a : getScriptArgs()) {
+            if (a.startsWith("boundary_profile="))
+                explicit = a.substring("boundary_profile=".length());
+        }
+        List<String> candidates = new ArrayList<String>();
+        if (explicit != null) {
+            candidates.add(explicit);
+        } else {
+            try {
+                File out = new File(outputJson);
+                File reportsDir = out.getParentFile();
+                File ws = (reportsDir != null)
+                    ? reportsDir.getParentFile() : null;
+                if (ws != null) {
+                    candidates.add(new File(new File(ws, "binaries"),
+                        currentProgram.getName() + ".boundary.json")
+                        .getPath());
+                }
+                if (reportsDir != null) {
+                    candidates.add(new File(reportsDir,
+                        currentProgram.getName() + ".boundary.json")
+                        .getPath());
+                }
+            } catch (Exception e) {
+                // Sidecar discovery is best-effort; no profile then.
+            }
+        }
+        for (String cand : candidates) {
+            File f = new File(cand);
+            if (!f.isFile()) {
+                if (explicit != null)
+                    println("[!] boundary: explicit profile not found: "
+                        + cand);
+                continue;
+            }
+            try {
+                StringBuilder sb = new StringBuilder();
+                java.io.BufferedReader br =
+                    new java.io.BufferedReader(new java.io.FileReader(f));
+                String line;
+                while ((line = br.readLine()) != null) sb.append(line)
+                    .append("\n");
+                br.close();
+                Object parsed = new MiniJson(sb.toString()).parse();
+                Map<String, Object> root = mjObj(parsed);
+                if (root == null) throw new Exception("root not object");
+                BoundaryProfile p = parseBoundaryProfile(root);
+                p.source = f.getPath();
+                // Image selection: program name minus extension
+                // (ns_image.elf -> ns_image). No match -> image
+                // agent unknown (counted per access, never guessed).
+                String prog = currentProgram.getName();
+                String key = prog;
+                int dot = prog.lastIndexOf('.');
+                if (dot > 0) key = prog.substring(0, dot);
+                Map<String, Object> images = mjObj(root.get("images"));
+                Map<String, Object> img = (images != null)
+                    ? mjObj(images.get(key)) : null;
+                if (img == null && images != null)
+                    img = mjObj(images.get(prog));
+                if (img != null) {
+                    p.imageSec = mjStr(img, "security_state");
+                    if ("unknown".equals(p.imageSec)) p.imageSec = null;
+                    p.imagePriv = mjStr(img, "privilege");
+                    if ("unknown".equals(p.imagePriv)) p.imagePriv = null;
+                    if (!p.hasDefault) {
+                        Map<String, Object> da =
+                            mjObj(img.get("default_attribute"));
+                        if (da != null) {
+                            p.defDomain = mjStr(da, "domain");
+                            p.defPriv = mjStr(da, "min_privilege");
+                            if (p.defDomain != null && p.defPriv != null)
+                                p.hasDefault = true;
+                        }
+                    }
+                    Map<String, Object> ovs =
+                        mjObj(mjObj(root.get("function_agent_overrides"))
+                            .get(key));
+                    if (ovs == null && mjObj(
+                        root.get("function_agent_overrides")) != null)
+                        ovs = mjObj(mjObj(
+                            root.get("function_agent_overrides"))
+                            .get(prog));
+                    if (ovs != null) {
+                        for (Map.Entry<String, Object> e : ovs.entrySet()) {
+                            if (e.getKey().startsWith("_")) continue;
+                            Map<String, Object> o = mjObj(e.getValue());
+                            String ag = (o != null)
+                                ? mjStr(o, "agent") : null;
+                            if (ag == null && e.getValue() instanceof String)
+                                ag = (String) e.getValue();
+                            if (ag != null)
+                                p.overrides.put(e.getKey(), ag);
+                        }
+                    }
+                }
+                println("[*] boundary: profile " + f.getPath() +
+                    " image=" + key + " regions=" + p.regions.size() +
+                    " imageSec=" + p.imageSec + " imagePriv=" +
+                    p.imagePriv + " default=" + p.hasDefault);
+                return p;
+            } catch (Exception e) {
+                println("[!] boundary: profile " + cand +
+                    " unusable (" + e.getMessage() + "); no boundary.");
+                return null;
+            }
+        }
+        println("[*] boundary: no profile; verdict vacuous (no " +
+            "configured boundary to cross).");
+        return null;
+    }
+
+    private BoundaryProfile parseBoundaryProfile(Map<String, Object> root) {
+        BoundaryProfile p = new BoundaryProfile();
+        String prec = mjStr(root, "boundary_precedence");
+        if ("lowest-wins".equals(prec)) p.highestWins = false;
+        Map<String, Object> da = mjObj(root.get("boundary_default_attribute"));
+        if (da != null) {
+            p.defDomain = mjStr(da, "domain");
+            p.defPriv = mjStr(da, "min_privilege");
+            if (p.defDomain != null && p.defPriv != null)
+                p.hasDefault = true;
+        }
+        p.mpuPrivdefena = mjBool(root, "mpu_privdefena", false);
+        List<Object> vlist = mjArr(root.get("veneer_functions"));
+        if (vlist != null) {
+            for (Object v : vlist)
+                if (v instanceof String) p.veneerNames.add((String) v);
+        }
+        Map<String, Object> dmas = mjObj(root.get("dma_controllers"));
+        if (dmas != null) {
+            for (Map.Entry<String, Object> e : dmas.entrySet()) {
+                Map<String, Object> c = mjObj(e.getValue());
+                if (c == null) continue;
+                String dom = mjStr(c, "domain");
+                String priv = mjStr(c, "privilege");
+                if (dom != null)
+                    p.dmaControllers.put(e.getKey(), new String[] { dom,
+                        (priv != null) ? priv : "any" });
+            }
+        }
+        List<Object> regs = mjArr(root.get("regions"));
+        if (regs != null) {
+            for (Object rv : regs) {
+                Map<String, Object> r = mjObj(rv);
+                if (r == null) continue;
+                BoundaryRegion br = new BoundaryRegion();
+                br.name = mjStr(r, "name");
+                if (br.name == null) continue;
+                br.start = mjHex(r.get("start"), 0);
+                br.end = mjHex(r.get("end"), 0);
+                br.domain = mjStr(r, "domain");
+                if (br.domain == null) br.domain = "both";
+                br.minPriv = mjStr(r, "min_privilege");
+                if (br.minPriv == null) br.minPriv = "any";
+                br.read = mjBool(r, "read", true);
+                br.write = mjBool(r, "write", true);
+                Object num = r.get("number");
+                br.number = (num instanceof Number)
+                    ? ((Number) num).longValue() : 0;
+                br.source = mjStr(r, "source");
+                if (br.source == null) br.source = "profile";
+                br.mechanism = mjStr(r, "mechanism");
+                if (br.mechanism == null) br.mechanism = "profile-only";
+                p.regions.add(br);
+            }
+        }
+        return p;
+    }
+
+    /** Agent as (domain, privilege, kind) with per-axis unknown
+        (null). Fully unknown (both axes null) -> unknown-agent
+        count, never a flag. A single known axis is still judged
+        on that axis (miss direction on the unknown axis only). */
+    private static class BoundaryAgent {
+        String domain, priv, kind;
+        BoundaryAgent(String d, String pr, String k) {
+            domain = d; priv = pr; kind = k;
+        }
+        boolean fullyUnknown() { return domain == null && priv == null; }
+        String label() {
+            if ("dma".equals(kind)) return "dma";
+            if ("unprivileged".equals(priv))
+                return (domain == null ? "unknown" : domain)
+                    + "-unprivileged";
+            return (domain == null ? "unknown" : domain) + "-cpu";
+        }
+    }
+
+    /** Parse a profile agent string: secure-cpu,
+        nonsecure-unprivileged, secure-unprivileged, dma, unknown. */
+    private BoundaryAgent agentFromString(String s, BoundaryProfile p) {
+        if (s == null || "unknown".equals(s)) return null;
+        if ("dma".equals(s)) return new BoundaryAgent(null, null, "dma");
+        String dom = null, priv = "privileged";
+        if (s.contains("secure") && !s.contains("nonsecure"))
+            dom = "secure";
+        else if (s.contains("nonsecure")) dom = "nonsecure";
+        if (s.contains("unprivileged")) priv = "unprivileged";
+        return new BoundaryAgent(dom, priv, "cpu");
+    }
+
+    private static class BoundaryEval {
+        List<String> siteJsons = new ArrayList<String>();
+        int checked, violations, unknownAgent, unknownRegion;
+    }
+
+    /** Judge one access. Returns the violation leg, or null when
+        compliant, unknown, or background-ruled. Counts unknowns
+        in the eval record. Leg order: domain, privilege,
+        permission (first failing leg is reported). */
+    private String judgeAccess(BoundaryEval ev, BoundaryAgent ag,
+        long addr, String kind, BoundaryProfile p) {
+        if (ag == null || ag.fullyUnknown()) {
+            ev.unknownAgent++;
+            return null;
+        }
+        BoundaryRegion r = p.resolveOrDefault(addr);
+        if (r == null) {
+            // MPU background rule (profile fact only): a
+            // privileged agent may touch an unmatched address
+            // when PRIVDEFENA is set; an unprivileged agent may
+            // not (that access faults -> privilege-leg violation
+            // on the background rule). Without PRIVDEFENA the
+            // address is UNKNOWN: counted, never flagged.
+            if (p.mpuPrivdefena && "privileged".equals(ag.priv))
+                return null;
+            if (p.mpuPrivdefena && "unprivileged".equals(ag.priv))
+                return "privilege";
+            ev.unknownRegion++;
+            return null;
+        }
+        if (ag.domain != null && !"both".equals(r.domain)
+            && !r.domain.equals(ag.domain)) return "domain";
+        if (ag.priv != null && !"any".equals(ag.priv)
+            && "privileged".equals(r.minPriv)
+            && !"privileged".equals(ag.priv)) return "privilege";
+        if ("read".equals(kind) && !r.read) return "permission";
+        if ("write".equals(kind) && !r.write) return "permission";
+        return null;
+    }
+
+    private void emitBoundarySite(BoundaryEval ev, String fn, long addr,
+        BoundaryAgent ag, BoundaryRegion r, String kind, String leg) {
+        String regionName = (r != null) ? r.name : "background";
+        ev.siteJsons.add("{\"function\": \"" + esc(fn) +
+            "\", \"address\": \"0x" + Long.toHexString(addr) +
+            "\", \"agent\": \"" + ag.label() + "\", \"region\": \"" +
+            esc(regionName) + "\", \"kind\": \"" + kind +
+            "\", \"leg\": \"" + leg + "\", \"violated\": true}");
+        ev.violations++;
+    }
+
+    /** SG at function entry (TrustZone-M veneer). Ghidra's ARM
+        lifting is checked empirically (see implementation.md);
+        when SG is not lifted this returns false and the profile
+        veneer list is the fallback. Only the FIRST instruction
+        counts: a veneer entry is SG, nothing else. */
+    private boolean functionStartsWithSg(List<OpRec> ops) {
+        for (OpRec op : ops) {
+            if (op.instrAsm == null) continue;
+            String a = op.instrAsm.trim();
+            if (a.isEmpty()) continue;
+            String tok = a.split("[\\s,]+")[0].toLowerCase();
+            return "sg".equals(tok);
+        }
+        return false;
+    }
+
+    /** Evaluate one function's must accesses under the boundary
+        profile. Data accesses of a dma-programming function are
+        judged as CPU accesses (the PROGRAMMING leg); the transfer
+        it programs is judged separately as DMA-agent accesses
+        (the TRANSFER leg) — the two-judgment rule, design §2.4. */
+    private BoundaryEval evaluateBoundary(String fn, List<OpRec> ops,
+        List<BoundaryAccess> accesses, BoundaryProfile p) {
+        BoundaryEval ev = new BoundaryEval();
+        // Dedup by (instr, op, addr), first occurrence wins:
+        // main-loop findings and clone-replay findings for the
+        // same access are ONE candidate (mirroring the mmio
+        // list's identity dedup; value refinement is deliberately
+        // not emitted, same policy as persite extras).
+        List<BoundaryAccess> deduped = new ArrayList<BoundaryAccess>();
+        Set<String> seenBnd = new HashSet<String>();
+        for (BoundaryAccess a : accesses) {
+            String id = a.instr + ":" + a.op + ":0x" +
+                Long.toHexString(a.addr);
+            if (seenBnd.add(id)) deduped.add(a);
+        }
+        accesses = deduped;
+        boolean isVeneer = functionStartsWithSg(ops)
+            || p.veneerNames.contains(fn);
+        String override = p.overrides.get(fn);
+        boolean isDmaProg = "dma".equals(override);
+        BoundaryAgent imageAgent = new BoundaryAgent(
+            p.imageSec, p.imagePriv, "cpu");
+        BoundaryAgent dataAgent;
+        if (isDmaProg) {
+            dataAgent = imageAgent; // programming leg: CPU agent
+        } else if (override != null) {
+            dataAgent = agentFromString(override, p);
+            if (dataAgent == null)
+                dataAgent = new BoundaryAgent(null, null, "cpu");
+        } else if (isVeneer) {
+            // Veneer body executes secure; privilege stays the
+            // image's (null when undeclared -> privilege leg
+            // passes, domain leg still judged; miss direction).
+            dataAgent = new BoundaryAgent("secure", p.imagePriv, "cpu");
+        } else {
+            dataAgent = imageAgent;
+        }
+        for (BoundaryAccess a : accesses) {
+            ev.checked++;
+            String kind = "STORE".equals(a.op) ? "write" : "read";
+            // Background-rule violations need a region name for
+            // the site; judgeAccess returns the leg, and the
+            // region is resolved again here for emission.
+            BoundaryRegion r = p.resolveOrDefault(a.addr);
+            String leg = judgeAccess(ev, dataAgent, a.addr, kind, p);
+            if (leg != null) emitBoundarySite(ev, fn, a.addr,
+                dataAgent, r, kind, leg);
+        }
+        // ---- DMA transfer synthesis (V1, narrow and declared) ----
+        // Only in a profile-declared programming function, only
+        // when the controller is unambiguous (exactly one profile
+        // controller), only for stored values that resolve to a
+        // boundary region (literal endpoints). Endpoints in
+        // register-offset order: lowest offset = source (read
+        // leg), next = destination (write leg). A different
+        // controller register layout needs a profile register map
+        // (V1.5); this rule never guesses one.
+        if (isDmaProg && p.dmaControllers.size() == 1) {
+            Map.Entry<String, String[]> ctrl =
+                p.dmaControllers.entrySet().iterator().next();
+            BoundaryAgent dmaAgent = new BoundaryAgent(
+                ctrl.getValue()[0], ctrl.getValue()[1], "dma");
+            List<BoundaryAccess> endpoints =
+                new ArrayList<BoundaryAccess>();
+            for (BoundaryAccess a : accesses) {
+                if (!"STORE".equals(a.op) || a.value == null) continue;
+                if (p.regionFor(a.value.longValue()) == null) continue;
+                endpoints.add(a);
+            }
+            java.util.Collections.sort(endpoints,
+                new java.util.Comparator<BoundaryAccess>() {
+                    public int compare(BoundaryAccess x,
+                        BoundaryAccess y) {
+                        return Long.compare(x.addr, y.addr);
+                    }
+                });
+            if (endpoints.size() >= 2) {
+                long src = endpoints.get(0).value.longValue();
+                long dst = endpoints.get(1).value.longValue();
+                BoundaryRegion rs = p.resolveOrDefault(src);
+                BoundaryRegion rd = p.resolveOrDefault(dst);
+                ev.checked++;
+                String legS = judgeAccess(ev, dmaAgent, src, "read", p);
+                if (legS != null) emitBoundarySite(ev, fn, src,
+                    dmaAgent, rs, "read", legS);
+                ev.checked++;
+                String legD = judgeAccess(ev, dmaAgent, dst, "write", p);
+                if (legD != null) emitBoundarySite(ev, fn, dst,
+                    dmaAgent, rd, "write", legD);
+            }
+        }
+        return ev;
+    }
+
     @Override
     public void run() throws Exception {
         if (getScriptArgs().length < 1) {
@@ -10637,11 +11307,18 @@ public class ExtractIR extends GhidraScript {
         }
         PrintWriter w = new PrintWriter(new FileWriter(outputJson));
 
+        // Phase 4 V1: boundary profile (null = no profile, verdict
+        // vacuous). Loaded before the function loop: region ranges
+        // extend the must-recording set for boundary judgment
+        // (RAM regions outside every MMIO window, e.g. SEC_RAM),
+        // without touching mmio_accesses or mmio_access_total.
+        BoundaryProfile bndProfile = loadBoundaryProfile(outputJson);
+
         w.println("{");
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.19\",");
+        w.println("  \"extractor_version\": \"v3.20\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -10682,6 +11359,12 @@ public class ExtractIR extends GhidraScript {
         int totalCopySites = 0;
         int totalBoundsFlagged = 0;
         List<String> allCopySites = new ArrayList<String>();
+        // Phase 4 V1: report-level boundary accumulators.
+        List<String> allBoundarySites = new ArrayList<String>();
+        int totalBoundaryChecked = 0;
+        int totalBoundaryViolations = 0;
+        int totalBoundaryUnknownAgent = 0;
+        int totalBoundaryUnknownRegion = 0;
         Map<String, Integer> totalFormCounts =
             new HashMap<String, Integer>();
         int totalTransferCalls = 0;
@@ -12843,6 +13526,10 @@ public class ExtractIR extends GhidraScript {
             List<String> msr = new ArrayList<String>();
             // v7 cfgspace: BAR-relative findings (additive class).
             List<String> barRel = new ArrayList<String>();
+            // Phase 4 V1: must accesses for boundary judgment
+            // (mmio-window accesses + profile-region extension).
+            List<BoundaryAccess> bndAccesses =
+                new ArrayList<BoundaryAccess>();
             Memory mem = currentProgram.getMemory();
             // Successors for the recording-time feasibility filter.
             List<List<Integer>> maySucc = buildSucc(ops, branchTargets);
@@ -12890,6 +13577,29 @@ public class ExtractIR extends GhidraScript {
                                 ", \"value_known_ones\": " + Long.toUnsignedString(valBits.ones) +
                                 ", \"value_known_zeroes\": " + Long.toUnsignedString(valBits.zeroes) + "}");
                             mustRecorded = true;
+                            if (bndProfile != null) {
+                                bndAccesses.add(new BoundaryAccess(
+                                    op.instrAddr.toString(), op.mnem,
+                                    addr.longValue(), exact));
+                            }
+                        } else if (addr != null && bndProfile != null &&
+                            bndProfile.regionFor(addr.longValue()) != null) {
+                            // Phase 4 RAM-region extension: a
+                            // must-proven access inside a profile
+                            // region but outside every MMIO window
+                            // (e.g. SEC_RAM at 0x30000000) is a
+                            // boundary candidate, NOT an mmio
+                            // trace op: mmio_access_total and the
+                            // Lean window check are untouched.
+                            Long extExact = null;
+                            if (op.mnem.equals("STORE") &&
+                                op.ins.length >= 3) {
+                                extExact = valBits.exactValue(sizeMask(
+                                    op.ins[2].getSize()));
+                            }
+                            bndAccesses.add(new BoundaryAccess(
+                                op.instrAddr.toString(), op.mnem,
+                                addr.longValue(), extExact));
                         }
                     }
                 }
@@ -12922,6 +13632,21 @@ public class ExtractIR extends GhidraScript {
                                 (exact == null ? "null" : Long.toUnsignedString(exact)) +
                                 ", \"value_known_ones\": " + Long.toUnsignedString(valBits.ones) +
                                 ", \"value_known_zeroes\": " + Long.toUnsignedString(valBits.zeroes) + "}");
+                            if (bndProfile != null) {
+                                bndAccesses.add(new BoundaryAccess(
+                                    op.instrAddr.toString(), op.mnem, a, exact));
+                            }
+                        } else if (bndProfile != null &&
+                            bndProfile.regionFor(a) != null) {
+                            // Phase 4 RAM-region extension, COPY
+                            // form (same rule as the LOAD/STORE
+                            // form above).
+                            Bits valBits = resolveBits(op.ins[0], bvals);
+                            int sz = op.out.getSize();
+                            Long extExact = valBits.exactValue(
+                                sizeMask(sz == 0 ? 4 : sz));
+                            bndAccesses.add(new BoundaryAccess(
+                                op.instrAddr.toString(), op.mnem, a, extExact));
                         }
                     }
                 }
@@ -13197,7 +13922,8 @@ public class ExtractIR extends GhidraScript {
                             fx.inStates[ri] : null;
                         recordMustFindings(ops.get(ri), rb, mem,
                             rMmio, rPortIo, rMsr, rBarRel,
-                            rMmioIds, rPortIds, rMsrIds, rBarIds);
+                            rMmioIds, rPortIds, rMsrIds, rBarIds,
+                            null, null, null);
                     }
                     if (rMmio.equals(mmio) && rPortIo.equals(portIo) &&
                         rMsr.equals(msr) && rBarRel.equals(barRel)) {
@@ -13228,6 +13954,16 @@ public class ExtractIR extends GhidraScript {
                                 new ArrayList<String>();
                             List<String> tBarIds =
                                 new ArrayList<String>();
+                            // Phase 4 V1: clone-replay boundary
+                            // candidates (mmio-aligned + region
+                            // extension). Collected here, deduped
+                            // at evaluation: a clone finding that
+                            // duplicates a main-loop finding is
+                            // judged once, never twice.
+                            List<BoundaryAccess> tBnd =
+                                new ArrayList<BoundaryAccess>();
+                            List<BoundaryAccess> tBndExt =
+                                new ArrayList<BoundaryAccess>();
                             for (int ci = 0; ci < ops.size(); ci++) {
                                 Map<String, Bits> cb =
                                     (ci < g.fx.inStates.length) ?
@@ -13235,7 +13971,12 @@ public class ExtractIR extends GhidraScript {
                                 recordMustFindings(ops.get(ci), cb,
                                     mem, tMmio, tPortIo, tMsr,
                                     tBarRel, tMmioIds, tPortIds,
-                                    tMsrIds, tBarIds);
+                                    tMsrIds, tBarIds,
+                                    tBnd, tBndExt, bndProfile);
+                            }
+                            if (bndProfile != null) {
+                                bndAccesses.addAll(tBnd);
+                                bndAccesses.addAll(tBndExt);
                             }
                             for (int ti = 0; ti < tMmio.size(); ti++) {
                                 if (rMmioSet.add(tMmioIds.get(ti))) {
@@ -13507,6 +14248,23 @@ public class ExtractIR extends GhidraScript {
             totalMsr += msr.size();
             totalCopySites += copySites.size();
             totalBoundsFlagged += copyFlagged;
+            // Phase 4 V1: boundary judgment for this function.
+            // A failure here must not lose the function's MMIO
+            // findings (same discipline as the bounds scan).
+            if (bndProfile != null) {
+                try {
+                    BoundaryEval ber = evaluateBoundary(
+                        f.getName(), ops, bndAccesses, bndProfile);
+                    totalBoundaryChecked += ber.checked;
+                    totalBoundaryViolations += ber.violations;
+                    totalBoundaryUnknownAgent += ber.unknownAgent;
+                    totalBoundaryUnknownRegion += ber.unknownRegion;
+                    allBoundarySites.addAll(ber.siteJsons);
+                } catch (Exception e) {
+                    println("[!] boundary eval failed for " +
+                        f.getName() + ": " + e);
+                }
+            }
             for (BoundsSiteRec sr : copySites) {
                 allCopySites.add(sr.json);
             }
@@ -13641,6 +14399,63 @@ public class ExtractIR extends GhidraScript {
             }
         }
         w.println("  },");
+        // Phase 4 V1: boundary fields (design §7). Sites carry
+        // violations ONLY; compliant accesses are not emitted
+        // (same reason bounds emits sites but the verdict line
+        // carries the count). boundary_checked_total is the one
+        // additive field: without it, violations + unknown counts
+        // cannot prove how much was actually judged.
+        w.println("  \"boundary_regions\": [");
+        if (bndProfile != null) {
+            for (int bi = 0; bi < bndProfile.regions.size(); bi++) {
+                if (bi > 0) w.println(",");
+                w.print("    " + bndProfile.regions.get(bi).json());
+            }
+            w.println();
+        }
+        w.println("  ],");
+        w.println("  \"boundary_region_count\": " +
+            (bndProfile == null ? 0 : bndProfile.regions.size()) + ",");
+        w.println("  \"boundary_sites\": [");
+        for (int bi = 0; bi < allBoundarySites.size(); bi++) {
+            if (bi > 0) w.println(",");
+            w.print("    " + allBoundarySites.get(bi));
+        }
+        w.println();
+        w.println("  ],");
+        w.println("  \"boundary_violation_count\": " +
+            totalBoundaryViolations + ",");
+        w.println("  \"boundary_unknown_agent_total\": " +
+            totalBoundaryUnknownAgent + ",");
+        w.println("  \"boundary_unknown_region_total\": " +
+            totalBoundaryUnknownRegion + ",");
+        w.println("  \"boundary_checked_total\": " +
+            totalBoundaryChecked + ",");
+        if (bndProfile == null) {
+            w.println("  \"boundary_profile\": null,");
+        } else {
+            w.println("  \"boundary_profile\": {");
+            w.println("    \"source\": \"" + esc(bndProfile.source) + "\",");
+            w.println("    \"image_security_state\": " +
+                (bndProfile.imageSec == null ? "null" :
+                    "\"" + bndProfile.imageSec + "\"") + ",");
+            w.println("    \"image_privilege\": " +
+                (bndProfile.imagePriv == null ? "null" :
+                    "\"" + bndProfile.imagePriv + "\"") + ",");
+            w.println("    \"boundary_precedence\": \"" +
+                (bndProfile.highestWins ? "highest-wins" : "lowest-wins") +
+                "\",");
+            w.println("    \"mpu_privdefena\": " + bndProfile.mpuPrivdefena + ",");
+            if (bndProfile.hasDefault) {
+                w.println("    \"boundary_default_attribute\": " +
+                    "{\"domain\": \"" + bndProfile.defDomain +
+                    "\", \"min_privilege\": \"" + bndProfile.defPriv +
+                    "\"}");
+            } else {
+                w.println("    \"boundary_default_attribute\": null");
+            }
+            w.println("  },");
+        }
         w.println("  \"literal_scan\": {");
         w.println("    \"literal_count\": " + litScan.literalCount + ",");
         w.print("    \"attributed\": {");
@@ -13679,6 +14494,10 @@ public class ExtractIR extends GhidraScript {
             " msr=" + persiteExtraMsr + " bar=" + persiteExtraBar +
             ", skippedByIdentity=" + persiteSkippedIdent +
             ", replayMismatch=" + persiteReplayMismatch + ".");
+        println("[*] boundary: checked=" + totalBoundaryChecked +
+            " violations=" + totalBoundaryViolations +
+            " unknown_agent=" + totalBoundaryUnknownAgent +
+            " unknown_region=" + totalBoundaryUnknownRegion);
         println("[+] JSON Export Complete: " + outputJson +
             " (" + fnCount + " functions, " + strCount + " strings)");
     }

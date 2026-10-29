@@ -43,7 +43,7 @@ def printBlink (trace : List MmioAccess) : IO Bool := do
   IO.println s!"mode clear-then-set before LED: {mode}"
   pure (order && led && clock && mode)
 
-def printGeneric (lang : Option String) (windows : List (Nat × Nat)) (trace : List MmioAccess) (sites : List BoundsSite) : IO Bool := do
+def printGeneric (lang : Option String) (windows : List (Nat × Nat)) (trace : List MmioAccess) (sites : List BoundsSite) (bsites : List BoundarySite) (bUnknownAgent bUnknownRegion bRegionCount : Nat) : IO Bool := do
   let nonempty := !trace.isEmpty
   let masks := checkMasksConsistent trace
   let window := checkWindowBands windows trace
@@ -75,7 +75,17 @@ def printGeneric (lang : Option String) (windows : List (Nat × Nat)) (trace : L
       let bfs := match s.baseField with | some n => toString n | none => "none"
       s!"{s.func} {s.kind} {natToHex s.instr} (role {s.role}, offset arg {s.offsetArg}, base field {bfs}, no sound guard)"
     IO.println s!"bounds violations: {names}"
-  pure (nonempty && masks && window && sanity && confined && clock && bounds)
+  let boundary := checkBoundary bsites
+  IO.println s!"boundary (no must-proven access crossing a configured security boundary): {boundary}"
+  IO.println s!"boundary regions: {bRegionCount}"
+  let boundaryVios := boundaryViolations bsites
+  if !boundaryVios.isEmpty then
+    let names := boundaryVios.map fun s =>
+      s!"{s.func} {if s.kind == "write" then "write" else "read"} {natToHex s.addr} ({s.agent}, {s.region}, {s.kind}, {s.leg})"
+    IO.println s!"boundary violations: {names}"
+  IO.println s!"boundary unknown-agent accesses: {bUnknownAgent}"
+  IO.println s!"boundary unknown-region accesses: {bUnknownRegion}"
+  pure (nonempty && masks && window && sanity && confined && clock && bounds && boundary)
 
 def printBmp (trace : List MmioAccess) (mayTrace : List MmioAccess) : IO Bool := do
   let generic := checkGeneric trace
@@ -111,8 +121,14 @@ def main (args : List String) : IO UInt32 := do
           match extractBoundsSites j with
           | .error e => IO.println s!"bounds extract failed: {e}"; pure 1
           | .ok sites => do
+          match extractBoundarySites j with
+          | .error e => IO.println s!"boundary extract failed: {e}"; pure 1
+          | .ok bsites => do
           let lang := extractLanguage j
-          let ok ← if mode == "generic" then printGeneric lang windows trace sites
+          let bUnknownAgent := extractBoundaryCount j "boundary_unknown_agent_total"
+          let bUnknownRegion := extractBoundaryCount j "boundary_unknown_region_total"
+          let bRegionCount := extractBoundaryCount j "boundary_region_count"
+          let ok ← if mode == "generic" then printGeneric lang windows trace sites bsites bUnknownAgent bUnknownRegion bRegionCount
             else if mode == "bmp" then printBmp trace mayTrace
             else printBlink trace
           if ok then IO.println "VERDICT: PASS"; pure 0

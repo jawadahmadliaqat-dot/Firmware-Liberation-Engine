@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="1266" viewBox="0 0 1160 1266">
+<rect width="100%" height="100%" fill="#0d1117"/>
+<text x="24" y="24" font-family="DejaVu Sans Mono, monospace" font-size="15">
+<tspan x="24" dy="0" fill="#79c0ff">Phase 4 — security-boundary property  |  engine v3.19 + boundary</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4"> </tspan>
+<tspan x="24" dy="21" fill="#ffdf5d">$ lake exe ingest_check ns_phase4.json generic   (exit 1)</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">trace ops: 14</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">trace ops by kind (mmio, port, msr): (14, 0, 0)</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">may trace ops: 0</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">trace non-empty: true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">masks consistent (ones &amp; zeroes == 0): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">all addresses in MMIO window: true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">port/MSR sanity (port ≤ 0xFFFF, MSR index &lt; 2^32): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">port/MSR confinement (every port/MSR in the architectural allowlist): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">clock-enable (every used peripheral&#x27;s gate register touched): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">bounds (no computed-pointer copy/transfer with unsound-only guard): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">bounds sites: 0</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary (no must-proven access crossing a configured security boundary): false</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary regions: 5</tspan>
+<tspan x="24" dy="21" fill="#ffb86c">boundary violations: [ns_read_sec_periph read 0x40010000 (nonsecure-cpu, SEC_PERIPH, read, domain), ns_write_sec_periph write 0x40010004 (nonsecure-cpu, SEC_PERIPH, write, domain), ns_read_sec_ram read 0x30000000 (nonsecure-cpu, SEC_RAM, read, domain), user_write_privreg write 0x40012000 (nonsecure-unprivileged, PRIV_REG, write, privilege), dma_prog read 0x40010000 (dma, SEC_PERIPH, read, domain)]</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary unknown-agent accesses: 1</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary unknown-region accesses: 0</tspan>
+<tspan x="24" dy="21" fill="#ff7b72">VERDICT: FAIL</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4"> </tspan>
+<tspan x="24" dy="21" fill="#ffdf5d">$ lake exe ingest_check sec_phase4.json generic  (exit 0)</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">trace ops: 3</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">trace ops by kind (mmio, port, msr): (3, 0, 0)</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">may trace ops: 0</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">trace non-empty: true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">masks consistent (ones &amp; zeroes == 0): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">all addresses in MMIO window: true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">port/MSR sanity (port ≤ 0xFFFF, MSR index &lt; 2^32): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">port/MSR confinement (every port/MSR in the architectural allowlist): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">clock-enable (every used peripheral&#x27;s gate register touched): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">bounds (no computed-pointer copy/transfer with unsound-only guard): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">bounds sites: 0</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary (no must-proven access crossing a configured security boundary): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary regions: 5</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary unknown-agent accesses: 0</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary unknown-region accesses: 0</tspan>
+<tspan x="24" dy="21" fill="#7ee787">VERDICT: PASS</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4"> </tspan>
+<tspan x="24" dy="21" fill="#ffdf5d">$ lake exe ingest_check mpu_zephyr.json generic  (exit 1, boundary only)</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">trace ops: 215</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">trace ops by kind (mmio, port, msr): (215, 0, 0)</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">may trace ops: 4</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">trace non-empty: true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">masks consistent (ones &amp; zeroes == 0): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">all addresses in MMIO window: true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">port/MSR sanity (port ≤ 0xFFFF, MSR index &lt; 2^32): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">port/MSR confinement (every port/MSR in the architectural allowlist): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">clock-enable (every used peripheral&#x27;s gate register touched): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">bounds (no computed-pointer copy/transfer with unsound-only guard): true</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">bounds sites: 0</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary (no must-proven access crossing a configured security boundary): false</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary regions: 2</tspan>
+<tspan x="24" dy="21" fill="#ffb86c">boundary violations: [user_write_ppb write 0xe000ed0c (secure-unprivileged, PPB, write, privilege)]</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary unknown-agent accesses: 0</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4">boundary unknown-region accesses: 0</tspan>
+<tspan x="24" dy="21" fill="#ff7b72">VERDICT: FAIL</tspan>
+<tspan x="24" dy="21" fill="#d4d4d4"> </tspan>
+</text></svg>
