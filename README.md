@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.16-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.17-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -103,6 +103,29 @@ TOP-heavy provenance. Deliberately excluded from v2: DMA reload calls and
 command-address programming. Version bumped v3.15 -> v3.16 because report
 JSON gains a field and sites gain new kinds/roles.
 
+**v3.17 changes:** bounds wide-check now requires negative rejection. A
+64-bit check counts as a sound guard only when it also rejects negative
+offsets: zero-extending widening (the offset is converted to unsigned
+first, so negatives become huge and the sum check rejects them) or a
+signed offset-vs-0 check alongside the wide sum. Sign-extending widening
+alone flags again: the `wide_guarded` shape (`(unsigned long long)off + n
+> size` with signed `off`) lets off=-1, n=16 wrap to 15 and pass, copying
+one byte below base. The matcher distinguishes the widening form from the
+lowering (zero-fill `movs`/`adc` vs sign-propagating `asr`), and the EXT
+kinds split into ZEXT (sound) vs SEXT (unsound). Precision on the synthetic
+ground-truth corpus (now 16 cases, labeled, not real firmware): TP=8, FP=0,
+FN=0, TN=8 — `wide_guarded` flagged, zero-extending and signed+wide cases
+unflagged, partial idiom (compare + SBCS, no gating branch) flagged.
+CVE-2026-11743 pair unchanged: pre-fix FAILs naming both sites, fixed
+PASSes. Full regression exact on 36 targets, zero bounds flips. Pipeline
+hardening (no published number changes): every run now saves its full
+headless log, reinstalls verify the Ghidra tree instead of trusting the
+launcher, and a post-reinstall x86_blink canary (11 MMIO) fails loudly on a
+damaged install — after a fresh Ghidra install was found to silently lack
+Decompiler Switch Analysis and recover less code until diagnosed. Version
+bumped v3.16 -> v3.17 because guard semantics changed on the wide-check
+input class.
+
 **Clock-enable-before-use (Lean-side, generic mode; no extractor change, no
 JSON change, no new flags):** every MUST access to a mapped STM32 peripheral's
 register block requires a MUST STORE to that peripheral's clock-gate register
@@ -140,6 +163,9 @@ v3.15 bounds verdict on CVE-2026-11743 firmware (`lake exe ingest_check <report>
 
 ![BOUNDS v2 pre-fix FAIL vs fixed PASS](assets/screenshots/bounds_screenshot_v2.svg)
 v3.16 bounds verdict on the same CVE pair: pre-fix FAILs naming BOTH the read site (memcpy) and the write site (`flash_sf32lb_mpi_qspi_nor_write arch_dcache_invd_range 0x12018a62, no sound guard`); fixed firmware PASSes with both sites guarded.
+
+![BOUNDS v3 refinement: precision + CVE pair](assets/screenshots/bounds_screenshot_ref.svg)
+v3.17 bounds verdict on the same CVE pair (unchanged: pre-fix FAILs naming BOTH sites, fixed PASSes), plus the refined precision pane: `wide_guarded` flagged again (sign-extending, no negative rejection), zero-extending and signed+wide cases unflagged, TP=8 FP=0 FN=0 TN=8.
 
 ## Honest zeros
 

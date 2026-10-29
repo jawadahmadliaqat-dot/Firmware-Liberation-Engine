@@ -580,9 +580,15 @@ def checkClockEnable (trace : List MmioAccess) : Bool :=
     size field -- the CVE-2026-11743 check shape, which a negative
     offset wraps past. `soundGuard` = the extractor found a candidate
     sound guard before the call: "signed-check" (signed offset-vs-0
-    comparison), "wide-check" (ZEXT/SEXT-past-pointer-size range
-    check), or "guard-call" (a call to a helper containing a signed
-    ARG-vs-0 check, with a branch between it and the copy); "none"
+    comparison), "wide-check" (ZEXT-past-pointer-size range check;
+    v3 refinement: SEXT does NOT count -- a sign-extending widening
+    alone does not reject negative offsets), "guard-call" (a call
+    to a helper containing a signed ARG-vs-0 check, with a branch
+    between it and the copy), or "multiword-check" (bounds v3: a
+    64-bit range check lowered to 32-bit ARM as low-word unsigned
+    compare + SBCS with carry + carry-tested branch gating the
+    transfer; v3 refinement: the widening must be zero-extending
+    -- a sign-extending ASR widening alone is NOT sound); "none"
     otherwise. A site is FLAGGED iff unsoundCheck && soundGuard ==
     "none": the function tried to validate and did it in exactly the
     wrapping way, with no candidate sound guard anywhere before the

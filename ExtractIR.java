@@ -8208,10 +8208,13 @@ public class ExtractIR extends GhidraScript {
     // between ADD(ARG(n),X) and FIELD(structPtr,sizeOff) -- and no
     // sound guard: no signed INT_SLESS/INT_SLESSEQUAL between ARG(n)
     // and CONST 0, no wide (ZEXT/SEXT past pointer size) check of the
-    // same offset against the same struct's field, and no guard-call
+    // same offset against the same struct's field, no guard-call
     // (a direct CALL before the copy to a function that itself
     // contains a signed ARG-vs-0 comparison, with a CBRANCH between
-    // that call and the copy). Guard detection is deliberately
+    // that call and the copy), and no multi-word compare guard
+    // (bounds v3: low-word unsigned compare + SBCS with carry +
+    // carry-tested branch gating the transfer -- see
+    // boundsMultiwordGuard). Guard detection is deliberately
     // over-approximate (any candidate signed check suppresses), so a
     // FLAGGED site means not even a candidate sound guard exists in
     // the function. Sites with a computed pointer but no unsound
@@ -8223,7 +8226,7 @@ public class ExtractIR extends GhidraScript {
 
     /** Symbolic provenance expression for the bounds scan. */
     private static class BExpr {
-        // TOP, ARG, CONST, FIELD, ADD, SUB, EXT, ROOT (v3.16:
+        // TOP, ARG, CONST, FIELD, ADD, SUB, ZEXT, SEXT, ROOT (v3.16:
         // ARG(n) plus unknown loop accumulation -- produced ONLY
         // by the must-join of a value that IS ARG(n)/ROOT(n) with
         // a value containing ARG(n); see containsArgRoot. A path
@@ -8235,7 +8238,7 @@ public class ExtractIR extends GhidraScript {
         final BExpr base; // FIELD base, EXT inner, ADD/SUB left
         final BExpr other; // ADD/SUB right
         final long off; // FIELD offset
-        final int extSize; // EXT output size
+        final int extSize; // ZEXT/SEXT output size
         private BExpr(String k, int a, long c, BExpr b, BExpr o,
             long f, int e) {
             kind = k; argIdx = a; constVal = c; base = b; other = o;
@@ -8297,9 +8300,14 @@ public class ExtractIR extends GhidraScript {
             if (r.kind.equals("CONST") && r.constVal == 0) return l;
             return new BExpr("SUB", -1, 0, l, r, 0, 0);
         }
-        static BExpr ext(BExpr in, int sz) {
+        static BExpr ext(BExpr in, int sz, boolean zero) {
             if (in == TOP) return TOP;
-            return new BExpr("EXT", -1, 0, in, null, 0, sz);
+            // ZEXT and SEXT are distinct kinds (v3 refinement):
+            // only zero-extension is a sound wide guard; a
+            // sign-extending widening alone leaves small
+            // negatives unchecked, same as the ASR lowering.
+            return new BExpr(zero ? "ZEXT" : "SEXT",
+                -1, 0, in, null, 0, sz);
         }
         String key() {
             if (kind.equals("TOP")) return "TOP";
@@ -8309,8 +8317,8 @@ public class ExtractIR extends GhidraScript {
             if (kind.equals("FIELD")) {
                 return "F(" + base.key() + "," + off + ")";
             }
-            if (kind.equals("EXT")) {
-                return "EXT(" + base.key() + "," + extSize + ")";
+            if (kind.equals("ZEXT") || kind.equals("SEXT")) {
+                return kind + "(" + base.key() + "," + extSize + ")";
             }
             return kind + "(" + base.key() + "," + other.key() + ")";
         }
@@ -8325,12 +8333,15 @@ public class ExtractIR extends GhidraScript {
             if (other.equals(offsetArg)) return base;
             return null;
         }
-        /** True iff this expression contains EXT(offsetArg) wider
-            than pointer size (a 64-bit-style range check operand).
+        /** True iff this expression contains ZEXT(offsetArg)
+            wider than pointer size (a 64-bit-style range check
+            operand). SEXT does NOT count (v3 refinement): a
+            sign-extending widening alone does not reject
+            negative offsets, so it is not a sound wide guard.
             A ROOT base counts: a widened loop-carried offset is
             still the same argument's guard. */
         boolean containsWideExt(BExpr offsetArg, int ptrSize) {
-            if (kind.equals("EXT")) {
+            if (kind.equals("ZEXT")) {
                 return (base.equals(offsetArg) ||
                     (base.kind.equals("ROOT") &&
                      base.argIdx == offsetArg.argIdx)) &&
@@ -8526,6 +8537,381 @@ public class ExtractIR extends GhidraScript {
         return "other";
     }
 
+    /** Varnode identity key for matcher bookkeeping
+        (space:offset:size). Register-space keys are stable across
+        instructions (flag registers); unique-space keys are valid
+        only within one instruction group (temporaries never leak
+        across groups -- see boundsTransfer's unique stripping). */
+    private String boundsVnKey(Varnode v) {
+        if (v == null) return "null";
+        try {
+            return v.getAddress().getAddressSpace().getName() + ":" +
+                v.getOffset() + ":" + v.getSize();
+        } catch (Exception e) {
+            return "null";
+        }
+    }
+
+    /** Group-level reachability (BFS over grpSucc). Identity counts
+        as reachable (a fall-through group that IS the transfer's
+        group reaches it). */
+    private boolean boundsGroupReaches(List<List<Integer>> grpSucc,
+        int from, int to) {
+        if (from == to) return true;
+        java.util.Set<Integer> seen = new java.util.HashSet<Integer>();
+        java.util.ArrayDeque<Integer> q =
+            new java.util.ArrayDeque<Integer>();
+        seen.add(from);
+        q.add(from);
+        while (!q.isEmpty()) {
+            int u = q.remove();
+            for (int v : grpSucc.get(u)) {
+                if (v == to) return true;
+                if (seen.add(v)) q.add(v);
+            }
+        }
+        return false;
+    }
+
+    /** Multi-word compare guard (bounds v3). A 64-bit range check
+        on 32-bit ARM lowers to three consecutive instruction
+        groups: [low-word unsigned compare] + [SBCS with carry] +
+        [carry-tested branch gating the transfer]. The low compare
+        is the unsound shape itself (unsigned ADD(offset,X) vs the
+        same struct's size field); the SBCS group is recognised by
+        its lowering signature (INT_SBORROW + INT_LESS + BOOL_OR in
+        one group -- the cmp group has INT_SBORROW but no INT_LESS /
+        BOOL_OR, the ADC group has BOOL_OR but no INT_SBORROW /
+        INT_LESS, so the triple separates them); the branch group
+        must test the carry flag the SBCS wrote (found dynamically
+        as the COPY destination of the SBCS BOOL_OR output -- no
+        hardcoded flag offsets), and the transfer must be reachable
+        from exactly the carry-set (in-range) successor: bcc
+        (carry==0, taken = reject) with the transfer reachable only
+        from the fall-through, or bcs (carry==1, taken = in-range)
+        with the transfer reachable only from the branch target.
+        Returns "multiword-check" or null. The high-word dataflow
+        tie is the carry-flag chain (compare writes carry, SBCS
+        reads it, branch reads the SBCS carry) plus strict
+        adjacency -- not full high-word provenance, which is TOP
+        (ASR/ADC lower through flag registers the scan does not
+        track). A pathological unrelated SBCS chained on the
+        compare's carry could over-suppress (false negative
+        direction -- a missed flag, never a false flag). A lone
+        compare, a compare + SBCS without the gating branch, or a
+        branch that does not gate the transfer do NOT count.
+        Refinement: the idiom is a sound guard only if the
+        widened offset is zero-extended (boundsMultiwordWidening);
+        a sign-extending ASR widening alone vetoes the guard,
+        because it does not reject negative offsets. */
+    private String boundsMultiwordGuard(List<BoundsCmp> cmps,
+        List<OpRec> ops, int[] opGroup, List<Integer> grpStarts,
+        List<List<Integer>> grpSucc, Map<String, Integer> addrToGroup,
+        int callGroup, int offIdx, BExpr structBase) {
+        if (grpSucc == null) return null;
+        BExpr offRef = BExpr.arg(offIdx);
+        int nGroups = grpStarts.size();
+        for (BoundsCmp c : cmps) {
+            if (!c.isUnsigned()) continue;
+            // Same shape as the unsound check, duplicated from the
+            // site block deliberately: refactoring it would risk
+            // changing existing flag behaviour.
+            BExpr fld = null;
+            BExpr otherSide = c.a.addOtherSide(offRef);
+            if (otherSide != null && !otherSide.kind.equals("TOP") &&
+                c.b.kind.equals("FIELD") &&
+                c.b.base.equals(structBase)) {
+                fld = c.b;
+            } else if ((otherSide =
+                c.b.addOtherSide(offRef)) != null &&
+                !otherSide.kind.equals("TOP") &&
+                c.a.kind.equals("FIELD") &&
+                c.a.base.equals(structBase)) {
+                fld = c.a;
+            }
+            if (fld == null) continue;
+            int g0 = opGroup[c.idx];
+            int g1 = g0 + 1;
+            int g2 = g0 + 2;
+            int g3 = g0 + 3;
+            if (g1 >= nGroups || g2 >= nGroups || g3 >= nGroups) {
+                continue;
+            }
+            if (g1 >= callGroup || g2 >= callGroup) continue;
+            int s0 = grpStarts.get(g0);
+            int e0 = grpStarts.get(g0 + 1);
+            int s1 = grpStarts.get(g1);
+            int e1 = (g1 + 1 < nGroups) ?
+                grpStarts.get(g1 + 1) : ops.size();
+            int s2 = grpStarts.get(g2);
+            int e2 = (g2 + 1 < nGroups) ?
+                grpStarts.get(g2 + 1) : ops.size();
+            // SBCS signature in g1.
+            boolean hasSborrow = false, hasLess = false,
+                hasBoolOr = false;
+            for (int k = s1; k < e1; k++) {
+                String m = ops.get(k).mnem;
+                if (m.equals("INT_SBORROW")) hasSborrow = true;
+                else if (m.equals("INT_LESS")) hasLess = true;
+                else if (m.equals("BOOL_OR")) hasBoolOr = true;
+            }
+            if (!hasSborrow || !hasLess || !hasBoolOr) continue;
+            // Carry register written by g0's compare: COPY dst
+            // whose src is the compare op's output.
+            String cmpOut = boundsVnKey(ops.get(c.idx).out);
+            List<String> c1s = new ArrayList<String>();
+            for (int k = s0; k < e0; k++) {
+                OpRec o = ops.get(k);
+                if (o.mnem.equals("COPY") && o.ins.length >= 1 &&
+                    boundsVnKey(o.ins[0]).equals(cmpOut)) {
+                    c1s.add(boundsVnKey(o.out));
+                }
+            }
+            if (c1s.isEmpty()) continue;
+            // SBCS group must read that carry (carry chain).
+            boolean readsC1 = false;
+            for (int k = s1; k < e1 && !readsC1; k++) {
+                OpRec o = ops.get(k);
+                for (int t = 0; t < o.ins.length; t++) {
+                    if (c1s.contains(boundsVnKey(o.ins[t]))) {
+                        readsC1 = true;
+                        break;
+                    }
+                }
+            }
+            if (!readsC1) continue;
+            // Carry registers written by g1's SBCS: COPY dsts
+            // whose src is a BOOL_OR output in g1.
+            List<String> c2s = new ArrayList<String>();
+            for (int k = s1; k < e1; k++) {
+                OpRec o = ops.get(k);
+                if (!o.mnem.equals("BOOL_OR")) continue;
+                String boOut = boundsVnKey(o.out);
+                for (int j = s1; j < e1; j++) {
+                    OpRec cp = ops.get(j);
+                    if (cp.mnem.equals("COPY") && cp.ins.length >= 1 &&
+                        boundsVnKey(cp.ins[0]).equals(boOut)) {
+                        c2s.add(boundsVnKey(cp.out));
+                    }
+                }
+            }
+            if (c2s.isEmpty()) continue;
+            // Branch group g2: CBRANCH testing a C2 flag, with the
+            // branch direction + reachability gating the transfer.
+            Integer branchK = null;
+            Long branchTarget = null;
+            for (int k = s2; k < e2 && branchK == null; k++) {
+                OpRec o = ops.get(k);
+                if (!o.mnem.equals("CBRANCH") || o.ins.length < 2) {
+                    continue;
+                }
+                String condKey = boundsVnKey(o.ins[1]);
+                for (int j = s2; j < e2; j++) {
+                    OpRec e = ops.get(j);
+                    if (!(e.mnem.equals("INT_EQUAL") ||
+                        e.mnem.equals("INT_NOTEQUAL"))) continue;
+                    if (!boundsVnKey(e.out).equals(condKey)) continue;
+                    if (e.ins.length < 2) continue;
+                    String l = boundsVnKey(e.ins[0]);
+                    String r = boundsVnKey(e.ins[1]);
+                    boolean isEq = e.mnem.equals("INT_EQUAL");
+                    for (String c2 : c2s) {
+                        long cv = -1;
+                        boolean ok = false;
+                        if (l.equals(c2) && e.ins[1].isConstant()) {
+                            cv = e.ins[1].getOffset();
+                            ok = true;
+                        } else if (r.equals(c2) &&
+                            e.ins[0].isConstant()) {
+                            cv = e.ins[0].getOffset();
+                            ok = true;
+                        }
+                        if (!ok) continue;
+                        if (isEq && cv == 0) branchK = 0;
+                        else if (isEq && cv == 1) branchK = 1;
+                        else if (!isEq && cv == 0) branchK = 1;
+                        else if (!isEq && cv == 1) branchK = 0;
+                        else continue;
+                        branchTarget = o.ins[0].getOffset();
+                        break;
+                    }
+                    if (branchK != null) break;
+                }
+            }
+            if (branchK == null || branchTarget == null) continue;
+            Integer tgtGroup =
+                addrToGroup.get(isa.formatCodeAddress(branchTarget));
+            if (tgtGroup == null) {
+                tgtGroup = addrToGroup.get(isa.formatCodeAddress(
+                    isa.stripInstructionTag(branchTarget)));
+            }
+            if (tgtGroup == null) continue;
+            boolean reachFall =
+                boundsGroupReaches(grpSucc, g3, callGroup);
+            boolean reachTgt =
+                boundsGroupReaches(grpSucc, tgtGroup, callGroup);
+            if ((branchK == 0 && reachFall && !reachTgt) ||
+                (branchK == 1 && reachTgt && !reachFall)) {
+                // Widening refinement (v3 refinement): the idiom
+                // is a sound guard ONLY if the widened offset is
+                // zero-extended. A sign-extending widening (ASR
+                // by 31 / SEXT) alone does not reject negative
+                // offsets (off=-1, n=16 wraps to a small sum),
+                // so it vetoes the guard (try the next compare);
+                // an unrecognised widening vetoes too -- only a
+                // proven zero-fill suppresses a flag.
+                if (!boundsMultiwordWidening(ops, grpStarts, g0)
+                    .equals("ZERO")) continue;
+                return "multiword-check";
+            }
+        }
+        return null;
+    }
+
+    /** Widening classification for a multi-word guard (bounds v3
+        refinement). The 64-bit sum's high word is computed by an
+        ADC group (BOOL_OR without INT_SBORROW/INT_LESS, found by
+        scanning back from the low-compare group, bounded to 8
+        groups -- the ADC precedes the compare it feeds). In that
+        group, a high-word add is an INT_ADD consuming no
+        intra-group INT_ADD output and no carry extension (a
+        carry-add consumes a partial sum or the carry, and tracing
+        through it would veto every guard); each high-word add
+        input is traced back through COPY chains to its defining
+        op (see boundsTraceWidening). Returns "ZERO"
+        only if every traced high-word input is ZERO; "SIGN" if
+        any input is SIGN; "UNKNOWN" otherwise. The caller vetoes
+        the guard unless the result is "ZERO": a sign-extending
+        widening alone does not reject negative offsets, and an
+        unrecognised widening must not be claimed sound.
+        Fail-safe direction: misidentifying the ADC group, or
+        hitting an unrecognised input, yields UNKNOWN (veto ->
+        flag), never a false sound verdict. */
+    private String boundsMultiwordWidening(List<OpRec> ops,
+        List<Integer> grpStarts, int g0) {
+        int adc = -1;
+        for (int g = g0 - 1; g >= 0 && g >= g0 - 8; g--) {
+            boolean hasOr = false, hasSborrow = false,
+                hasLess = false;
+            int s = grpStarts.get(g);
+            int e = (g + 1 < grpStarts.size()) ?
+                grpStarts.get(g + 1) : ops.size();
+            for (int k = s; k < e; k++) {
+                String m = ops.get(k).mnem;
+                if (m.equals("BOOL_OR")) hasOr = true;
+                if (m.equals("INT_SBORROW")) hasSborrow = true;
+                if (m.equals("INT_LESS")) hasLess = true;
+            }
+            if (hasOr && !hasSborrow && !hasLess) {
+                adc = g;
+                break;
+            }
+        }
+        if (adc < 0) return "UNKNOWN";
+        int s = grpStarts.get(adc);
+        int e = (adc + 1 < grpStarts.size()) ?
+            grpStarts.get(adc + 1) : ops.size();
+        // Carry extensions: INT_ZEXT outputs whose input is a
+        // 1-byte flag varnode. A pure high-word add consumes only
+        // original values (registers/consts defined before the
+        // group, or intra-group COPYs of consts); a carry-add
+        // consumes a partial sum (an intra-group INT_ADD output)
+        // or a carry extension, and tracing THROUGH it would hit
+        // the INT_ADD definition itself (UNKNOWN) and veto every
+        // guard. So an INT_ADD counts as a high-word add only if
+        // none of its inputs is an intra-group INT_ADD output or
+        // a carry extension.
+        java.util.Set<String> carryExt =
+            new java.util.HashSet<String>();
+        java.util.Set<String> addOuts =
+            new java.util.HashSet<String>();
+        for (int k = s; k < e; k++) {
+            OpRec o = ops.get(k);
+            if (o.mnem.equals("INT_ZEXT") && o.ins != null &&
+                o.ins.length >= 1 && o.ins[0] != null &&
+                o.ins[0].getSize() == 1 && o.out != null) {
+                carryExt.add(boundsVnKey(o.out));
+            }
+            if (o.mnem.equals("INT_ADD") && o.out != null) {
+                addOuts.add(boundsVnKey(o.out));
+            }
+        }
+        boolean sawAdd = false;
+        boolean sawSign = false;
+        boolean sawUnknown = false;
+        for (int k = s; k < e; k++) {
+            OpRec o = ops.get(k);
+            if (!o.mnem.equals("INT_ADD") || o.ins == null) continue;
+            boolean carryAdd = false;
+            for (Varnode in : o.ins) {
+                if (in != null &&
+                    (carryExt.contains(boundsVnKey(in)) ||
+                     addOuts.contains(boundsVnKey(in)))) {
+                    carryAdd = true;
+                    break;
+                }
+            }
+            if (carryAdd) continue;
+            sawAdd = true;
+            for (Varnode in : o.ins) {
+                if (in == null) continue;
+                String r = boundsTraceWidening(ops, k, in);
+                if (r.equals("SIGN")) sawSign = true;
+                else if (!r.equals("ZERO")) sawUnknown = true;
+            }
+        }
+        if (!sawAdd) return "UNKNOWN";
+        if (sawSign) return "SIGN";
+        if (sawUnknown) return "UNKNOWN";
+        return "ZERO";
+    }
+
+    /** Trace one widening input back through COPY chains.
+        fromIdx is the using op's index; the walk covers all ops
+        before it in this function. Returns "SIGN", "ZERO", or
+        "UNKNOWN". A CALL/CALLIND between use and definition
+        yields UNKNOWN (a call would clobber a caller-saved high
+        word, so the pre-call definition is not the value used).
+        INT_SRIGHT is SIGN only when the shift is the sign bit
+        (input size * 8 - 1: 31 for a 32-bit widening); any other
+        defining op (ADD, LOAD, call return, ...) is UNKNOWN. */
+    private String boundsTraceWidening(List<OpRec> ops, int fromIdx,
+        Varnode start) {
+        if (start == null) return "UNKNOWN";
+        if (start.isConstant()) {
+            return start.getOffset() == 0 ? "ZERO" : "UNKNOWN";
+        }
+        String cur = boundsVnKey(start);
+        for (int k = fromIdx - 1; k >= 0; k--) {
+            OpRec o = ops.get(k);
+            if (o.mnem.equals("CALL") || o.mnem.equals("CALLIND")) {
+                return "UNKNOWN";
+            }
+            if (o.out == null) continue;
+            if (!boundsVnKey(o.out).equals(cur)) continue;
+            if (o.mnem.equals("COPY") && o.ins != null &&
+                o.ins.length == 1 && o.ins[0] != null) {
+                if (o.ins[0].isConstant()) {
+                    return o.ins[0].getOffset() == 0 ?
+                        "ZERO" : "UNKNOWN";
+                }
+                cur = boundsVnKey(o.ins[0]);
+                continue;
+            }
+            if (o.mnem.equals("INT_SRIGHT") && o.ins != null &&
+                o.ins.length >= 2 && o.ins[0] != null &&
+                o.ins[1] != null && o.ins[1].isConstant() &&
+                o.ins[1].getOffset() ==
+                    o.ins[0].getSize() * 8 - 1) {
+                return "SIGN";
+            }
+            if (o.mnem.equals("INT_SEXT")) return "SIGN";
+            if (o.mnem.equals("INT_ZEXT")) return "ZERO";
+            return "UNKNOWN";
+        }
+        return "UNKNOWN";
+    }
+
     private Map<String, BExpr> boundsTransfer(Map<String, BExpr> in,
         OpRec op, long[] saved, boolean stripUniques) {
         Map<String, BExpr> prov = new HashMap<String, BExpr>(in);
@@ -8571,7 +8957,7 @@ public class ExtractIR extends GhidraScript {
                 op.ins.length == 1) {
                 boundsPut(op.out,
                     BExpr.ext(boundsProvOf(op.ins[0], prov),
-                        op.out.getSize()),
+                        op.out.getSize(), mnem.equals("INT_ZEXT")),
                     prov);
             } else {
                 boundsPut(op.out, BExpr.TOP, prov);
@@ -8789,6 +9175,43 @@ public class ExtractIR extends GhidraScript {
         } catch (Exception e) {
             ptrSize = 4;
         }
+        // Instruction-group maps for the multi-word guard check
+        // (bounds v3): op index -> group index, group start op
+        // indices, group-level successors from buildSucc, and
+        // group-start address -> group index. If buildSucc failed
+        // (succ == null), grpSucc stays null and the multi-word
+        // guard is disabled (miss direction).
+        int[] opGroup = new int[n];
+        List<Integer> grpStarts = new ArrayList<Integer>();
+        for (int i = 0; i < n; i++) {
+            if (isInstrStart[i]) grpStarts.add(i);
+            opGroup[i] = grpStarts.size() - 1;
+        }
+        Map<String, Integer> addrToGroup = new HashMap<String, Integer>();
+        for (int g = 0; g < grpStarts.size(); g++) {
+            addrToGroup.put(
+                ops.get(grpStarts.get(g)).instrAddr.toString(), g);
+        }
+        List<List<Integer>> grpSucc = null;
+        if (succ != null) {
+            grpSucc = new ArrayList<List<Integer>>();
+            for (int g = 0; g < grpStarts.size(); g++) {
+                grpSucc.add(new ArrayList<Integer>());
+            }
+            for (int g = 0; g < grpStarts.size(); g++) {
+                int gs = grpStarts.get(g);
+                int ge = (g + 1 < grpStarts.size()) ?
+                    grpStarts.get(g + 1) : n;
+                java.util.Set<Integer> ss =
+                    new java.util.HashSet<Integer>();
+                for (int i = gs; i < ge; i++) {
+                    for (int s : succ.get(i)) {
+                        if (s >= 0 && s < n) ss.add(opGroup[s]);
+                    }
+                }
+                grpSucc.get(g).addAll(ss);
+            }
+        }
         List<BoundsCall> calls = new ArrayList<BoundsCall>();
         List<Integer> cbranchIdx = new ArrayList<Integer>();
         // Phase 2 walks instruction by instruction: the working map
@@ -8982,6 +9405,19 @@ public class ExtractIR extends GhidraScript {
                                 }
                                 if (!guard.equals("none")) break;
                             }
+                        }
+                        // Multi-word compare guard (bounds v3):
+                        // last, so existing guard behaviour is
+                        // preserved exactly when an earlier guard
+                        // fires; skipped in the pre-pass (which
+                        // ignores sites) via the null check.
+                        if (guard.equals("none") &&
+                            signedCheckByEntry != null) {
+                            String mw = boundsMultiwordGuard(res.cmps,
+                                ops, opGroup, grpStarts, grpSucc,
+                                addrToGroup, opGroup[i], offIdx,
+                                structBase);
+                            if (mw != null) guard = mw;
                         }
                         boolean flagged = unsound &&
                             guard.equals("none");
@@ -9226,7 +9662,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.16\",");
+        w.println("  \"extractor_version\": \"v3.17\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped

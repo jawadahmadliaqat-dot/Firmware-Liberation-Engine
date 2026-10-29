@@ -2,6 +2,7 @@ import os
 import subprocess
 import json
 import sys
+import datetime
 
 # System Parameters & Resource Limits
 # Overridable so anyone can run this on their own Linux box:
@@ -27,6 +28,30 @@ def sync_from_gdrive(filename):
         return False
     print("[+] Download complete.")
     return True
+
+def save_headless_log(binary_name, stdout, stderr):
+    """Saves the COMPLETE headless log for one target run.
+
+    HARDENING (Oct 29, 2026 drift): the old code printed only the last
+    500 chars of stdout and archived nothing, so the Oct 29 analyzer
+    loss was un-diagnosable retroactively (a one-line
+    "Decompiler Switch Analysis" presence check in a saved log would
+    have caught it immediately). Every run now saves its full log to
+    headless_logs/<binary>_<timestamp>.log; the console still shows
+    only the short tail.
+    """
+    log_dir = f"{LOCAL_WORKSPACE}/headless_logs"
+    os.makedirs(log_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe = os.path.basename(binary_name)
+    log_path = f"{log_dir}/{safe}_{stamp}.log"
+    with open(log_path, "w") as f:
+        f.write("=== STDOUT ===\n")
+        f.write(stdout or "")
+        f.write("\n=== STDERR ===\n")
+        f.write(stderr or "")
+    print(f"[*] Full headless log saved to {log_path}")
+    return log_path
 
 def run_ghidra_analysis(binary_name, project_name="PoC_Project"):
     """Runs Ghidra Headless within strict -Xmx2G heap limits"""
@@ -58,10 +83,12 @@ def run_ghidra_analysis(binary_name, project_name="PoC_Project"):
     try:
         process = subprocess.run(ghidra_cmd, env=env, capture_output=True, text=True, timeout=300)
         print("[+] Ghidra Analysis Finished.")
-        print(process.stdout[-500:]) # Print tail of log
+        save_headless_log(binary_name, process.stdout, process.stderr)
+        print(process.stdout[-500:]) # Print tail of log (console stays short)
         return True
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         print("[!] Ghidra timed out.")
+        save_headless_log(binary_name, e.stdout or "", e.stderr or "")
         return False
     except Exception as e:
         print(f"[!] Analysis failed: {e}")

@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="1660" viewBox="0 0 1020 1660">
+<rect x="0" y="0" width="1020" height="1660" fill="#0b0d10"/>
+<rect x="16" y="58" width="988" height="724" rx="10" fill="#111318" stroke="#333646"/>
+<rect x="16" y="794" width="988" height="416" rx="10" fill="#111318" stroke="#333646"/>
+<rect x="16" y="1222" width="988" height="350" rx="10" fill="#111318" stroke="#333646"/>
+<text x="16" y="34" font-family="monospace" font-size="17" font-weight="bold" fill="#ffffff">Bounds v3 refinement — wide-check must also reject negatives</text>
+<text x="32" y="84" font-family="monospace" font-size="15" font-weight="bold" fill="#e8e8e8">PRECISION CORPUS — 16 cases (refined: TP=8 FP=0 FN=0 TN=8)</text>
+<text x="32" y="108" font-family="monospace" font-size="11" fill="#9a9a9a">$ python3 v25-bounds-v2/precision/score_precision.py</text>
+<text x="32" y="136" font-family="monospace" font-size="12.5" fill="#e8e8e8">version: v3.16 | sites: 13 | flagged: 8</text>
+<!-- VERBATIM: forms: {"total_transfer_calls": 16, "memcpy": {"site": 9, "plain_arg": 11, "field_only": 0, "const": 1, "top": 1, "other": 0}, "memmove": {"site": 1, "plain_arg": 1, "field_only": 0, "const": 0, "top": 0, "other": 0}, "cache": {"site": 3, "plain_arg": 1, "field_only": 0, "const": 0, "top": 0, "other": 0}} -->
+<text x="32" y="158" font-family="monospace" font-size="12.5" fill="#e8e8e8">forms: {"total_transfer_calls": 16, "memcpy": {"site": 9, "plain_arg": 11, "field_only": 0, "const": 1, "top": 1, "other</text>
+<text x="32" y="180" font-family="monospace" font-size="12.5" fill="#e8e8e8">": 0}, "memmove": {"site": 1, "plain_arg": 1, "field_only": 0, "const": 0, "top": 0, "other": 0}, "cache": {"site": 3, "</text>
+<text x="32" y="202" font-family="monospace" font-size="12.5" fill="#e8e8e8">plain_arg": 1, "field_only": 0, "const": 0, "top": 0, "other": 0}}</text>
+<text x="32" y="224" font-family="monospace" font-size="12.5" fill="#e8e8e8">TP       unvalidated_src                  expect=FLAG   :: 0x8000140 memcpy/src unsound=True guard=none flagged=True</text>
+<text x="32" y="246" font-family="monospace" font-size="12.5" fill="#e8e8e8">TP       unvalidated_dst                  expect=FLAG   :: 0x8000164 memcpy/dst unsound=True guard=none flagged=True</text>
+<text x="32" y="268" font-family="monospace" font-size="12.5" fill="#e8e8e8">TP       unvalidated_memmove              expect=FLAG   :: 0x800018c memmove/src unsound=True guard=none flagged=True</text>
+<text x="32" y="290" font-family="monospace" font-size="12.5" fill="#e8e8e8">TN       caller_validated                 expect=NOFLAG :: 0x80001a4 memcpy/src unsound=False guard=none flagged=False</text>
+<text x="32" y="312" font-family="monospace" font-size="12.5" fill="#e8e8e8">TP       unsigned_only_caller_validated   expect=FLAG   :: 0x80001ec memcpy/src unsound=True guard=none flagged=True</text>
+<text x="32" y="334" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       wide_guarded                     expect=FLAG   :: 0x8000246 memcpy/src unsound=True guard=none flagged=True</text>
+<!-- VERBATIM: TN       wide_zero_guarded                expect=NOFLAG :: 0x8000276 memcpy/src unsound=True guard=multiword-check flagged=False -->
+<text x="32" y="356" font-family="monospace" font-size="12.5" fill="#4ade80">TN       wide_zero_guarded                expect=NOFLAG :: 0x8000276 memcpy/src unsound=True guard=multiword-check flagg</text>
+<text x="32" y="378" font-family="monospace" font-size="12.5" fill="#4ade80">ed=False</text>
+<!-- VERBATIM: TN       wide_signed_guarded              expect=NOFLAG :: 0x80002ae memcpy/src unsound=True guard=signed-check flagged=False -->
+<text x="32" y="400" font-family="monospace" font-size="12.5" fill="#4ade80">TN       wide_signed_guarded              expect=NOFLAG :: 0x80002ae memcpy/src unsound=True guard=signed-check flagged=</text>
+<text x="32" y="422" font-family="monospace" font-size="12.5" fill="#4ade80">False</text>
+<text x="32" y="444" font-family="monospace" font-size="12.5" fill="#ffb86b">TP       wide_nogate                      expect=FLAG   :: 0x80002ec memcpy/src unsound=True guard=none flagged=True</text>
+<!-- VERBATIM: TN       guardcall_guarded                expect=NOFLAG :: 0x800031e memcpy/src unsound=False guard=guard-call flagged=False -->
+<text x="32" y="466" font-family="monospace" font-size="12.5" fill="#e8e8e8">TN       guardcall_guarded                expect=NOFLAG :: 0x800031e memcpy/src unsound=False guard=guard-call flagged=F</text>
+<text x="32" y="488" font-family="monospace" font-size="12.5" fill="#e8e8e8">alse</text>
+<text x="32" y="510" font-family="monospace" font-size="12.5" fill="#e8e8e8">TN       plain_ptr                        expect=NOSITE :: (no site)</text>
+<text x="32" y="532" font-family="monospace" font-size="12.5" fill="#e8e8e8">TN       const_ptr                        expect=NOSITE :: (no site)</text>
+<!-- VERBATIM: TP       invd_straight                    expect=FLAG   :: 0x800035c arch_dcache_invd_range/addr unsound=True guard=none flagged=True -->
+<text x="32" y="554" font-family="monospace" font-size="12.5" fill="#e8e8e8">TP       invd_straight                    expect=FLAG   :: 0x800035c arch_dcache_invd_range/addr unsound=True guard=none</text>
+<text x="32" y="576" font-family="monospace" font-size="12.5" fill="#e8e8e8"> flagged=True</text>
+<!-- VERBATIM: TP       invd_loop                        expect=FLAG   :: 0x800038c arch_dcache_invd_range/addr unsound=True guard=none flagged=True -->
+<text x="32" y="598" font-family="monospace" font-size="12.5" fill="#e8e8e8">TP       invd_loop                        expect=FLAG   :: 0x800038c arch_dcache_invd_range/addr unsound=True guard=none</text>
+<text x="32" y="620" font-family="monospace" font-size="12.5" fill="#e8e8e8"> flagged=True</text>
+<!-- VERBATIM: TN       invd_guarded_loop                expect=NOFLAG :: 0x80003c2 arch_dcache_invd_range/addr unsound=True guard=signed-check flagged=False -->
+<text x="32" y="642" font-family="monospace" font-size="12.5" fill="#e8e8e8">TN       invd_guarded_loop                expect=NOFLAG :: 0x80003c2 arch_dcache_invd_range/addr unsound=True guard=sign</text>
+<text x="32" y="664" font-family="monospace" font-size="12.5" fill="#e8e8e8">ed-check flagged=False</text>
+<text x="32" y="686" font-family="monospace" font-size="12.5" fill="#e8e8e8">TN       invd_plain                       expect=NOSITE :: (no site)</text>
+<text x="32" y="708" font-family="monospace" font-size="12.5" fill="#4ade80">TP=8 FP=0 FN=0 TN=8 UNTESTED=0 SITE-FP=0</text>
+<!-- VERBATIM: NOTE: unsigned_only_caller_validated counts TP by property semantics; vs exploitability it is 1 flag-by-design (caller validates) — see design-v2.md §5.2. -->
+<text x="32" y="730" font-family="monospace" font-size="12.5" fill="#e8e8e8">NOTE: unsigned_only_caller_validated counts TP by property semantics; vs exploitability it is 1 flag-by-design (caller v</text>
+<text x="32" y="752" font-family="monospace" font-size="12.5" fill="#e8e8e8">alidates) — see design-v2.md §5.2.</text>
+<text x="32" y="820" font-family="monospace" font-size="15" font-weight="bold" fill="#e8e8e8">CVE PRE-FIX (vulnerable, unchanged verdict)</text>
+<text x="32" y="844" font-family="monospace" font-size="11" fill="#9a9a9a">$ lake exe ingest_check ../analysis_reports/sf32lb_qspi_prefx.elf_report.json generic  (from lean/)</text>
+<text x="32" y="872" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops: 56</text>
+<text x="32" y="894" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops by kind (mmio, port, msr): (56, 0, 0)</text>
+<text x="32" y="916" font-family="monospace" font-size="12.5" fill="#e8e8e8">may trace ops: 0</text>
+<text x="32" y="938" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace non-empty: true</text>
+<text x="32" y="960" font-family="monospace" font-size="12.5" fill="#e8e8e8">masks consistent (ones &amp; zeroes == 0): true</text>
+<text x="32" y="982" font-family="monospace" font-size="12.5" fill="#e8e8e8">all addresses in MMIO window: true</text>
+<text x="32" y="1004" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR sanity (port ≤ 0xFFFF, MSR index &lt; 2^32): true</text>
+<text x="32" y="1026" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR confinement (every port/MSR in the architectural allowlist): true</text>
+<text x="32" y="1048" font-family="monospace" font-size="12.5" fill="#e8e8e8">clock-enable (every used peripheral's gate register touched): true</text>
+<text x="32" y="1070" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds (no computed-pointer copy/transfer with unsound-only guard): false</text>
+<text x="32" y="1092" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds sites: 3</text>
+<!-- VERBATIM: bounds violations: [flash_sf32lb_mpi_qspi_nor_write arch_dcache_invd_range 0x12018a62 (role addr, offset arg 1, base field 4, no sound guard), flash_sf32lb_mpi_qspi_nor_read memcpy 0x1201d1d6 (role src, offset arg 1, base field 4, no sound guard)] -->
+<text x="32" y="1114" font-family="monospace" font-size="12.5" fill="#ffb86b">bounds violations: [flash_sf32lb_mpi_qspi_nor_write arch_dcache_invd_range 0x12018a62 (role addr, offset arg 1, base fie</text>
+<text x="32" y="1136" font-family="monospace" font-size="12.5" fill="#ffb86b">ld 4, no sound guard), flash_sf32lb_mpi_qspi_nor_read memcpy 0x1201d1d6 (role src, offset arg 1, base field 4, no sound </text>
+<text x="32" y="1158" font-family="monospace" font-size="12.5" fill="#ffb86b">guard)]</text>
+<text x="32" y="1180" font-family="monospace" font-size="12.5" fill="#ff5a5a">VERDICT: FAIL</text>
+<text x="32" y="1248" font-family="monospace" font-size="15" font-weight="bold" fill="#e8e8e8">CVE FIXED (909eb56, unchanged verdict)</text>
+<text x="32" y="1272" font-family="monospace" font-size="11" fill="#9a9a9a">$ lake exe ingest_check ../analysis_reports/sf32lb_qspi_fixed.elf_report.json generic  (from lean/)</text>
+<text x="32" y="1300" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops: 56</text>
+<text x="32" y="1322" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace ops by kind (mmio, port, msr): (56, 0, 0)</text>
+<text x="32" y="1344" font-family="monospace" font-size="12.5" fill="#e8e8e8">may trace ops: 0</text>
+<text x="32" y="1366" font-family="monospace" font-size="12.5" fill="#e8e8e8">trace non-empty: true</text>
+<text x="32" y="1388" font-family="monospace" font-size="12.5" fill="#e8e8e8">masks consistent (ones &amp; zeroes == 0): true</text>
+<text x="32" y="1410" font-family="monospace" font-size="12.5" fill="#e8e8e8">all addresses in MMIO window: true</text>
+<text x="32" y="1432" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR sanity (port ≤ 0xFFFF, MSR index &lt; 2^32): true</text>
+<text x="32" y="1454" font-family="monospace" font-size="12.5" fill="#e8e8e8">port/MSR confinement (every port/MSR in the architectural allowlist): true</text>
+<text x="32" y="1476" font-family="monospace" font-size="12.5" fill="#e8e8e8">clock-enable (every used peripheral's gate register touched): true</text>
+<text x="32" y="1498" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds (no computed-pointer copy/transfer with unsound-only guard): true</text>
+<text x="32" y="1520" font-family="monospace" font-size="12.5" fill="#e8e8e8">bounds sites: 3</text>
+<text x="32" y="1542" font-family="monospace" font-size="12.5" fill="#4ade80">VERDICT: PASS</text>
+<text x="16" y="1584" font-family="monospace" font-size="12.5" fill="#9a9a9a">Refined: wide_guarded FLAGGED again (sign-extending, no negative rejection);</text>
+<text x="16" y="1604" font-family="monospace" font-size="12.5" fill="#9a9a9a">wide_zero_guarded TN via multiword-check (zero-fill); wide_signed_guarded TN via signed-check;</text>
+<text x="16" y="1624" font-family="monospace" font-size="12.5" fill="#9a9a9a">wide_nogate TP (partial idiom, no gate).</text>
+<text x="16" y="1644" font-family="monospace" font-size="12.5" fill="#9a9a9a">CVE pair unchanged: pre-fix FAIL still names BOTH sites (read memcpy + write cache-invalidate); fixed still PASS.</text>
+</svg>
