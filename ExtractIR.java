@@ -1,5 +1,8 @@
 import ghidra.app.script.GhidraScript;
+import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
@@ -9,6 +12,8 @@ import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.symbol.ExternalLocation;
 import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.lang.RegisterValue;
+import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolIterator;
 import java.io.FileWriter;
 import java.io.PrintWriter;
@@ -743,12 +748,24 @@ public class ExtractIR extends GhidraScript {
             return String.format("%08x", addr);
         }
         public boolean isMmioAddress(long addr) {
-            // ARM Cortex-M peripheral region.
-            return addr >= 0x40000000L && addr < 0x60000000L;
+            // ARM Cortex-M peripheral region, plus the two
+            // RP2040 blocks that live outside it (Phase 3
+            // item 6, profile bounds from the RP2040 SVD
+            // profile: SIO 0xD0000000-0xD0000180, SSI
+            // 0x18000000-0x180000FC). A window extension is
+            // sound in the must direction (it can only ADD
+            // recordings for addresses the code provably
+            // touches); the regression measures whether any
+            // non-RP2040 ARM target touches these ranges.
+            return (addr >= 0x40000000L && addr < 0x60000000L) ||
+                (addr >= 0xD0000000L && addr < 0xD0000180L) ||
+                (addr >= 0x18000000L && addr < 0x18000100L);
         }
         public List<long[]> mmioWindows() {
             List<long[]> wins = new ArrayList<long[]>();
             wins.add(new long[] {0x40000000L, 0x60000000L});
+            wins.add(new long[] {0xD0000000L, 0xD0000180L});
+            wins.add(new long[] {0x18000000L, 0x18000100L});
             return wins;
         }
         public int fallthroughIndex(List<OpRec> ops, int i) {
@@ -5975,6 +5992,113 @@ public class ExtractIR extends GhidraScript {
         effect (CF8 address + CFC data, verified against this
         corpus's host bridge driver). Everything else returns null
         (edge only, never a fabricated access). */
+    /** v3.19 Phase 3 item 1: TDX tdcall-IO-read wrapper detection.
+        A function G is a tdcall-IO-read wrapper of size s iff:
+        (i) G contains NO CALLOTHER IN/OUT (a raw path would
+        already be recorded -- this gate keeps the IoWrite16/32
+        and IoRead32 helpers, which also call the tdcall
+        trampoline with leaf 0x1e, from double-counting);
+        (ii) G contains a direct CALL whose preceding constant
+        assignment to the first Windows-x64 argument register
+        (RCX, offset 0x8) is 0x1e (the TDX VP.VMCALL IO subleaf)
+        and whose preceding constant assignment to the second
+        argument register (RDX, offset 0x10) is s in {1,2,4};
+        (iii) G forwards its first argument register to R9
+        (offset 0x88) with a COPY before that CALL (the
+        trampoline's port slot, cf. EDK2 TdVmCall IO);
+        (iv) G returns a value loaded from memory after that
+        CALL (a LOAD whose output is COPY'd to the return
+        register, offset 0x0, with size s).
+        Ghidra lifts `tdcall` to NO pcode ops, so the trampoline
+        itself can never be recorded as a CALLOTHER IN/OUT --
+        the wrapper shape is the only observable. Returns the
+        size, or null when G is not such a wrapper. x86-64
+        Windows convention only; anything else fails closed. */
+    private static Integer tdcallReadSize(List<OpRec> ops) {
+        for (int i = 0; i < ops.size(); i++) {
+            OpRec op = ops.get(i);
+            if (op.mnem.equals("CALLOTHER") &&
+                (op.instrAsm.equalsIgnoreCase("IN") ||
+                 op.instrAsm.equalsIgnoreCase("OUT"))) {
+                return null;
+            }
+        }
+        for (int ci = 0; ci < ops.size(); ci++) {
+            OpRec call = ops.get(ci);
+            if (!call.mnem.equals("CALL")) continue;
+            Long leaf = tdcallLastConst(ops, ci, 0x8L);
+            if (leaf == null || leaf.longValue() != 0x1eL) continue;
+            Long sz = tdcallLastConst(ops, ci, 0x10L);
+            if (sz == null || !(sz.longValue() == 1L ||
+                sz.longValue() == 2L || sz.longValue() == 4L)) {
+                continue;
+            }
+            boolean fwd = false;
+            for (int j = 0; j < ci; j++) {
+                OpRec o = ops.get(j);
+                if (!o.mnem.equals("COPY") || o.ins.length != 1 ||
+                    o.out == null) continue;
+                if (tdcallIsReg(o.ins[0], 0x8L) &&
+                    tdcallIsReg(o.out, 0x88L)) { fwd = true; break; }
+            }
+            if (!fwd) continue;
+            boolean ret = false;
+            for (int j = ci + 1; j < ops.size() && !ret; j++) {
+                OpRec ld = ops.get(j);
+                if (!ld.mnem.equals("LOAD") || ld.out == null) {
+                    continue;
+                }
+                String lk = vkey(ld.out);
+                for (int k = j + 1; k < ops.size(); k++) {
+                    OpRec cp = ops.get(k);
+                    if (!cp.mnem.equals("COPY") ||
+                        cp.ins.length != 1 || cp.out == null) {
+                        continue;
+                    }
+                    if (vkey(cp.ins[0]).equals(lk) &&
+                        tdcallIsReg(cp.out, 0x0L) &&
+                        cp.out.getSize() == sz.intValue()) {
+                        ret = true; break;
+                    }
+                }
+            }
+            if (!ret) continue;
+            return Integer.valueOf(sz.intValue());
+        }
+        return null;
+    }
+
+    /** Last constant COPY assignment to a register before op
+        index `before` (exclusive), or null. Only plain COPYs
+        count (mov reg, imm); XOR-zeroing and arithmetic
+        definitions are not constant assignments here. */
+    private static Long tdcallLastConst(List<OpRec> ops, int before,
+        long regOff) {
+        for (int j = before - 1; j >= 0; j--) {
+            OpRec o = ops.get(j);
+            if (o.out == null || !tdcallIsReg(o.out, regOff)) {
+                continue;
+            }
+            if (o.mnem.equals("COPY") && o.ins.length == 1 &&
+                o.ins[0].isConstant()) {
+                return Long.valueOf(o.ins[0].getOffset());
+            }
+            return null;
+        }
+        return null;
+    }
+
+    private static boolean tdcallIsReg(Varnode v, long off) {
+        if (v == null) return false;
+        try {
+            return "register".equals(
+                v.getAddress().getAddressSpace().getName()) &&
+                v.getOffset() == off;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private static String[][] protoHwEffect(ProtoCall pc) {
         if (pc == null || pc.isBs) return null;
         if (pc.method.equals("Pci.Read")) {
@@ -10517,7 +10641,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.18\",");
+        w.println("  \"extractor_version\": \"v3.19\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -10631,6 +10755,328 @@ public class ExtractIR extends GhidraScript {
         } catch (Exception e) {
             // Legs stay disabled; memState then treats stack
             // stores as unknown (sound, less precise).
+        }
+        // v3.19 Phase 3 item 6 (S2): RP2040 second-stage boot
+        // code lives in a .boot2 section that Ghidra does not
+        // recover as a function (raw assembly, no symbols),
+        // so the pipeline never analyzes it. If a .boot2
+        // block exists on an ARM program and no function
+        // covers its start, create one over the block so the
+        // normal pipeline analyzes it. Best-effort and
+        // guarded: any failure (no transaction, code-unit
+        // conflict, non-Thumb bytes) leaves the program
+        // unchanged and the item as a documented remainder.
+        // The created function is named "boot2" and is
+        // indistinguishable downstream from a recovered
+        // function -- its findings come from the pipeline's
+        // own fixpoint, never from a side-channel parse.
+        try {
+            if ("ARM".equals(isa.name())) {
+                MemoryBlock boot2blk =
+                    currentProgram.getMemory().getBlock(".boot2");
+                if (boot2blk != null) {
+                    FunctionManager fm0 =
+                        currentProgram.getFunctionManager();
+                    Address bStart = boot2blk.getStart();
+                    Function cov = fm0.getFunctionContaining(bStart);
+                    if (cov == null) {
+                        int tx = currentProgram.startTransaction(
+                            "phase3-boot2");
+                        try {
+                            // The section arrives as defined
+                            // data; a function entry may not
+                            // be created on defined data, so
+                            // clear the code units, disassemble
+                            // (Thumb-forced: Cortex-M executes
+                            // Thumb only, and the section's
+                            // first halfword b500 is `push
+                            // {lr}`), then create the function
+                            // over the disassembled set. Same
+                            // transaction throughout, so a
+                            // later failure rolls the clear
+                            // back with it.
+                            currentProgram.getListing()
+                                .clearCodeUnits(bStart,
+                                    boot2blk.getEnd(), false);
+                            AddressSet bRange = new AddressSet(
+                                bStart, boot2blk.getEnd());
+                            ArmDisassembleCommand dc =
+                                new ArmDisassembleCommand(bStart,
+                                    bRange, true);
+                            try {
+                                ghidra.program.model.lang.Register
+                                    tm = currentProgram
+                                        .getRegister("TMode");
+                                if (tm != null) {
+                                    dc.setInitialContext(
+                                        new RegisterValue(tm,
+                                            java.math.BigInteger.ONE));
+                                }
+                            } catch (Exception e) {
+                                // Default context; disassembly
+                                // still attempted below.
+                            }
+                            boolean disOk = dc.applyTo(
+                                currentProgram, monitor);
+                            AddressSet bSet = new AddressSet(
+                                dc.getDisassembledAddressSet());
+                            Function bf = null;
+                            if (disOk && !bSet.isEmpty()) {
+                                bf = fm0.createFunction(
+                                    "boot2", bStart, bSet,
+                                    SourceType.USER_DEFINED);
+                            }
+                            println("[*] boot2: disassembled=" +
+                                disOk + " addrs=" +
+                                bSet.getNumAddresses() +
+                                " function=" +
+                                (bf == null ? "FAILED" :
+                                    bf.getName()));
+                        } finally {
+                            currentProgram.endTransaction(tx, true);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            println("[!] boot2: creation failed, continuing " +
+                "without it: " + e);
+        }
+        // v3.19 Phase 3 item 5 (L1): table-driven function
+        // discovery for stripped binaries. Ghidra's
+        // symbol-driven discovery loses functions that are
+        // reachable only through tables (device init fns,
+        // API slot fns, ISR handlers) -- on stripped Zephyr
+        // that is 100 of 269 functions, and it also blocks
+        // L2 (device enumeration needs init fns to exist).
+        // The tables themselves are linker-defined and
+        // survive stripping: sw_isr_table entries are
+        // (arg, handler) pairs, device_area records carry an
+        // init pointer, *_driver_api_area sections are pure
+        // API function-pointer tables, and initlevel is an
+        // init function-pointer array. A word qualifies only
+        // if it has the Thumb bit set, its stripped target
+        // lies in an executable block, and no function
+        // already covers it. Qualified targets are
+        // disassembled (Thumb-forced, as for boot2) when
+        // they hold no instruction yet, then created via
+        // CreateFunctionCmd, whose flow analysis computes
+        // the body (stopping at existing functions). Every
+        // candidate is best-effort and independent: a
+        // failure skips that candidate only. Binaries
+        // without these sections (everything in the corpus
+        // except Zephyr) and unstripped binaries (every
+        // table target already a function) are unaffected
+        // -- verified by the regression, not assumed.
+        try {
+            if ("ARM".equals(isa.name())) {
+                FunctionManager fm1 =
+                    currentProgram.getFunctionManager();
+                int tx2 = currentProgram.startTransaction(
+                    "phase3-table-fns");
+                int created = 0;
+                int skipped = 0;
+                List<Address> createdQueue =
+                    new ArrayList<Address>();
+                try {
+                    for (MemoryBlock tb :
+                        currentProgram.getMemory().getBlocks()) {
+                        String tn = tb.getName();
+                        if (!"sw_isr_table".equals(tn) &&
+                            !"device_area".equals(tn) &&
+                            !"initlevel".equals(tn) &&
+                            !tn.endsWith("_driver_api_area")) {
+                            continue;
+                        }
+                        long a = tb.getStart().getOffset();
+                        long e = tb.getEnd().getOffset();
+                        for (long woff = a; woff + 3 <= e;
+                            woff += 4) {
+                            long word;
+                            try {
+                                word = isa.readPointer(
+                                    currentProgram.getMemory(),
+                                    toAddr(woff)) & 0xffffffffL;
+                            } catch (Exception ex) {
+                                continue;
+                            }
+                            if ((word & 1L) == 0) continue;
+                            long tgt = word & ~1L;
+                            Address tAddr;
+                            MemoryBlock xb;
+                            try {
+                                tAddr = toAddr(tgt);
+                                xb = currentProgram.getMemory()
+                                    .getBlock(tAddr);
+                            } catch (Exception ex) {
+                                continue;
+                            }
+                            if (xb == null || !xb.isExecute()) {
+                                continue;
+                            }
+                            try {
+                                if (fm1.getFunctionContaining(
+                                    tAddr) != null) {
+                                    skipped++;
+                                    continue;
+                                }
+                            } catch (Exception ex) {
+                                continue;
+                            }
+                            try {
+                                if (currentProgram.getListing()
+                                    .getInstructionAt(tAddr)
+                                    == null) {
+                                    AddressSet xr =
+                                        new AddressSet(
+                                            xb.getStart(),
+                                            xb.getEnd());
+                                    ArmDisassembleCommand dc2 =
+                                        new ArmDisassembleCommand(
+                                            tAddr, xr, true);
+                                    try {
+                                        ghidra.program.model.lang.Register
+                                            tm2 = currentProgram
+                                                .getRegister("TMode");
+                                        if (tm2 != null) {
+                                            dc2.setInitialContext(
+                                                new RegisterValue(tm2,
+                                                    java.math.BigInteger.ONE));
+                                        }
+                                    } catch (Exception ex) {
+                                        // Default context.
+                                    }
+                                    dc2.applyTo(currentProgram,
+                                        monitor);
+                                }
+                                CreateFunctionCmd cfc =
+                                    new CreateFunctionCmd(tAddr);
+                                cfc.applyTo(currentProgram,
+                                    monitor);
+                                if (cfc.getFunction() != null) {
+                                    created++;
+                                    createdQueue.add(tAddr);
+                                }
+                            } catch (Exception ex) {
+                                // This candidate stays
+                                // undiscovered; continue.
+                            }
+                        }
+                    }
+                // Closure pass: table-created functions call
+                // further functions that stripped analysis also
+                // missed (e.g. uarte_0_init -> pinctrl_apply_state
+                // -> pinctrl_configure_pins; clock API fns ->
+                // nrfx_clock_*). Follow direct CALL/BRANCH
+                // targets of created functions to fixpoint
+                // (capped), creating each newly found function
+                // the same way. Intra-function branches are
+                // skipped by the covering-function test;
+                // BRANCHIND (jump tables, callbacks) is never
+                // followed here -- only direct targets.
+                {
+                    // Seed: entries created by the table
+                    // pass above (explicit list -- the
+                    // created functions' source type is
+                    // NOT USER_DEFINED, so it cannot be
+                    // used to identify them).
+                    List<Address> queue = createdQueue;
+                    int qi = 0;
+                    while (qi < queue.size() &&
+                        created < 512) {
+                        Address ce = queue.get(qi++);
+                        Function cf;
+                        try {
+                            cf = fm1.getFunctionAt(ce);
+                        } catch (Exception ex) {
+                            continue;
+                        }
+                        if (cf == null) continue;
+                        OpsResult cor;
+                        try {
+                            cor = buildOps(cf);
+                        } catch (Exception ex) {
+                            continue;
+                        }
+                        for (OpRec o : cor.ops) {
+                            if (!o.mnem.equals("CALL") &&
+                                !o.mnem.equals("BRANCH")) {
+                                continue;
+                            }
+                            if (o.ins.length < 1) continue;
+                            Varnode tv = o.ins[0];
+                            if (tv == null ||
+                                tv.isConstant()) continue;
+                            Address ta;
+                            MemoryBlock xb2;
+                            try {
+                                if (!"ram".equals(tv.getAddress()
+                                    .getAddressSpace().getName())) {
+                                    continue;
+                                }
+                                ta = toAddr(tv.getOffset());
+                                xb2 = currentProgram.getMemory()
+                                    .getBlock(ta);
+                            } catch (Exception ex) {
+                                continue;
+                            }
+                            if (xb2 == null ||
+                                !xb2.isExecute()) continue;
+                            try {
+                                if (fm1.getFunctionContaining(
+                                    ta) != null) continue;
+                            } catch (Exception ex) {
+                                continue;
+                            }
+                            try {
+                                if (currentProgram.getListing()
+                                    .getInstructionAt(ta)
+                                    == null) {
+                                    AddressSet xr2 =
+                                        new AddressSet(
+                                            xb2.getStart(),
+                                            xb2.getEnd());
+                                    ArmDisassembleCommand dc3 =
+                                        new ArmDisassembleCommand(
+                                            ta, xr2, true);
+                                    try {
+                                        ghidra.program.model.lang.Register
+                                            tm3 = currentProgram
+                                                .getRegister("TMode");
+                                        if (tm3 != null) {
+                                            dc3.setInitialContext(
+                                                new RegisterValue(tm3,
+                                                    java.math.BigInteger.ONE));
+                                        }
+                                    } catch (Exception ex) {
+                                        // Default context.
+                                    }
+                                    dc3.applyTo(currentProgram,
+                                        monitor);
+                                }
+                                CreateFunctionCmd cfc2 =
+                                    new CreateFunctionCmd(ta);
+                                cfc2.applyTo(currentProgram,
+                                    monitor);
+                                if (cfc2.getFunction() != null) {
+                                    created++;
+                                    queue.add(ta);
+                                }
+                            } catch (Exception ex) {
+                                // Candidate skipped.
+                            }
+                        }
+                    }
+                }
+                } finally {
+                    currentProgram.endTransaction(tx2, true);
+                }
+                println("[*] table-fns: created=" + created +
+                    " skippedAlreadyFn=" + skipped);
+            }
+        } catch (Exception e) {
+            println("[!] table-fns: discovery failed, " +
+                "continuing without it: " + e);
         }
         FunctionManager fmA = currentProgram.getFunctionManager();
         List<FuncRec> funcRecs = new ArrayList<FuncRec>();
@@ -11756,6 +12202,87 @@ public class ExtractIR extends GhidraScript {
             // Init enumeration is best-effort; a symbol-table
             // failure must not lose the site-driven results.
         }
+        // v3.19 Phase 3 item 5 (L2): section-based device
+        // enumeration, FALLBACK ONLY -- it runs only when the
+        // symbol scan above found zero devices, so an
+        // unstripped binary's numbers are untouched (its pairs
+        // come from symbols exactly as before). On a stripped
+        // Zephyr binary the symbol names are gone but the
+        // section headers survive, and the linker-defined
+        // device_area section still holds the device records
+        // contiguously: [name, ?, api, state, data, init, 0]
+        // (init at +20, as the symbol path reads it). A
+        // candidate record start must pass
+        // looksLikeDeviceStruct (readonly block, init at +20
+        // is a known function) AND the section-specific gate
+        // that the word at +8 points into a
+        // *_driver_api_area section. The gate is what kills
+        // intra-record shifted windows: for a window inside
+        // a true record, the +8 word is a state/data pointer
+        // (RAM), an init code pointer (text), zero, or a
+        // name pointer (rodata) -- never an api-area start.
+        // Records are found by scanning forward 4 bytes at a
+        // time for the next passing start, so no record
+        // stride is hardcoded (it varies by Zephyr version
+        // and config). Pairs feed the same clone machinery
+        // as symbol pairs, and the ISR enumeration below
+        // (already section-based, gated on deviceAddrs) then
+        // works on stripped binaries too.
+        if (devInitFound == 0) {
+            try {
+                MemoryBlock devBlk = null;
+                for (MemoryBlock b : memA.getBlocks()) {
+                    if ("device_area".equals(b.getName())) {
+                        devBlk = b;
+                        break;
+                    }
+                }
+                if (devBlk != null) {
+                    long a = devBlk.getStart().getOffset();
+                    long e = devBlk.getEnd().getOffset();
+                    while (a + 27 <= e) {
+                        long rec = -1;
+                        for (long c = a; c + 27 <= e; c += 4) {
+                            if (!looksLikeDeviceStruct(memA, c,
+                                funcByEntry)) continue;
+                            MemoryBlock apiBlk = null;
+                            try {
+                                long apiPtr = isa.readPointer(
+                                    memA, toAddr(c + 8));
+                                apiBlk = memA.getBlock(
+                                    toAddr(apiPtr));
+                            } catch (Exception ex) {
+                                apiBlk = null;
+                            }
+                            if (apiBlk == null ||
+                                !apiBlk.getName().endsWith(
+                                    "_driver_api_area")) {
+                                continue;
+                            }
+                            rec = c;
+                            break;
+                        }
+                        if (rec < 0) break;
+                        long init = isa.stripInstructionTag(
+                            isa.readPointer(memA,
+                                toAddr(rec + 20)));
+                        FuncRec tgt = funcByEntry.get(init);
+                        if (tgt != null &&
+                            !tgt.f.isExternal()) {
+                            deviceEnumPairs.add(
+                                new long[]{tgt.entryKey, rec, 0});
+                            deviceAddrs.add(rec);
+                            devInitFound++;
+                        }
+                        a = rec + 4;
+                    }
+                }
+            } catch (Exception e) {
+                // Section fallback is best-effort; a failure
+                // leaves the stripped binary at the
+                // site-driven results, never worse.
+            }
+        }
         try {
             MemoryBlock isrBlk = null;
             for (MemoryBlock b : memA.getBlocks()) {
@@ -12189,6 +12716,32 @@ public class ExtractIR extends GhidraScript {
         } catch (Exception e) {
             // Maps stay partial; guard-call lookup tolerates it,
             // and caller validation fails closed on missing data.
+        }
+        // v3.19 Phase 3 item 1: tdcall-IO-read wrapper map
+        // (entryKey -> size), x86-64 only. Best-effort: a
+        // failure here only loses the new port entries, never
+        // the function's existing findings. Keyed by the
+        // stripped entry key (same key the emission loop's
+        // CALL targets resolve to via funcByEntry).
+        Map<Long, Integer> tdcallReadWrappers =
+            new HashMap<Long, Integer>();
+        if (isX86_64) {
+            try {
+                for (FuncRec gr : funcRecs) {
+                    try {
+                        Integer sz = tdcallReadSize(gr.or.ops);
+                        if (sz != null) {
+                            tdcallReadWrappers.put(gr.entryKey, sz);
+                            println("[*] tdcall-read wrapper: " +
+                                gr.f.getName() + " size=" + sz);
+                        }
+                    } catch (Exception e) {
+                        // This wrapper stays unrecognized.
+                    }
+                }
+            } catch (Exception e) {
+                // Map stays partial/empty; fail-closed.
+            }
         }
         for (FuncRec rec : funcRecs) {
             Function f = rec.f;
@@ -12762,6 +13315,65 @@ public class ExtractIR extends GhidraScript {
                                 ", \"value_known_zeroes\": 0}");
                         }
                     }
+                }
+            }
+            // v3.19 Phase 3 item 1: tdcall-IO-read call-site
+            // ports. Ghidra lifts `tdcall` to no pcode, so a
+            // tdcall-only read wrapper (e.g. EDK2 IoRead8)
+            // contributes no CALLOTHER IN of its own; the
+            // access is emitted here, attributed to the CALL
+            // instruction in the caller (same precedent as the
+            // protocol effects above), with the exact existing
+            // entry shape. Only exact argument values emit:
+            // a computed port (e.g. 0xcfc + low bits) yields
+            // nothing. Deduped on (instr, port) so a wrapper
+            // call site shared by merged + clone recording
+            // cannot double-count (this block runs on merged
+            // state only, so duplicates can only come from
+            // an identical raw entry -- checked anyway).
+            if (isX86_64 && !tdcallReadWrappers.isEmpty() &&
+                fx != null && fx.inStates != null) {
+                Set<String> tdcallSeen = new HashSet<String>();
+                for (int i = 0; i < ops.size(); i++) {
+                    OpRec op = ops.get(i);
+                    if (!op.mnem.equals("CALL") ||
+                        op.ins.length < 1) continue;
+                    Varnode tgt = op.ins[0];
+                    if (tgt == null || tgt.isConstant()) continue;
+                    long tgtOff;
+                    try {
+                        if (!"ram".equals(tgt.getAddress()
+                            .getAddressSpace().getName())) continue;
+                        tgtOff = tgt.getOffset();
+                    } catch (Exception e) {
+                        continue;
+                    }
+                    Integer wsz = tdcallReadWrappers.get(tgtOff);
+                    if (wsz == null) continue;
+                    if (i >= fx.inStates.length ||
+                        fx.inStates[i] == null) continue;
+                    Varnode arg0 = regVarnode(0x8L,
+                        isa.pointerSize());
+                    if (arg0 == null) continue;
+                    Bits pb = resolveBits(arg0, fx.inStates[i]);
+                    if (pb == null) continue;
+                    Long port = pb.exactValue(0xFFFFL);
+                    if (port == null) continue;
+                    String id = "port:" + op.instrAddr + ":0x" +
+                        Long.toHexString(port.longValue());
+                    // A CALL instruction cannot also be a raw
+                    // CALLOTHER entry, so per-function dedup on
+                    // (instr, port) is sufficient here.
+                    if (!tdcallSeen.add(id)) continue;
+                    portIo.add("{\"instr\": \"" + op.instrAddr +
+                        "\", \"op\": \"IN\"" +
+                        ", \"direction\": \"IN\"" +
+                        ", \"port\": \"0x" +
+                        Long.toHexString(port.longValue()) +
+                        "\", \"size\": " + wsz.intValue() +
+                        ", \"value\": null" +
+                        ", \"value_known_ones\": 0" +
+                        ", \"value_known_zeroes\": 0}");
                 }
             }
             w.println();

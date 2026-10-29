@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.18-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.19-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -156,6 +156,33 @@ the CVE firmware's own DMA / command-instruction calls), PLT-only
 callees, grandchild programming. Version bumped v3.17 -> v3.18 because
 new site kinds, a new guard label, a flagged-to-suppressed semantic
 flip, and a JSON shape old Lean cannot parse (null `base_field`).
+
+**v3.19 changes:** Phase 3 coverage, landed gains only. Port 0x511
+PIO-fallback IN is now in the extractor port set (PciHostBridge ports
+8 → 9; the port is covered by the existing fw_cfg allowlist, so
+PciHostBridge stays PASS). Stripped enumeration: table-driven
+function discovery plus a section-based device fallback recovers
+stripped Zephyr from 97 to 156 MMIO (functions 169 → 212, devInit 4,
+devIsr 1, matching unstripped enumeration); unstripped Zephyr is
+unchanged at 196. RP2040 windows widen: SIO (0xD0000000–0xD0000180)
+and SSI (0x18000000–0x18000100) plus boot2 recovery take RP2040
+198 → 220 (+9 SIO, +13 boot2), and the second RP2040 target cdc_msc
+224 → 303 (+73 SIO/SSI, +6 boot2); zero findings lost on any other
+target (BMP 427, stripped 314, F4 171, x86_blink 11, full 36-target
+regression). Two honest one-liners: remaining coverage work stays
+open (Zephyr GPIO tail needs a loop-precision redesign, USART2 Gap B
+needs a redesign not a patch, 16-bit real mode needs a raw-binary
+import path plus a segmented adapter) — Phase 3 did not close them;
+and non-live 21 (all-slots seeding) is DELIBERATELY NOT enabled —
+a finding must mean "does call", not "could call", so it stays
+deferred until a labelled JSON shape (e.g. `is_callable`) exists.
+Precision unchanged (TP=17, FP=0, FN=0, TN=16); CVE-2026-11743 pair
+unchanged (pre-fix FAILs naming both sites, fixed PASSes);
+CVE-2026-78119 pair still PASS/PASS (the engine does not flag eSPI
+— expected, not a regression). Version bumped v3.18 -> v3.19
+because real-target outputs changed (new port entry, MMIO totals,
+new functions, new MMIO bands); JSON shape unchanged, no Lean change
+needed.
 
 **Clock-enable-before-use (Lean-side, generic mode; no extractor change, no
 JSON change, no new flags):** every MUST access to a mapped STM32 peripheral's
