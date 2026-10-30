@@ -24,6 +24,28 @@ fi
 sudo sed -i 's/^MAXMEM=2G/MAXMEM=512M/' /opt/ghidra/support/analyzeHeadless || true
 grep -n "^MAXMEM" /opt/ghidra/support/analyzeHeadless
 
+# Hardening (Oct 29, 2026): a launcher-exists check CANNOT catch a
+# partial tree — a fresh install once ran analyzeHeadless fine while
+# silently missing Decompiler Switch Analysis, and extraction numbers
+# dropped with no error anywhere. So setup NEVER trusts the launcher
+# alone: it always verifies the tree AND runs the x86_blink canary,
+# and FAILS LOUDLY (non-zero exit, no "Setup complete") if either fails.
+# (The install block above is unchanged; verification runs whether the
+# install was skipped or performed, because a pre-existing launcher
+# proves nothing about tree completeness.)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export FIRMWARE_WORKSPACE="${FIRMWARE_WORKSPACE:-$SCRIPT_DIR}"
+if ! "$SCRIPT_DIR/verify_ghidra_tree.sh" /opt/ghidra; then
+  echo "SETUP FAILED: Ghidra tree verification failed — this install is incomplete and its analysis cannot be trusted." >&2
+  echo "  Delete /opt/ghidra and re-run setup.sh, or run reinstall_ghidra.sh, then re-run setup.sh." >&2
+  exit 1
+fi
+if ! "$SCRIPT_DIR/canary_x86_blink.sh"; then
+  echo "SETUP FAILED: x86_blink canary failed — this Ghidra install does not reproduce the expected 11 mmio accesses." >&2
+  echo "  Do NOT trust analysis from it. Delete /opt/ghidra and re-run setup.sh, or run reinstall_ghidra.sh." >&2
+  exit 1
+fi
+
 # --- Lean 4.35.0 via elan (elan.lean-lang.org 404s; GitHub raw script works) ---
 if [ ! -x "$HOME/.elan/bin/lean" ]; then
   curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.35.0

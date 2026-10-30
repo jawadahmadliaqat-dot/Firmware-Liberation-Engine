@@ -99,7 +99,9 @@ def printBmp (trace : List MmioAccess) (mayTrace : List MmioAccess) : IO Bool :=
 def main (args : List String) : IO UInt32 := do
   let path := (args.head?).getD "report.json"
   let mode := (args.drop 1 |>.head?).getD "blink"
-  let content ← IO.FS.readFile path
+  let content ← try IO.FS.readFile path catch e => do
+    IO.println s!"cannot read report: {path} ({e})"
+    IO.Process.exit 1
   match Json.parse content with
   | .error e => IO.println s!"JSON parse failed: {e}"; pure 1
   | .ok j =>
