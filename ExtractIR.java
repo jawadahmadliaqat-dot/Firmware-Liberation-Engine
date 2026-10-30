@@ -10554,6 +10554,49 @@ public class ExtractIR extends GhidraScript {
     // learning with must-precede, thread-entry attribution,
     // CONTROL/PSR tracking, PRIMASK/FAULTMASK/handler-ness/name
     // heuristics (REJECTED, never implemented here).
+    // ---- Phase 4 V1.5 (LOCAL ONLY, stamp stays v3.20) ----
+    // Adds, both OPT-IN via the boundary profile (absent = V1
+    // behaviour exactly, so unprofiled runs are byte-identical):
+    // (1) static-table region learning (design §1.3 source 2)
+    // under the EVIDENCE RULE: table-present != table-applied. A
+    // table entry becomes a region ONLY when (a) its symbol
+    // resolves into a READ-ONLY block, (b) some function in the
+    // image directly CALLs a profile-declared consumer function,
+    // AND (c) that consumer's own must-fixpoint contains a LOAD
+    // (or COPY-from-ram) resolving exactly to the table address
+    // or into the config struct (consumer reads the table). Any
+    // failing condition -> NO regions from that table, with the
+    // status recorded in boundary_table_learning (never silent).
+    // Learned regions sort BELOW profile regions (numbers from
+    // -1000 under highest-wins, +1000 under lowest-wins), so an
+    // explicit profile region always wins an overlap against a
+    // derived one. Supported decodes: zephyr_mpu_v8 (Zephyr 4.4
+    // ARMv8-M arm_mpu_region, no-PXN layout, verified on the
+    // v2m_musca_b1 build), base_size, base_limit. Other Zephyr
+    // versions/layouts (ARMv7-M RASR, PXN, ARMv8-R) are NOT
+    // claimed: they need a new profile entry + verification.
+    // (2) thread-entry attribution (design §2.2 item 4): direct
+    // CALLs to k_thread_create / z_impl_k_thread_create (exact
+    // API names, plus compiler-clone suffix variants of those
+    // exact names) resolve entry = register arg 3 and options =
+    // stack slot 4 (AAPCS: args 0-3 in r0-r3, options is arg 8)
+    // from the call-site must-fixpoint (register + stk: cells).
+    // K_USER bit (profile thread_user_option_bit, default 4 =
+    // Zephyr BIT(2)) -> unprivileged, else privileged. A thread
+    // entry also directly called elsewhere, or with conflicting
+    // options across sites, is UNKNOWN (counted, never flagged):
+    // per-function attribution cannot decide a two-privilege
+    // function. Thread learning sets the PRIVILEGE axis only;
+    // domain still comes from image/veneer. ARM AAPCS only.
+    // NOT in V1.5 (design-only, see v15_report.md): config-write
+    // learning with must-precede (the engine has no must-precede
+    // reasoning: no dominators, no boot-order model, and SAU/MPU
+    // config sequences need RNR-sequence order too). No
+    // order-free config learning is implemented: the task
+    // forbids faking must-precede with order-free reasoning.
+    // Lean is UNCHANGED by V1.5: the verdict path reads only
+    // boundary_sites + counts, which learned agents/regions feed
+    // through unchanged; no new Lean lines are needed.
     // Violation rule (design §3, all six conditions required):
     // must-proven address, known agent, known region (or profile
     // default), agent not allowed on some leg (domain, privilege,
@@ -10701,6 +10744,18 @@ public class ExtractIR extends GhidraScript {
         Object v = m.get(k);
         return (v instanceof Boolean) ? ((Boolean) v).booleanValue() : dflt;
     }
+    private static long mjLong(Object v, long dflt) {
+        if (v instanceof Number) return ((Number) v).longValue();
+        if (v instanceof String) {
+            String t = ((String) v).trim();
+            try {
+                if (t.startsWith("0x") || t.startsWith("0X"))
+                    return Long.parseLong(t.substring(2), 16);
+                return Long.parseLong(t);
+            } catch (Exception e) { return dflt; }
+        }
+        return dflt;
+    }
 
     private static class BoundaryRegion {
         String name; long start, end; String domain, minPriv;
@@ -10727,6 +10782,30 @@ public class ExtractIR extends GhidraScript {
         }
     }
 
+    /** V1.5: one profile-declared static table to learn regions
+        from. Field offsets are byte offsets within one entry;
+        defaults are filled in per decode in parseBoundaryProfile
+        (zephyr_mpu_v8 defaults differ from the generic ones). */
+    private static class StaticTableSpec {
+        String name, tableSymbol, configSymbol, decode, domain,
+            mechanism, defMinPriv;
+        long count = -1, countOff = 0, ptrOff = 4, stride = 0;
+        long baseOff = 0, sizeOff = 4, limitOff = 8, attrOff = 8,
+            nameOff = 4;
+        boolean defRead = true, defWrite = true;
+        List<String> consumerNames = new ArrayList<String>();
+    }
+
+    /** V1.5: one learned thread entry. priv == null means the
+        function is NOT learnable (conflict across sites, or also
+        directly called): evaluation treats it as unknown. */
+    private static class ThreadEntry {
+        String priv; int sites; String status;
+        ThreadEntry(String p, int s, String st) {
+            priv = p; sites = s; status = st;
+        }
+    }
+
     private static class BoundaryProfile {
         List<BoundaryRegion> regions = new ArrayList<BoundaryRegion>();
         boolean highestWins = true;
@@ -10737,6 +10816,17 @@ public class ExtractIR extends GhidraScript {
         String source;
         Map<String, String> overrides = new HashMap<String, String>();
         Set<String> veneerNames = new HashSet<String>();
+        // V1.5: opt-in learning inputs + results. Empty when the
+        // profile declares neither (V1 behaviour, exactly).
+        List<StaticTableSpec> staticTables =
+            new ArrayList<StaticTableSpec>();
+        boolean threadLearning = false;
+        Set<String> threadCreateNames = new HashSet<String>();
+        long threadUserBit = 4;
+        Map<String, ThreadEntry> threadEntries =
+            new HashMap<String, ThreadEntry>();
+        int threadUnresolvedSites = 0;
+        List<String> tableLearningJson = new ArrayList<String>();
         // controller name -> [domain, privilege]
         Map<String, String[]> dmaControllers =
             new HashMap<String, String[]>();
@@ -10848,14 +10938,19 @@ public class ExtractIR extends GhidraScript {
                                 p.hasDefault = true;
                         }
                     }
-                    Map<String, Object> ovs =
-                        mjObj(mjObj(root.get("function_agent_overrides"))
-                            .get(key));
-                    if (ovs == null && mjObj(
-                        root.get("function_agent_overrides")) != null)
-                        ovs = mjObj(mjObj(
-                            root.get("function_agent_overrides"))
-                            .get(prog));
+                    // V1.5 fix (pre-existing V1 bug): profiles
+                    // without function_agent_overrides NPE'd here
+                    // (mjObj(null).get) and lost the whole profile.
+                    // All V1 profiles happened to carry overrides,
+                    // so it never fired until V1.5 profiles omitted
+                    // the section. Absent overrides = none, not an
+                    // unusable profile.
+                    Map<String, Object> ovsRoot = mjObj(
+                        root.get("function_agent_overrides"));
+                    Map<String, Object> ovs = (ovsRoot != null)
+                        ? mjObj(ovsRoot.get(key)) : null;
+                    if (ovs == null && ovsRoot != null)
+                        ovs = mjObj(ovsRoot.get(prog));
                     if (ovs != null) {
                         for (Map.Entry<String, Object> e : ovs.entrySet()) {
                             if (e.getKey().startsWith("_")) continue;
@@ -10912,6 +11007,76 @@ public class ExtractIR extends GhidraScript {
                 if (dom != null)
                     p.dmaControllers.put(e.getKey(), new String[] { dom,
                         (priv != null) ? priv : "any" });
+            }
+        }
+        // V1.5: static-table specs + thread-entry learning flags.
+        // thread_create_functions defaults (when learning is on
+        // and no list is given) to the two Zephyr entry points:
+        // the public API and its syscall implementation, which
+        // compiler-specialized clones forward to.
+        p.threadLearning = mjBool(root, "thread_entry_learning",
+            false);
+        p.threadUserBit = mjLong(root.get("thread_user_option_bit"),
+            4);
+        List<Object> tcf = mjArr(root.get("thread_create_functions"));
+        if (tcf != null) {
+            for (Object v : tcf)
+                if (v instanceof String) p.threadCreateNames.add(
+                    (String) v);
+        } else if (p.threadLearning) {
+            p.threadCreateNames.add("k_thread_create");
+            p.threadCreateNames.add("z_impl_k_thread_create");
+        }
+        List<Object> tabs = mjArr(root.get("static_tables"));
+        if (tabs != null) {
+            for (Object tv : tabs) {
+                Map<String, Object> t = mjObj(tv);
+                if (t == null) continue;
+                StaticTableSpec sp = new StaticTableSpec();
+                sp.name = mjStr(t, "name");
+                if (sp.name == null) continue;
+                sp.tableSymbol = mjStr(t, "table_symbol");
+                sp.configSymbol = mjStr(t, "config_symbol");
+                sp.decode = mjStr(t, "decode");
+                if (sp.decode == null) sp.decode = "base_size";
+                sp.domain = mjStr(t, "domain");
+                if (sp.domain == null) sp.domain = "both";
+                sp.mechanism = mjStr(t, "mechanism");
+                if (sp.mechanism == null) sp.mechanism = "mpu";
+                sp.defMinPriv = mjStr(t, "default_min_privilege");
+                if (sp.defMinPriv == null) sp.defMinPriv = "any";
+                sp.defRead = mjBool(t, "default_read", true);
+                sp.defWrite = mjBool(t, "default_write", true);
+                sp.count = mjLong(t.get("count"), -1);
+                sp.countOff = mjLong(t.get("count_offset"), 0);
+                sp.ptrOff = mjLong(t.get("ptr_offset"), 4);
+                List<Object> cons =
+                    mjArr(t.get("consumer_functions"));
+                if (cons != null) {
+                    for (Object cv : cons)
+                        if (cv instanceof String)
+                            sp.consumerNames.add((String) cv);
+                }
+                sp.stride = mjLong(t.get("stride"), 0);
+                // Decode-specific field defaults: the Zephyr
+                // ARMv8-M layout is {base u32, name ptr,
+                // attr bitfields byte + pad, r_limit u32}
+                // (stride 16, no-PXN); generic tables default
+                // to {base, size} pairs.
+                if ("zephyr_mpu_v8".equals(sp.decode)) {
+                    sp.baseOff = mjLong(t.get("base_offset"), 0);
+                    sp.nameOff = mjLong(t.get("name_offset"), 4);
+                    sp.attrOff = mjLong(t.get("attr_offset"), 8);
+                    sp.limitOff = mjLong(t.get("limit_offset"), 12);
+                    if (sp.stride == 0) sp.stride = 16;
+                } else {
+                    sp.baseOff = mjLong(t.get("base_offset"), 0);
+                    sp.sizeOff = mjLong(t.get("size_offset"), 4);
+                    sp.limitOff = mjLong(t.get("limit_offset"), 8);
+                    sp.attrOff = mjLong(t.get("attr_offset"), 8);
+                    sp.nameOff = mjLong(t.get("name_offset"), 4);
+                }
+                p.staticTables.add(sp);
             }
         }
         List<Object> regs = mjArr(root.get("regions"));
@@ -11076,13 +11241,31 @@ public class ExtractIR extends GhidraScript {
             dataAgent = agentFromString(override, p);
             if (dataAgent == null)
                 dataAgent = new BoundaryAgent(null, null, "cpu");
-        } else if (isVeneer) {
-            // Veneer body executes secure; privilege stays the
-            // image's (null when undeclared -> privilege leg
-            // passes, domain leg still judged; miss direction).
-            dataAgent = new BoundaryAgent("secure", p.imagePriv, "cpu");
         } else {
+            // V1.5 composition: image default, veneer sets the
+            // DOMAIN axis (secure), thread-entry learning sets
+            // the PRIVILEGE axis (or unknown on conflict /
+            // also-direct-called). Profile overrides (above)
+            // still win over both learned signals.
             dataAgent = imageAgent;
+            if (isVeneer) {
+                // Veneer body executes secure; privilege stays
+                // the image's (null when undeclared -> privilege
+                // leg passes, domain leg still judged; miss
+                // direction).
+                dataAgent = new BoundaryAgent("secure",
+                    p.imagePriv, "cpu");
+            }
+            ThreadEntry te = p.threadEntries.get(fn);
+            if (te != null) {
+                if (te.priv == null) {
+                    dataAgent = new BoundaryAgent(null, null,
+                        "cpu");
+                } else {
+                    dataAgent = new BoundaryAgent(dataAgent.domain,
+                        te.priv, "cpu");
+                }
+            }
         }
         for (BoundaryAccess a : accesses) {
             ev.checked++;
@@ -11139,6 +11322,702 @@ public class ExtractIR extends GhidraScript {
             }
         }
         return ev;
+    }
+
+    // ============ Phase 4 V1.5: static-table learning ============
+    // Evidence rule (design §1.3, table-present != table-applied):
+    // a table yields regions ONLY when symbol + read-only block +
+    // direct consumer call + consumer reads table/config ALL hold.
+    // Every failure mode is recorded (never silent) and yields
+    // zero regions from that table. Evidence is checked BEFORE
+    // decoding, so an unapplied table's bytes are never trusted.
+
+    private Long findSymbolAddress(String name) {
+        if (name == null) return null;
+        try {
+            SymbolIterator sit =
+                currentProgram.getSymbolTable().getSymbolIterator();
+            while (sit.hasNext()) {
+                Symbol s = sit.next();
+                if (name.equals(s.getName()))
+                    return s.getAddress().getOffset();
+            }
+        } catch (Exception e) {
+            // No symbol: the caller records no-symbol.
+        }
+        return null;
+    }
+
+    private Long readMemU32(long addr) {
+        try {
+            return currentProgram.getMemory().getInt(toAddr(addr))
+                & 0xffffffffL;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Long readMemU8(long addr) {
+        try {
+            return (long) (currentProgram.getMemory().getByte(
+                toAddr(addr)) & 0xff);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** C string at addr from program memory (max 64 chars,
+        printable ASCII only); null when unreadable. Used only
+        for learned-region names; a failure never blocks learning. */
+    private String readMemCString(long addr) {
+        try {
+            Memory mem = currentProgram.getMemory();
+            StringBuilder b = new StringBuilder();
+            for (int i = 0; i < 64; i++) {
+                byte c = mem.getByte(toAddr(addr + i));
+                if (c == 0) {
+                    if (b.length() == 0) return null;
+                    return b.toString();
+                }
+                if (c < 32 || c > 126) return null;
+                b.append((char) c);
+            }
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** True when some function in the image directly CALLs a
+        function whose name matches target (exact, or target +
+        "." + a compiler-clone suffix). CALLIND never counts:
+        an indirect call target is not a proven consumer call. */
+    private boolean anyDirectCallTo(List<FuncRec> funcRecs,
+        Map<Long, FuncRec> funcByEntry, String target) {
+        for (FuncRec rec : funcRecs) {
+            for (OpRec op : rec.or.ops) {
+                if (!"CALL".equals(op.mnem) || op.ins.length < 1)
+                    continue;
+                Varnode t = op.ins[0];
+                if (t == null || t.getAddress() == null ||
+                    !"ram".equals(t.getAddress().getAddressSpace()
+                        .getName())) continue;
+                FuncRec callee = funcByEntry.get(t.getOffset());
+                if (callee == null) callee = funcByEntry.get(
+                    isa.stripInstructionTag(t.getOffset()));
+                if (callee == null) continue;
+                String nm = callee.f.getName();
+                if (target.equals(nm) ||
+                    nm.startsWith(target + ".")) return true;
+            }
+        }
+        return false;
+    }
+
+    /** True when any function named target (exact or clone
+        suffix) contains a LOAD (or COPY-from-ram) whose address
+        resolves exactly, in its own must-fixpoint, to tableAddr
+        or into [configAddr, configAddr + 8) (the config struct's
+        count + pointer words). A non-converged fixpoint has
+        emptied states, so this fails closed (no evidence). */
+    private boolean consumerReadsTable(List<FuncRec> funcRecs,
+        String target, long tableAddr, Long configAddr) {
+        for (FuncRec rec : funcRecs) {
+            String nm = rec.f.getName();
+            if (!target.equals(nm) && !nm.startsWith(target + "."))
+                continue;
+            if (rec.fx == null || !rec.fx.converged ||
+                rec.fx.inStates == null) continue;
+            List<OpRec> ops = rec.or.ops;
+            for (int i = 0; i < ops.size(); i++) {
+                OpRec op = ops.get(i);
+                if (i >= rec.fx.inStates.length ||
+                    rec.fx.inStates[i] == null) continue;
+                if ("LOAD".equals(op.mnem) && op.ins.length >= 2) {
+                    Long a = resolveAddressExact(op.ins[1],
+                        rec.fx.inStates[i]);
+                    if (a != null && (a.longValue() == tableAddr ||
+                        (configAddr != null &&
+                            a.longValue() >= configAddr.longValue() &&
+                            a.longValue() < configAddr.longValue() + 8)))
+                        return true;
+                } else if ("COPY".equals(op.mnem) &&
+                    op.ins.length >= 1 && op.ins[0] != null &&
+                    op.ins[0].getAddress() != null &&
+                    "ram".equals(op.ins[0].getAddress()
+                        .getAddressSpace().getName())) {
+                    long a = op.ins[0].getOffset();
+                    if (a == tableAddr || (configAddr != null &&
+                        a >= configAddr.longValue() &&
+                        a < configAddr.longValue() + 8)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void recordTableStatus(BoundaryProfile p, String name,
+        String status, int regions) {
+        p.tableLearningJson.add("{\"table\": \"" + esc(name) +
+            "\", \"status\": \"" + status + "\", \"regions\": " +
+            regions + "}");
+        println("[*] boundary table: " + name + " -> " + status +
+            " (" + regions + " regions)");
+    }
+
+    /** V1.5 item 1. Appends learned regions to p.regions (with
+        below-profile numbers) and records one status per table.
+        Call once, before the emission loop, so learned regions
+        feed the RAM-extension check and the report JSON. */
+    private void learnStaticTables(BoundaryProfile p,
+        List<FuncRec> funcRecs, Map<Long, FuncRec> funcByEntry) {
+        if (p.staticTables.isEmpty()) return;
+        Memory mem = currentProgram.getMemory();
+        int learnedIdx = 0;
+        for (StaticTableSpec sp : p.staticTables) {
+            Long symAddr = (sp.tableSymbol == null) ? null
+                : findSymbolAddress(sp.tableSymbol);
+            Long cfgAddr = (sp.configSymbol == null) ? null
+                : findSymbolAddress(sp.configSymbol);
+            if (sp.tableSymbol == null && sp.configSymbol == null) {
+                recordTableStatus(p, sp.name, "no-symbol", 0);
+                continue;
+            }
+            if ((sp.tableSymbol != null && symAddr == null &&
+                sp.configSymbol == null) ||
+                (sp.configSymbol != null && cfgAddr == null)) {
+                recordTableStatus(p, sp.name, "no-symbol", 0);
+                continue;
+            }
+            // Block gate: the probed address (table symbol, else
+            // config struct) must sit in a read-only block. A
+            // writable table can be rewritten at runtime, so its
+            // bytes prove nothing static.
+            long probeAddr = (symAddr != null)
+                ? symAddr.longValue() : cfgAddr.longValue();
+            MemoryBlock blk = null;
+            try {
+                blk = mem.getBlock(toAddr(probeAddr));
+            } catch (Exception e) {
+                blk = null;
+            }
+            if (blk == null) {
+                recordTableStatus(p, sp.name, "no-block", 0);
+                continue;
+            }
+            if (blk.isWrite()) {
+                recordTableStatus(p, sp.name, "writable-block", 0);
+                continue;
+            }
+            // Evidence, in order. The consumer list is a profile
+            // field (the profile names the target's real
+            // consumer, e.g. z_arm_mpu_init); this method never
+            // guesses consumers. An empty consumer list can
+            // never satisfy the rule.
+            boolean called = false;
+            for (String c : sp.consumerNames) {
+                if (anyDirectCallTo(funcRecs, funcByEntry, c)) {
+                    called = true;
+                    break;
+                }
+            }
+            if (!called) {
+                recordTableStatus(p, sp.name, "no-call", 0);
+                continue;
+            }
+            boolean reads = false;
+            for (String c : sp.consumerNames) {
+                if (consumerReadsTable(funcRecs, c,
+                    probeAddr, cfgAddr)) {
+                    reads = true;
+                    break;
+                }
+            }
+            if (!reads) {
+                recordTableStatus(p, sp.name, "no-reference", 0);
+                continue;
+            }
+            // Decode. Count + table address come from the config
+            // struct when one is declared (the config is what
+            // the consumer reads); otherwise from the symbol +
+            // profile count. A config pointer disagreeing with
+            // the table symbol fails closed (config-mismatch).
+            Long count = null;
+            Long tableAddr = null;
+            if (cfgAddr != null) {
+                count = readMemU32(cfgAddr.longValue()
+                    + sp.countOff);
+                Long ptr = readMemU32(cfgAddr.longValue()
+                    + sp.ptrOff);
+                if (count == null || ptr == null) {
+                    recordTableStatus(p, sp.name,
+                        "decode-failed", 0);
+                    continue;
+                }
+                tableAddr = ptr;
+                if (symAddr != null &&
+                    symAddr.longValue() != ptr.longValue()) {
+                    recordTableStatus(p, sp.name,
+                        "config-mismatch", 0);
+                    continue;
+                }
+            } else {
+                tableAddr = symAddr;
+                if (sp.count >= 0) count = sp.count;
+            }
+            if (count == null || count.longValue() <= 0 ||
+                count.longValue() > 64 || sp.stride <= 0) {
+                recordTableStatus(p, sp.name, "decode-failed", 0);
+                continue;
+            }
+            // The resolved table must itself be read-only.
+            MemoryBlock tblk = null;
+            try {
+                tblk = mem.getBlock(toAddr(tableAddr.longValue()));
+            } catch (Exception e) {
+                tblk = null;
+            }
+            if (tblk == null || tblk.isWrite()) {
+                recordTableStatus(p, sp.name,
+                    tblk == null ? "no-block" : "writable-block",
+                    0);
+                continue;
+            }
+            List<BoundaryRegion> learned =
+                new ArrayList<BoundaryRegion>();
+            boolean bad = false;
+            for (long i = 0; i < count.longValue(); i++) {
+                long e = tableAddr.longValue() + i * sp.stride;
+                Long base = readMemU32(e + sp.baseOff);
+                if (base == null) { bad = true; break; }
+                BoundaryRegion br = new BoundaryRegion();
+                br.source = "static-table";
+                br.mechanism = sp.mechanism;
+                br.domain = sp.domain;
+                if ("zephyr_mpu_v8".equals(sp.decode)) {
+                    Long attr = readMemU8(e + sp.attrOff);
+                    Long limit = readMemU32(e + sp.limitOff);
+                    if (attr == null || limit == null) {
+                        bad = true; break;
+                    }
+                    // ARMv8-M RBAR attr byte: SH[4:3], AP[2:1],
+                    // XN[0]. AP 0 = P_RW_U_NA, 1 = P_RW_U_RW,
+                    // 2 = P_RO_U_NA, 3 = P_RO_U_RO (CMSIS
+                    // MPU_RBAR_AP_Pos = 1). XN is fetch, not
+                    // data: ignored (design §5, no XN rule).
+                    // RLAR limit field is 32-byte aligned;
+                    // the region end is limit + 32 (exclusive).
+                    long ap = (attr.longValue() >> 1) & 0x3L;
+                    br.start = base.longValue() & ~0x1fL;
+                    br.end = (limit.longValue() & ~0x1fL) + 0x20L;
+                    br.minPriv = (ap == 1 || ap == 3)
+                        ? "any" : "privileged";
+                    br.read = true;
+                    br.write = (ap == 0 || ap == 1);
+                    Long nmPtr = readMemU32(e + sp.nameOff);
+                    String nm = (nmPtr == null) ? null
+                        : readMemCString(nmPtr.longValue());
+                    br.name = (nm != null) ? nm
+                        : sp.name + "#" + i;
+                    if (br.start % 32 != 0 || br.end % 32 != 0) {
+                        bad = true; break;
+                    }
+                } else if ("base_limit".equals(sp.decode)) {
+                    Long limit = readMemU32(e + sp.limitOff);
+                    if (limit == null) { bad = true; break; }
+                    br.start = base.longValue();
+                    br.end = limit.longValue();
+                    br.minPriv = sp.defMinPriv;
+                    br.read = sp.defRead;
+                    br.write = sp.defWrite;
+                    br.name = sp.name + "#" + i;
+                } else {
+                    // base_size (default generic decode).
+                    Long size = readMemU32(e + sp.sizeOff);
+                    if (size == null) { bad = true; break; }
+                    br.start = base.longValue();
+                    br.end = base.longValue() + size.longValue();
+                    br.minPriv = sp.defMinPriv;
+                    br.read = sp.defRead;
+                    br.write = sp.defWrite;
+                    br.name = sp.name + "#" + i;
+                }
+                if (br.start >= br.end ||
+                    br.end - br.start > 0x80000000L) {
+                    bad = true; break;
+                }
+                learned.add(br);
+            }
+            if (bad || learned.isEmpty()) {
+                recordTableStatus(p, sp.name, "decode-failed", 0);
+                continue;
+            }
+            // Learned regions sort BELOW profile regions: an
+            // explicit profile region always wins an overlap
+            // against a derived one (explicit beats derived).
+            for (BoundaryRegion br : learned) {
+                br.number = (p.highestWins ? -1000L : 1000L)
+                    + learnedIdx;
+                learnedIdx++;
+                p.regions.add(br);
+            }
+            recordTableStatus(p, sp.name, "learned",
+                learned.size());
+        }
+    }
+
+    // ============ Phase 4 V1.5: thread-entry attribution ============
+    // Zephyr userspace (design §2.2 item 4). A thread's entry
+    // function runs at that thread's privilege: k_thread_create
+    // (or its syscall implementation z_impl_k_thread_create, which
+    // compiler-specialized clones forward to) is called with
+    // entry in register arg 3 and options in stack slot 4 (arg 8
+    // under AAPCS: args 0-3 in registers, args 4+ on the stack).
+    // Resolution uses the caller function's must-fixpoint IN
+    // state at the CALL op: registers for entry, stk: cells for
+    // the stack slot (the CALL transfer drops stk: cells, so the
+    // POST-call state must never be used here). A site that does
+    // not resolve exactly (unknown entry, unknown options, entry
+    // not a known function, non-converged fixpoint) is counted
+    // in threadUnresolvedSites and learns nothing. Merging: one
+    // privilege across all resolved sites -> learned; both
+    // privileges -> conflict (unknown); an entry function that
+    // is ALSO a direct CALL target runs at two privileges under
+    // per-function attribution -> also-direct-called (unknown).
+    // Unknown here means the evaluator counts the access as
+    // unknown-agent, never flags it. K_THREAD_DEFINE static
+    // threads are NOT covered: their records live in the
+    // _static_thread_data section, whose layout was not
+    // verified against a built image in this task (see
+    // v15_report.md); adding it unverified would overclaim.
+    // CONTROL/PSR tracking stays deferred to V2 (design §2.2.5);
+    // PRIMASK/FAULTMASK/handler-ness/name heuristics are
+    // REJECTED (design §2.3) and no such code exists here: the
+    // callee-name match below identifies the Zephyr API
+    // k_thread_create itself (design §2.2.4's own mechanism),
+    // not a security property guessed from a name.
+
+    private void learnThreadEntries(BoundaryProfile p,
+        List<FuncRec> funcRecs, Map<Long, FuncRec> funcByEntry) {
+        if (!p.threadLearning) return;
+        if (!"ARM".equals(isa.name())) {
+            println("[!] boundary thread-entry: non-ARM ISA (" +
+                isa.name() + "); learning disabled, no entries.");
+            return;
+        }
+        if (memSpOff < 0) {
+            println("[!] boundary thread-entry: no SP register; " +
+                "learning disabled, no entries.");
+            return;
+        }
+        // Direct-call targets, for the also-direct-called rule.
+        Set<String> calledNames = new HashSet<String>();
+        for (FuncRec rec : funcRecs) {
+            for (OpRec op : rec.or.ops) {
+                if (!"CALL".equals(op.mnem) || op.ins.length < 1)
+                    continue;
+                Varnode t = op.ins[0];
+                if (t == null || t.getAddress() == null ||
+                    !"ram".equals(t.getAddress().getAddressSpace()
+                        .getName())) continue;
+                FuncRec callee = funcByEntry.get(t.getOffset());
+                if (callee == null) callee = funcByEntry.get(
+                    isa.stripInstructionTag(t.getOffset()));
+                if (callee != null)
+                    calledNames.add(callee.f.getName());
+            }
+        }
+        Map<String, Set<String>> privsByEntry =
+            new HashMap<String, Set<String>>();
+        Map<String, Integer> sitesByEntry =
+            new HashMap<String, Integer>();
+        int unresolved = 0;
+        int ps = isa.pointerSize();
+        for (FuncRec rec : funcRecs) {
+            if (rec.fx == null || !rec.fx.converged ||
+                rec.fx.inStates == null) continue;
+            List<OpRec> ops = rec.or.ops;
+            for (int i = 0; i < ops.size(); i++) {
+                OpRec op = ops.get(i);
+                if (!"CALL".equals(op.mnem) || op.ins.length < 1)
+                    continue;
+                Varnode t = op.ins[0];
+                if (t == null || t.getAddress() == null ||
+                    !"ram".equals(t.getAddress().getAddressSpace()
+                        .getName())) continue;
+                FuncRec callee = funcByEntry.get(t.getOffset());
+                if (callee == null) callee = funcByEntry.get(
+                    isa.stripInstructionTag(t.getOffset()));
+                if (callee == null) continue;
+                String cnm = callee.f.getName();
+                boolean isCreate = false;
+                for (String tc : p.threadCreateNames) {
+                    if (tc.equals(cnm) || cnm.startsWith(tc + ".")) {
+                        isCreate = true;
+                        break;
+                    }
+                }
+                if (!isCreate) continue;
+                if (i >= rec.fx.inStates.length ||
+                    rec.fx.inStates[i] == null) {
+                    unresolved++;
+                    continue;
+                }
+                Map<String, Bits> st = rec.fx.inStates[i];
+                // Forwarding-clone test: a k_thread_create callee
+                // (never z_impl itself) whose body CALLs
+                // z_impl_k_thread_create is a compiler-specialized
+                // clone: its caller-site convention is NOT the
+                // 10-arg layout (the real MPU build's clone takes
+                // (thread, stack, entry) and bakes the rest), so
+                // reading r3/options at the caller site would be
+                // meaningless, and the clone's merged fixpoint
+                // meets two different entries to unknown. Such
+                // sites take Path 2 ONLY (never Path 1).
+                boolean forwards = false;
+                if (!cnm.equals("z_impl_k_thread_create") &&
+                    !cnm.startsWith("z_impl_k_thread_create.")) {
+                    for (OpRec cop : callee.or.ops) {
+                        if (!"CALL".equals(cop.mnem) ||
+                            cop.ins.length < 1) continue;
+                        Varnode ct = cop.ins[0];
+                        if (ct == null || ct.getAddress() == null ||
+                            !"ram".equals(ct.getAddress()
+                                .getAddressSpace().getName()))
+                            continue;
+                        FuncRec cc = funcByEntry.get(
+                            ct.getOffset());
+                        if (cc == null) cc = funcByEntry.get(
+                            isa.stripInstructionTag(
+                                ct.getOffset()));
+                        if (cc == null) continue;
+                        String ccn = cc.f.getName();
+                        if ("z_impl_k_thread_create".equals(ccn) ||
+                            ccn.startsWith(
+                                "z_impl_k_thread_create.")) {
+                            forwards = true;
+                            break;
+                        }
+                    }
+                }
+                String priv = null;
+                String enm = null;
+                if (forwards) {
+                    // Path 2: per-site seeded fixpoint. Seed the
+                    // clone's fixpoint with THIS caller site's
+                    // argument registers (only registers: entry
+                    // maps never carry stk: cells, and the clone
+                    // rebuilds its z_impl stack args in-body),
+                    // run it, and read entry + options at the
+                    // clone's own z_impl call. A non-converged
+                    // rerun empties its states -> unresolved
+                    // (fail closed, never a merged guess).
+                    long[] cargRegs = null;
+                    try {
+                        cargRegs = isa.argumentRegisterOffsets(
+                            callConvMap.get(callee.entryKey));
+                    } catch (Exception e) {
+                        cargRegs = null;
+                    }
+                    if (cargRegs != null && cargRegs.length >= 4) {
+                        Map<String, Bits> seed =
+                            new HashMap<String, Bits>();
+                        for (long off : cargRegs) {
+                            Varnode vn = regVarnode(off, ps);
+                            if (vn == null) continue;
+                            putKnown(seed, vkey(vn),
+                                resolveBits(vn, st));
+                        }
+                        FixResult cfx = null;
+                        try {
+                            cfx = runFixpoint(callee.or.ops,
+                                currentProgram.getMemory(),
+                                callee.branchTargets, seed,
+                                callee.loopCallOps);
+                        } catch (Exception e) {
+                            cfx = null;
+                        }
+                        if (cfx != null && cfx.converged &&
+                            cfx.inStates != null) {
+                            Set<String> pairs =
+                                new HashSet<String>();
+                            String pairEntry = null;
+                            String pairPriv = null;
+                            List<OpRec> cops = callee.or.ops;
+                            for (int ci = 0; ci < cops.size();
+                                ci++) {
+                                OpRec cop = cops.get(ci);
+                                if (!"CALL".equals(cop.mnem) ||
+                                    cop.ins.length < 1) continue;
+                                Varnode ct = cop.ins[0];
+                                if (ct == null ||
+                                    ct.getAddress() == null ||
+                                    !"ram".equals(ct.getAddress()
+                                        .getAddressSpace()
+                                        .getName())) continue;
+                                FuncRec cc = funcByEntry.get(
+                                    ct.getOffset());
+                                if (cc == null) cc =
+                                    funcByEntry.get(
+                                        isa.stripInstructionTag(
+                                            ct.getOffset()));
+                                if (cc == null) continue;
+                                String ccn = cc.f.getName();
+                                if (!"z_impl_k_thread_create"
+                                    .equals(ccn) &&
+                                    !ccn.startsWith(
+                                        "z_impl_k_thread_create."))
+                                    continue;
+                                if (ci >= cfx.inStates.length ||
+                                    cfx.inStates[ci] == null)
+                                    continue;
+                                Map<String, Bits> cst =
+                                    cfx.inStates[ci];
+                                long[] zarg = null;
+                                try {
+                                    zarg = isa
+                                        .argumentRegisterOffsets(
+                                            callConvMap.get(
+                                                cc.entryKey));
+                                } catch (Exception e) {
+                                    zarg = null;
+                                }
+                                if (zarg == null ||
+                                    zarg.length < 4) continue;
+                                Varnode evn = regVarnode(
+                                    zarg[3], ps);
+                                if (evn == null) continue;
+                                Long eval = resolveAddressExact(
+                                    evn, cst);
+                                if (eval == null) continue;
+                                FuncRec erec = funcByEntry.get(
+                                    eval.longValue());
+                                if (erec == null) erec =
+                                    funcByEntry.get(
+                                        isa.stripInstructionTag(
+                                            eval.longValue()));
+                                if (erec == null) continue;
+                                Varnode spv = regVarnode(
+                                    memSpOff, ps);
+                                if (spv == null) continue;
+                                Bits spb = resolveBits(spv, cst);
+                                long[] sps = (spb.sym == null)
+                                    ? null
+                                    : Bits.parseSpSym(spb.sym);
+                                if (sps == null) continue;
+                                Bits ob = stkLookup(cst, sps[0],
+                                    sps[1] + 16, 4);
+                                if (ob == null) continue;
+                                Long oval = ob.exactValue(
+                                    0xffffffffL);
+                                if (oval == null) continue;
+                                String pv = ((oval.longValue()
+                                    & p.threadUserBit) != 0)
+                                    ? "unprivileged"
+                                    : "privileged";
+                                pairs.add(erec.f.getName() + "\n"
+                                    + pv);
+                                pairEntry = erec.f.getName();
+                                pairPriv = pv;
+                            }
+                            if (pairs.size() == 1) {
+                                enm = pairEntry;
+                                priv = pairPriv;
+                            }
+                        }
+                    }
+                    if (enm == null) { unresolved++; continue; }
+                } else {
+                    // Path 1: direct endpoint (the real
+                    // k_thread_create, or z_impl itself): entry
+                    // in register arg 3, options in stack slot 4
+                    // (arg 8) = SP + 16 at the CALL. SP must be
+                    // an SP symbol; the slot value comes from
+                    // stk: cells (byte-assembling lookup covers
+                    // strd 8-byte stores over slots 4-5).
+                    long[] argRegs = null;
+                    try {
+                        argRegs = isa.argumentRegisterOffsets(
+                            callConvMap.get(callee.entryKey));
+                    } catch (Exception e) {
+                        argRegs = null;
+                    }
+                    if (argRegs == null || argRegs.length < 4) {
+                        unresolved++;
+                        continue;
+                    }
+                    Varnode entryVn = regVarnode(argRegs[3], ps);
+                    if (entryVn == null) { unresolved++; continue; }
+                    Long entryVal = resolveAddressExact(entryVn, st);
+                    if (entryVal == null) {
+                        unresolved++;
+                        continue;
+                    }
+                    FuncRec entryRec = funcByEntry.get(
+                        entryVal.longValue());
+                    if (entryRec == null) entryRec =
+                        funcByEntry.get(isa.stripInstructionTag(
+                            entryVal.longValue()));
+                    if (entryRec == null) {
+                        unresolved++;
+                        continue;
+                    }
+                    Varnode spVn = regVarnode(memSpOff, ps);
+                    if (spVn == null) { unresolved++; continue; }
+                    Bits spBits = resolveBits(spVn, st);
+                    long[] sps = (spBits.sym == null) ? null
+                        : Bits.parseSpSym(spBits.sym);
+                    if (sps == null) { unresolved++; continue; }
+                    Bits optBits = stkLookup(st, sps[0],
+                        sps[1] + 16, 4);
+                    if (optBits == null) {
+                        unresolved++;
+                        continue;
+                    }
+                    Long optVal = optBits.exactValue(0xffffffffL);
+                    if (optVal == null) {
+                        unresolved++;
+                        continue;
+                    }
+                    priv = ((optVal.longValue()
+                        & p.threadUserBit) != 0) ? "unprivileged"
+                        : "privileged";
+                    enm = entryRec.f.getName();
+                }
+                Set<String> s = privsByEntry.get(enm);
+                if (s == null) {
+                    s = new HashSet<String>();
+                    privsByEntry.put(enm, s);
+                }
+                s.add(priv);
+                Integer c = sitesByEntry.get(enm);
+                sitesByEntry.put(enm, (c == null) ? 1 : c + 1);
+            }
+        }
+        p.threadUnresolvedSites = unresolved;
+        for (Map.Entry<String, Set<String>> e :
+            privsByEntry.entrySet()) {
+            String enm = e.getKey();
+            int sites = sitesByEntry.get(enm).intValue();
+            ThreadEntry te;
+            if (calledNames.contains(enm)) {
+                te = new ThreadEntry(null, sites,
+                    "also-direct-called");
+            } else if (e.getValue().size() == 1) {
+                te = new ThreadEntry(
+                    e.getValue().iterator().next(), sites,
+                    "learned");
+            } else {
+                te = new ThreadEntry(null, sites, "conflict");
+            }
+            p.threadEntries.put(enm, te);
+            println("[*] boundary thread-entry: " + enm + " -> " +
+                te.status + (te.priv == null ? "" :
+                    " (" + te.priv + ")") + " [" + sites +
+                " site(s)]");
+        }
+        println("[*] boundary thread-entry: unresolved sites=" +
+            unresolved + ", entries=" + p.threadEntries.size());
     }
 
     @Override
@@ -11318,7 +12197,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.20\",");
+        w.println("  \"extractor_version\": \"v3.21\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -13426,6 +14305,26 @@ public class ExtractIR extends GhidraScript {
                 // Map stays partial/empty; fail-closed.
             }
         }
+        // Phase 4 V1.5: static-table + thread-entry learning.
+        // Runs once, after every fixpoint is final and before
+        // the emission loop, so learned regions feed the
+        // RAM-extension check and learned agents feed every
+        // function's boundary judgment. A failure here learns
+        // nothing (V1 behaviour) and never loses MMIO findings.
+        if (bndProfile != null) {
+            try {
+                learnStaticTables(bndProfile, funcRecs,
+                    funcByEntry);
+            } catch (Exception e) {
+                println("[!] boundary table learning failed: " + e);
+            }
+            try {
+                learnThreadEntries(bndProfile, funcRecs,
+                    funcByEntry);
+            } catch (Exception e) {
+                println("[!] boundary thread learning failed: " + e);
+            }
+        }
         for (FuncRec rec : funcRecs) {
             Function f = rec.f;
             if (!firstFn) w.println(",");
@@ -14456,6 +15355,40 @@ public class ExtractIR extends GhidraScript {
             }
             w.println("  },");
         }
+        // Phase 4 V1.5: learning diagnostics (additive; Lean
+        // ignores them). Empty arrays / 0 when learning is off
+        // or no profile is present.
+        w.println("  \"boundary_table_learning\": [");
+        if (bndProfile != null) {
+            for (int bi = 0;
+                bi < bndProfile.tableLearningJson.size(); bi++) {
+                if (bi > 0) w.println(",");
+                w.print("    " + bndProfile.tableLearningJson.get(bi));
+            }
+            w.println();
+        }
+        w.println("  ],");
+        w.println("  \"boundary_thread_entries\": [");
+        if (bndProfile != null) {
+            boolean firstTe = true;
+            for (Map.Entry<String, ThreadEntry> te :
+                bndProfile.threadEntries.entrySet()) {
+                if (!firstTe) w.println(",");
+                firstTe = false;
+                w.print("    {\"function\": \"" +
+                    esc(te.getKey()) + "\", \"privilege\": " +
+                    (te.getValue().priv == null ? "null" :
+                        "\"" + te.getValue().priv + "\"") +
+                    ", \"sites\": " + te.getValue().sites +
+                    ", \"status\": \"" + te.getValue().status +
+                    "\"}");
+            }
+            w.println();
+        }
+        w.println("  ],");
+        w.println("  \"boundary_thread_unresolved_sites\": " +
+            (bndProfile == null ? 0
+                : bndProfile.threadUnresolvedSites) + ",");
         w.println("  \"literal_scan\": {");
         w.println("    \"literal_count\": " + litScan.literalCount + ",");
         w.print("    \"attributed\": {");
