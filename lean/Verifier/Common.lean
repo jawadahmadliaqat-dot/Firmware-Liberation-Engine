@@ -292,9 +292,23 @@ def x86PortAllowed (p : Nat) : Bool :=
     MTRR_DEF_TYPE, EFER, STAR/LSTAR/CSTAR/FMASK, FS/GS bases, TSC_AUX)
     and AMD APM (SYSCFG, HWCR, GHCB, SEV_STATUS). Any MSR outside this
     list fails confinement until added here with a justification
-    comment (the allowlist path). -/
+    comment (the allowlist path).
+    Additions (CpuDxe, P5 MSR gap — named entries only, SDM-justified):
+    0x17 IA32_PLATFORM_ID (SDM Vol 4 Table 2-2, read-only; CPU
+    identification for microcode-update targeting), 0x79
+    IA32_BIOS_UPDT_TRIG (microcode-update trigger written by
+    firmware to load a microcode update), 0x830 IA32_X2APIC_ICR
+    (x2APIC interrupt-command register; IPI send for AP bring-up),
+    0x982 IA32_TME_ACTIVATE (Intel TME spec 336907 Table 4-2;
+    TME/MK-TME activation status read by firmware — bit 1 TME
+    Enable, bits 35:32 MK_TME_KEYID_BITS). No x2APIC range was
+    added: only the single named ICR entry, per the named-only
+    rule. The list is index-granular, not direction-granular, so
+    each entry permits both RDMSR and WRMSR; the observed CpuDxe
+    accesses are 0x79/0x830 writes and 0x17/0x982 reads. -/
 def x86MsrAllowed (m : Nat) : Bool :=
   m == 0x10 || m == 0x1B || m == 0x8B || m == 0xFE ||
+  m == 0x17 || m == 0x79 || m == 0x830 || m == 0x982 ||
   inRange m 0x174 0x177 ||
   m == 0x1A0 ||
   inRange m 0x200 0x210 ||

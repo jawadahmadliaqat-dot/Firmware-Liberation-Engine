@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.21-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.22-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -104,6 +104,7 @@ pre-existing (Sata/Virtio empty traces + 4 intentional synthetic FAILs).
 | v3.19 | Phase 3 coverage: 0x511 port, stripped Zephyr 97 → 156, SIO/SSI windows (RP2040 220, cdc_msc 303). |
 | v3.20 | Boundary property V1 (PPB band, static profiles, SG veneers, DMA two-judgment); contract 16/16; Zephyr MPU trophy (1 violation); BMP core family fix. |
 | v3.21 | V1.5: table learning + thread attribution built and proven (below); config-write learning design-only. |
+| v3.22 | CpuDxe MSR allowlist gap closed (below); CpuDxe PASSes generic. |
 | v3.1–v3.13 | Fixpoint tracker, MAY analysis, jump tables, call graph, points-to, tail calls, per-site transfer, clobber refinement, stack slots. |
 
 **v3.21 (V1.5) in short:** a table entry becomes a boundary region only when its
@@ -117,6 +118,13 @@ fixpoint rerun for compiler clones forwarding to `z_impl`. Config-write learning
 with must-precede is **design-only**: the engine has no must-precede machinery, the
 intra-function form would be vacuous on real targets, and Zephyr dynamic MPU
 regions are reprogrammed every context switch — no order-free substitute was built.
+
+**v3.22 (CpuDxe MSR allowlist) in short:** P5's CpuDxe MSR gap closed with four
+named MSRs, each identified from Intel documentation — 0x17 IA32_PLATFORM_ID
+(read), 0x79 IA32_BIOS_UPDT_TRIG (microcode trigger), 0x830 IA32_X2APIC_ICR (AP
+bring-up), 0x982 IA32_TME_ACTIVATE (memory-encryption status) — and CpuDxe now
+PASSes generic. Named entries only, no blanket range; the allowlist stays
+index-granular, not direction-granular.
 
 ## Honest limits (one line each)
 
