@@ -12,19 +12,19 @@
 <h2>TinyUSB cdc_msc <span class="badge pass">PASS</span></h2>
 <p>TinyUSB device example (CDC + MSC classes) on the Raspberry Pi Pico (RP2040), built from public source. Exercises two USB classes plus the RP2040 USB device controller.</p>
 <table class="stats">
-<tr><th>Fixed MMIO</th><td>224</td></tr>
+<tr><th>Fixed MMIO</th><td>324</td></tr>
 <tr><th>May accesses</th><td>0 sites / 0 addresses</td></tr>
 <tr><th>Port / MSR</th><td>0 / 0</td></tr>
-<tr><th>Extractor version</th><td>v3.12</td></tr>
+<tr><th>Extractor version</th><td>v3.22</td></tr>
 <tr><th>Lean mode</th><td>generic</td></tr>
-<tr><th>Classifier (SVD profile)</th><td>141 known / 83 suspect (all 83 verified as atomic aliases)</td></tr>
+<tr><th>Classifier (SVD profile)</th><td>141 known / 83 suspect (all 83 verified as atomic aliases; v3.12 classifier run, total now 324 at v3.22)</td></tr>
 </table>
 <h3>Lean log (verdict lines)</h3>
-<pre>trace ops: 224
+<pre>trace ops: 324
 may trace ops: 0
 VERDICT: PASS</pre>
 <h3>Ground truth</h3>
-<p>224/224 code-true, 0 unexplained extras. Matches: clock tree (~110: crystal oscillator, both PLLs, clocks), USB device-controller control plane (~60: init, interrupt, transfer, abort, buffer control, enumeration fix, timer/alarm), GPIO config (pins 0/1/25), BOOTSEL button 4 (live, via board button read), system info 1. All 83 suspects verified programmatically as atomic-alias pages (known base + 0x1000/0x2000/0x3000) — the same profile-completeness gap as the RP2040 pilot.</p>
+<p>224/224 code-true at v3.12, 0 unexplained extras. Matches: clock tree (~110: crystal oscillator, both PLLs, clocks), USB device-controller control plane (~60: init, interrupt, transfer, abort, buffer control, enumeration fix, timer/alarm), GPIO config (pins 0/1/25), BOOTSEL button 4 (live, via board button read), system info 1. Count rose 224 &rarr; 303 in v3.19 (SIO/SSI windows, second RP2040 target) and 303 &rarr; 324 in v3.20 (PPB band). All 83 suspects verified programmatically as atomic-alias pages (known base + 0x1000/0x2000/0x3000) — the same profile-completeness gap as the RP2040 pilot.</p>
 <div class="note"><b>Named misses, stated plainly.</b> (1) SIO GPIO data on a live path: the LED blink writes through SIO at 0xd0000000, outside the ARM extractor window. (2) DPRAM payload bytes: transmit/receive copies go through a struct-held computed DPRAM pointer; only 4 fixed endpoint-control DPRAM registers were recovered. (3) Standing blind spot: second-stage boot code unrecovered as a function, 0 findings in its ranges. Generic PASS means only that what was found stayed in-window.</div>
 <h3>Provenance</h3>
 <p>Source: TinyUSB (HEAD 39b9dba1), example <code>examples/device/cdc_msc</code>, board <code>raspberry_pi_pico</code>. Pico SDK on disk (HEAD 079c6f39, same as the RP2040 pilot). SVD: pico-sdk RP2040.svd, 37 blocks via pure SVD import. Toolchain: arm-none-eabi-gcc 13.2.1, cmake 3.28.3. Built ELF MD5: edae55ce2eaa672e1008b22f7538b00f.</p>

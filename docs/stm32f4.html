@@ -12,19 +12,19 @@
 <h2>STM32F4 UART <span class="badge pass">PASS</span></h2>
 <p>UART two-boards polling example from STM32CubeF4 (STM32F4-Discovery, STM32F407VG), transmitter build, built from public source. Canonical numbers below are the -O0 build.</p>
 <table class="stats">
-<tr><th>Fixed MMIO (-O0)</th><td>171</td></tr>
-<tr><th>Fixed MMIO (-O2 diagnostic)</th><td>171</td></tr>
+<tr><th>Fixed MMIO (-O0)</th><td>186</td></tr>
+<tr><th>Fixed MMIO (-O2 diagnostic)</th><td>187</td></tr>
 <tr><th>May accesses</th><td>0 sites / 0 addresses</td></tr>
 <tr><th>Port / MSR</th><td>0 / 0</td></tr>
-<tr><th>Extractor version</th><td>v3.13</td></tr>
+<tr><th>Extractor version</th><td>v3.22</td></tr>
 <tr><th>Lean mode</th><td>generic (STM32F4 has no bmp driver families)</td></tr>
-<tr><th>Classifier (-O0, SVD profile)</th><td>164 known / 7 suspect (bit-band aliases, all explained)</td></tr>
+<tr><th>Classifier (-O0, SVD profile)</th><td>164 known / 7 suspect (bit-band aliases, all explained; v3.13 classifier run, totals now 186/187 at v3.22)</td></tr>
 </table>
 <h3>Lean log (verdict lines, -O0)</h3>
-<pre>trace ops: 171
+<pre>trace ops: 186
 may trace ops: 0
 VERDICT: PASS</pre>
-<p>Diagnostic -O2 build: trace 171, VERDICT: PASS.</p>
+<p>Diagnostic -O2 build: trace 187, VERDICT: PASS. The -O0/-O2 rise from 171 (v3.20 PPB band: SysTick, SCB, NVIC accesses) is the only change since v3.13.</p>
 <h3>Ground truth</h3>
 <p>150/150 code-true at v3.12, 0 unexplained extras. At v3.13 the -O0 build recovers the GPIO plane too (+21: HAL_GPIO_Init pairs for GPIOA/GPIOD, ReadPin IDR, TogglePin ODR/BSRR, WritePin BSRR), so -O0 is now 171 and the -O2 build is 171 as well. Per-peripheral (-O0, v3.13): RCC 116, on-chip memory-interface 12, PWR 7, EXTI 8 (interrupt-mode branch only), RCC bit-band aliases 7, GPIOA 9, GPIOD 12.</p>
 <div class="note"><b>Named misses, stated plainly.</b> (1) GPIO data plane at -O0: parameters spilled to stack slots defeat the must-transfer; recovered in v3.13 by stack-slot tracking (and at -O2 already). (2) USART2 data plane at BOTH builds: the HAL handle-struct pattern (handle instance stored to RAM in main, loaded back in every UART function) defeats global seeding. Generic PASS means only that what was found stayed in-window.</div>

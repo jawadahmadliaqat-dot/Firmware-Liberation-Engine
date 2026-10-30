@@ -12,19 +12,19 @@
 <h2>nRF52 UART <span class="badge pass">PASS</span></h2>
 <p>Peripheral UART example from the nRF5 SDK, for the nRF52832 (pca10040 board), built from public source at -O3.</p>
 <table class="stats">
-<tr><th>Fixed MMIO</th><td>205</td></tr>
+<tr><th>Fixed MMIO</th><td>220</td></tr>
 <tr><th>May accesses</th><td>0 sites / 0 addresses</td></tr>
 <tr><th>Port / MSR</th><td>0 / 0</td></tr>
-<tr><th>Extractor version</th><td>v3.13</td></tr>
+<tr><th>Extractor version</th><td>v3.22</td></tr>
 <tr><th>Lean mode</th><td>generic</td></tr>
-<tr><th>Classifier (SVD profile)</th><td>181 known / 1 suspect (Errata 16, source-verified)</td></tr>
+<tr><th>Classifier (SVD profile)</th><td>181 known / 1 suspect (Errata 16, source-verified; v3.13 classifier run, total now 220 at v3.22)</td></tr>
 </table>
 <h3>Lean log (verdict lines)</h3>
-<pre>trace ops: 205
+<pre>trace ops: 220
 may trace ops: 0
 VERDICT: PASS</pre>
 <h3>Ground truth</h3>
-<p>182/182 code-true at v3.12, 0 unexplained extras. At v3.13 the TX path is recovered (+23: nrfx_uart_tx 12, nrfx_uarte_tx 11), total 205. Breakdown: board init 12 (LED pins 17&ndash;20, button pins 13&ndash;16), UART block 125 (UART0 and UARTE0 share base 0x40002000 and both drivers are runtime-reachable via the easy-DMA flag, so the static result correctly reports both), SystemInit 41 (silicon errata workarounds, every finding verified against <code>system_nrf52.c</code> source lines).</p>
+<p>182/182 code-true at v3.12, 0 unexplained extras. At v3.13 the TX path is recovered (+23: nrfx_uart_tx 12, nrfx_uarte_tx 11), total 205. At v3.20 the PPB band adds 15, total 220. Breakdown: board init 12 (LED pins 17&ndash;20, button pins 13&ndash;16), UART block 125 (UART0 and UARTE0 share base 0x40002000 and both drivers are runtime-reachable via the easy-DMA flag, so the static result correctly reports both), SystemInit 41 (silicon errata workarounds, every finding verified against <code>system_nrf52.c</code> source lines).</p>
 <div class="note"><b>Recovered in v3.13 — with a correction.</b> The UART TX data path was missing at v3.12, and the original diagnosis (stack spill) was wrong: both TX functions are entered only via direct tail branches, and CALL-only binding gave them no binding site. Slice 4 (direct-branch tail-call sites) recovers all 23. Generic PASS means only that what was found stayed in-window.</div>
 <h3>Provenance</h3>
 <p>Source: nRF5 SDK 17.1.0 (131,838,843-byte vendor zip, SHA-256 5bfe38e7&hellip;), example <code>examples/peripheral/uart/pca10040/blank/armgcc</code>. SVD: nrfx (HEAD e04a8737), <code>nrf52832/nrf52.svd</code> (SHA-256 d82d1fe4&hellip;), 66 peripherals via pure SVD import. Toolchain: arm-none-eabi-gcc 13.2.1, SDK default -O3 -g3. Built ELF MD5: ffa3e8f466b62e73c691b05005980671.</p>
