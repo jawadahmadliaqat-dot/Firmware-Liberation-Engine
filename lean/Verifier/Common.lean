@@ -305,10 +305,30 @@ def x86PortAllowed (p : Nat) : Bool :=
     added: only the single named ICR entry, per the named-only
     rule. The list is index-granular, not direction-granular, so
     each entry permits both RDMSR and WRMSR; the observed CpuDxe
-    accesses are 0x79/0x830 writes and 0x17/0x982 reads. -/
+    accesses are 0x79/0x830 writes and 0x17/0x982 reads.
+    Additions (LocalApicTimerDxe + PlatformPei, Step 2 allowlist
+    gaps — named entries only, SDM-justified, no 0x800-0x8FF
+    blanket range):
+    0x3A IA32_FEATURE_CONTROL (SDM Vol 4 Table 2-2, R/W;
+    VMX/SMX feature control incl. lock bit, written by PlatformPei
+    via a generic WRMSR helper), 0x80F Spurious Interrupt Vector
+    Register, a.k.a. IA32_X2APIC_SIVR (Intel x2APIC Specification
+    318148 Table 2-2: xAPIC MMIO offset 00F0H, MSR offset 00FH,
+    R/W; MSR index = 0x800 + offset, so 0x800 + 0x0F = 0x80F),
+    0x832 LVT Timer Register (same Table 2-2: MMIO 0320H, offset
+    032H, R/W; 0x800 + 0x32), 0x838 Initial Count Register for
+    Timer (same Table 2-2: MMIO 0380H, offset 038H, R/W;
+    0x800 + 0x38), 0x83E Divide Configuration Register for Timer
+    (same Table 2-2: MMIO 03E0H, offset 03EH, R/W; 0x800 + 0x3E).
+    The four x2APIC entries cross-check against the observed
+    helper form ECX = 0x800 + (xAPIC MMIO offset >> 4) in
+    LocalApicTimerDxe. All five registers are R/W, and the
+    observed accesses are WRMSR; the pre-existing index-granular
+    (not direction-granular) limit still applies. -/
 def x86MsrAllowed (m : Nat) : Bool :=
   m == 0x10 || m == 0x1B || m == 0x8B || m == 0xFE ||
   m == 0x17 || m == 0x79 || m == 0x830 || m == 0x982 ||
+  m == 0x3A || m == 0x80F || m == 0x832 || m == 0x838 || m == 0x83E ||
   inRange m 0x174 0x177 ||
   m == 0x1A0 ||
   inRange m 0x200 0x210 ||

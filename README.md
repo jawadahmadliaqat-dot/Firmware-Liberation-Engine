@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.22-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.23-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -57,7 +57,7 @@ A binary passed as a path is used directly (no Drive needed); a bare name syncs 
 - **Boundary** — no must-proven access crossing a configured security boundary
   (violation, unknown-agent and unknown-region counts reported, never silent).
 
-## Results (extractor v3.20, 36-target regression, 0 mismatches)
+## Results (extractor v3.23, 36-target regression, 0 mismatches)
 
 | Target | Fixed findings | May | Lean verdict |
 |---|---|---|---|
@@ -105,6 +105,7 @@ pre-existing (Sata/Virtio empty traces + 4 intentional synthetic FAILs).
 | v3.20 | Boundary property V1 (PPB band, static profiles, SG veneers, DMA two-judgment); contract 16/16; Zephyr MPU trophy (1 violation); BMP core family fix. |
 | v3.21 | V1.5: table learning + thread attribution built and proven (below); config-write learning design-only. |
 | v3.22 | CpuDxe MSR allowlist gap closed (below); CpuDxe PASSes generic. |
+| v3.23 | LocalApicTimerDxe + PlatformPei MSR allowlist gaps closed (below); both PASS generic. |
 | v3.1–v3.13 | Fixpoint tracker, MAY analysis, jump tables, call graph, points-to, tail calls, per-site transfer, clobber refinement, stack slots. |
 
 **v3.21 (V1.5) in short:** a table entry becomes a boundary region only when its
@@ -125,6 +126,20 @@ named MSRs, each identified from Intel documentation — 0x17 IA32_PLATFORM_ID
 bring-up), 0x982 IA32_TME_ACTIVATE (memory-encryption status) — and CpuDxe now
 PASSes generic. Named entries only, no blanket range; the allowlist stays
 index-granular, not direction-granular.
+
+**v3.23 (LocalApicTimerDxe + PlatformPei MSR allowlist) in short:** the two
+Step 2 confinement FAILs closed with five named MSRs, each identified from
+Intel documentation — 0x3A IA32_FEATURE_CONTROL (SDM Vol 4 Table 2-2),
+0x80F Spurious Interrupt Vector Register, 0x832 LVT Timer Register,
+0x838 Initial Count Register for Timer, 0x83E Divide Configuration
+Register for Timer (Intel x2APIC Specification 318148 Table 2-2; each
+x2APIC index cross-checked as 0x800 + (xAPIC MMIO offset >> 4)) — and
+both targets now PASS generic. Named entries only, no 0x800-0x8FF
+blanket range; the allowlist stays index-granular, not
+direction-granular. The Results header staleness (still reading v3.20)
+is fixed to v3.23 in the same change.
+
+**OVMF evaluation round (v3.23 Lean, counted):** 124 inventoried OVMF targets run — 51 PASS / 73 FAIL, all 73 FAILs empty-trace coverage (0 trace ops) with 0 real bugs and 0 bounds sites. Shell + TlsDxe needed a one-off 1G heap attempt (512M cap restored after); the 512M ceiling is no longer an open gap for this corpus.
 
 ## Honest limits (one line each)
 

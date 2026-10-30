@@ -12197,7 +12197,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.22\",");
+        w.println("  \"extractor_version\": \"v3.23\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
