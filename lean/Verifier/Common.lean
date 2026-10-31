@@ -502,7 +502,7 @@ def f1ClockGates : List ClockGate := [
   { name := "SPI1",   blockLo := 0x40013000, blockHi := 0x40013400, gateAddr := 0x40021018, gateBit := 12 },
   { name := "TIM8",   blockLo := 0x40013400, blockHi := 0x40013800, gateAddr := 0x40021018, gateBit := 13 },
   { name := "USART1", blockLo := 0x40013800, blockHi := 0x40013C00, gateAddr := 0x40021018, gateBit := 14 },
-  { name := "ADC3",   blockLo := 0x40014000, blockHi := 0x40014400, gateAddr := 0x40021018, gateBit := 15 },
+  { name := "ADC3",   blockLo := 0x40013C00, blockHi := 0x40014000, gateAddr := 0x40021018, gateBit := 15 },
   { name := "TIM2",   blockLo := 0x40000000, blockHi := 0x40000400, gateAddr := 0x4002101C, gateBit := 0 },
   { name := "TIM3",   blockLo := 0x40000400, blockHi := 0x40000800, gateAddr := 0x4002101C, gateBit := 1 },
   { name := "TIM4",   blockLo := 0x40000800, blockHi := 0x40000C00, gateAddr := 0x4002101C, gateBit := 2 },

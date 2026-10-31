@@ -43,7 +43,8 @@ import subprocess
 import sys
 from collections import Counter, defaultdict
 
-LEAN_DIR = os.path.expanduser("~/firmware_workspace/lean")
+REPO_LEAN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lean")
+LEAN_DIR = REPO_LEAN_DIR if os.path.isdir(REPO_LEAN_DIR) else os.path.expanduser("~/firmware_workspace/lean")
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -83,7 +84,8 @@ def run_lean_generic(report_path: str) -> list[str]:
     keep = [ln for ln in lines if ln.startswith(
         ("trace ops", "may trace ops", "trace non-empty", "masks consistent",
          "all addresses in MMIO window", "port/MSR sanity",
-         "port/MSR confinement", "clock-enable", "VERDICT"))]
+         "port/MSR confinement", "clock-enable", "bounds", "boundary",
+         "VERDICT"))]
     return keep
 
 
@@ -191,7 +193,7 @@ def main() -> None:
         # EXACT claim: generic-mode PASS lines only. This is not a full
         # functional certification, and no .olean artifact is cited.
         "formal_proof_status": (
-            "LEAN4_GENERIC_PASS: confinement true, clock-enable true, "
+            "LEAN4_GENERIC_PASS: confinement true, clock-enable true, bounds true, boundary true, "
             "all addresses in MMIO window, masks consistent "
             f"(extractor {report.get('extractor_version')}, must-trace "
             "only, may excluded)"

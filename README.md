@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.23-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.24-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -50,30 +50,32 @@ A binary passed as a path is used directly (no Drive needed); a bare name syncs 
 ## What it checks (Lean generic mode)
 
 - **In-window addresses** — every fixed access inside the architecture's MMIO window.
-- **Driver confinement** (bmp mode) — each driver family touches only its own peripherals.
+- **Driver confinement** (bmp mode) — each of the six named driver families (jtagtap, rcc_, st_usbfs, swdptap, aux_serial_set/clear_led, platform_) touches only its own peripherals; any other function name passes confinement unchecked (`else true` in checkBmpConfinement).
 - **Port/MSR confinement** — every port/MSR entry against an architectural allowlist.
 - **Clock-enable-before-use** — every used STM32 peripheral's gate register touched.
 - **Bounds** — no computed-pointer copy/transfer with an unsound-only guard.
 - **Boundary** — no must-proven access crossing a configured security boundary
   (violation, unknown-agent and unknown-region counts reported, never silent).
 
-## Results (extractor v3.23, 36-target regression, 0 mismatches)
+## Results (extractor v3.24, 36-target regression, 0 mismatches)
 
 | Target | Fixed findings | May | Lean verdict |
 |---|---|---|---|
-| Black Magic Probe v2.0.0 (ARM) | 447 MMIO | 7 sites | bmp PASS, generic PASS |
-| Black Magic Probe, stripped | 327 MMIO | 5 sites | generic PASS only (never bmp mode on stripped input) |
+| Black Magic Probe v2.0.0 (ARM) | 483 MMIO | 7 sites | bmp PASS, generic PASS |
+| Black Magic Probe, stripped | 335 MMIO | 5 sites | generic PASS only (never bmp mode on stripped input) |
 | STM32F4 UART (-O0 / -O2) | 186 / 187 MMIO | 0 | generic PASS |
 | nRF52 UART (-O3) | 220 MMIO | 0 | generic PASS |
-| RP2040 hello_uart | 236 MMIO | 0 | generic PASS |
-| TinyUSB cdc_msc (RP2040) | 324 MMIO | 0 | generic PASS |
-| Zephyr echo_bot (nRF52840) | 282 MMIO | 0 | generic PASS |
-| OVMF UEFI drivers (7 images) | 0 fixed MMIO · 28 ports | 0 | DxeCore / PciBus / PciHostBridge / QemuVideo PASS; Sata / Virtio FAIL (empty trace) |
-| **Corpus total (6 stacks)** | **1,695** | | |
+| RP2040 hello_uart | 268 MMIO | 0 | generic PASS |
+| TinyUSB cdc_msc (RP2040) | 398 MMIO | 0 | generic PASS |
+| Zephyr echo_bot (nRF52840) | 330 MMIO | 0 | generic PASS |
+| OVMF UEFI drivers (7 images) | 0 fixed MMIO · 29 recovered ports | 0 | DxeCore / PciBus / PciHostBridge / QemuVideo PASS (recovered trace only; protocol/BAR-mediated reach unmeasured); Sata / Virtio FAIL (empty trace — coverage FAIL, not a violation) |
+| **Corpus total (6 stacks)** | **1,885** | | |
 
-OVMF ports, PE+TE twin counted separately: DxeCore 11, PciBus 2, PciHostBridge 9,
-QemuVideo PE 3 + TE 3 (25 counting the twin once). Lean sweep: 6 FAILs, all
-pre-existing (Sata/Virtio empty traces + 4 intentional synthetic FAILs).
+OVMF ports, PE+TE twin counted separately: DxeCore 11, PciBus 2, PciHostBridge 10,
+QemuVideo PE 3 + TE 3 (26 counting the twin once). Lean sweep: 6 FAILs, all
+pre-existing — 3 empty-trace coverage FAILs (Sata, Virtio, acpi-mcfg) and 3
+intentional synthetic violation demos (syndemo-arm-violation in bmp mode,
+syndemo-clock-violation, x86-syndemo-port); none is a violation in shipped firmware.
 
 ## What it proves, in one line each
 
@@ -106,6 +108,7 @@ pre-existing (Sata/Virtio empty traces + 4 intentional synthetic FAILs).
 | v3.21 | V1.5: table learning + thread attribution built and proven (below); config-write learning design-only. |
 | v3.22 | CpuDxe MSR allowlist gap closed (below); CpuDxe PASSes generic. |
 | v3.23 | LocalApicTimerDxe + PlatformPei MSR allowlist gaps closed (below); both PASS generic. |
+| v3.24 | Phase 3 backlog: stripped 241 → 311, PciHostBridge 10 ports, spinlock 32 exact, 16-bit raw import + segmented adapter, RV64/MIPS64 calls/jump tables on fixtures; USART2 Gap B design-only. |
 | v3.1–v3.13 | Fixpoint tracker, MAY analysis, jump tables, call graph, points-to, tail calls, per-site transfer, clobber refinement, stack slots. |
 
 **v3.21 (V1.5) in short:** a table entry becomes a boundary region only when its
@@ -139,19 +142,32 @@ blanket range; the allowlist stays index-granular, not
 direction-granular. The Results header staleness (still reading v3.20)
 is fixed to v3.23 in the same change.
 
+**v3.24 (Phase 3 backlog) in short:** stripped enumeration remainder (stripped
+Zephyr 241 → 311 across items 1+3, gap to unstripped 19), PciHostBridge
+second 0x511 site recovered (ports 9 → 10), spinlock loop closed exactly
+(0 → 32 stores byte-for-byte ground truth), wrong ISR may-tail edge removed
+(honest unknown shipped), 16-bit raw-binary import + segmented adapter
+proven on synthetic Real-Mode targets, RV64/MIPS64 calls and jump tables
+proven on hand-built fixtures (absolute-pointer and 32-bit-offset forms,
+MIPS64 R6 fallthrough fixed). USART2 Gap B stays DESIGN-ONLY
+(monotonicity unproven); GPIO tail, boot2 SSI, ISR callback-store
+subsystem, and RV64/MIPS64 real targets remain open — see the backlog
+report in `~/workspace/v43-phase3backlog/BACKLOG-REPORT.md`.
+
 **OVMF evaluation round (v3.23 Lean, counted):** 124 inventoried OVMF targets run — 51 PASS / 73 FAIL, all 73 FAILs empty-trace coverage (0 trace ops) with 0 real bugs and 0 bounds sites. Shell + TlsDxe needed a one-off 1G heap attempt (512M cap restored after); the 512M ceiling is no longer an open gap for this corpus.
 
 ## Honest limits (one line each)
 
 - Generic PASS means only "what was found stayed in-window" — **not** proof of security.
+- Ghidra P-Code is the ground truth of every verdict: a verdict covers only what Ghidra recovered as P-Code and ExtractIR extracted. Code Ghidra does not recover as functions, and addresses outside the extractor's windows, are absent from the trace rather than proven absent from the firmware — the named instances are F4 USART2 (Gap B), the RP2040 boot2/SIO remainder, the Zephyr GPIO tail, and BAR/runtime-mediated OVMF access.
 - Stripped binaries: generic mode only — `bmp` mode passes vacuously on stripped input, never quote it.
 - Clock-enable v1: order-free, not must-precede; register granularity, not bit; no-RCC firmware vacuous PASS.
 - F4 USART2 invisible (Gap B, needs a redesign, not a patch); LPUART enable→disable→use not caught.
-- OVMF fixed-band MMIO is an honest zero: UEFI drivers reach hardware via protocols and runtime BARs, not fixed addresses.
+- OVMF fixed-band MMIO is an honest zero for the original 6-driver corpus: those UEFI drivers reach hardware via protocols and runtime BARs, not fixed addresses. Exception, found by P5: Tcg2Dxe is the first fixed-MMIO OVMF driver (TPM block, 18 LOADs, 9 distinct 0xFED40000+ addresses, all passing) — the zero stays true for the original 6 only.
 - Boundary V1.5 scope: static profiles + learned tables + thread attribution; config-write learning design-only; a boundary violation is a necessary condition for privilege escalation, NOT proof of an exploit.
 - Non-live 21 (all-slots seeding) is DELIBERATELY NOT enabled — a finding must mean "does call", not "could call"; deferred until a labelled JSON shape exists.
-- 16-bit real mode needs a raw-binary import path plus a segmented adapter; still open.
-- Real violations found in shipped firmware: 0. The FAILs that exist are synthetic demos and Sata/Virtio's genuinely-empty traces; the MPU/SAU boundary violations are on purpose-built proof targets.
+- 16-bit real mode has a raw-binary import path plus a segmented adapter, proven on synthetic Real-Mode targets; far-target discovery, Protected Mode, and A20 policy remain open.
+- Real violations found in shipped firmware: 0. In the 36-target sweep, the FAILs that exist are intentional synthetic violation demos and Sata/Virtio's genuinely-empty traces (empty-trace FAILs, not violations); the MPU/SAU boundary violations are on purpose-built proof targets. The 124-target OVMF evaluation round's 73 FAILs are likewise empty-trace coverage FAILs, counted separately above — none of these FAILs is a violation found in shipped firmware.
 - PciHostBridge (resolved, not a finding): ports 0x510/0x514/0x518 are QEMU fw_cfg; the allowlist grants the four named ports only, and it now PASSES.
 
 ## Screenshots (real terminal output)

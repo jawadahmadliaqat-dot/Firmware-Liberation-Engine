@@ -1,5 +1,6 @@
 import ghidra.app.script.GhidraScript;
 import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
+import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
@@ -217,6 +218,19 @@ public class ExtractIR extends GhidraScript {
     private static final int MAX_PCODE_PER_FUNCTION = 5000;
     private static final int MAX_STRINGS = 10000;
     private static final int MAX_FIXPOINT_ROUNDS = 100;
+    // v3.23 Phase 3 backlog item 3: bounded loop peeling (see
+    // peelLoopsForFunction). Caps, not tunables: a loop that needs
+    // more units or a bigger region is left exactly as today.
+    private static final int PEEL_MAX_UNITS = 64;
+    private static final int PEEL_MAX_REGION = 512;
+
+    // v3.23 Phase 3 backlog item 6: 16-bit segmented adapter gate.
+    // True only for x86:LE:16:Real Mode programs (set in run()).
+    // The Real Mode pspec defines the segment userop as
+    // res = (zext(base) << 4) + zext(inner); the Protected Mode
+    // pspec defines it as (base << 16) + inner, which is NOT a
+    // physical address without a GDT, so Protected Mode segment
+    // ops stay unknown (fail-closed) by this gate.
 
     // ---------------- Step 1: ISA abstraction ----------------
     // All ISA-specific knowledge lives behind IsaAdapter; the rest
@@ -325,6 +339,8 @@ public class ExtractIR extends GhidraScript {
     // the pre-step-1 behaviour). RISC-V programs get a RiscVIsa,
     // MIPS programs a MipsIsa, x86 programs an X86Isa.
     private IsaAdapter isa = new ArmIsa();
+    // v3.23 Phase 3 backlog item 6: see the PEEL note above.
+    private boolean seg16RealMode = false;
 
     /** Memory-propagation stack registers (set in run() before any
         fixpoint runs; -1 = that leg disabled). The stack pointer
@@ -511,6 +527,28 @@ public class ExtractIR extends GhidraScript {
                 if (o < c + ps && c < o + s) { hit = true; break; }
             }
             if (hit) kept.add(c);
+        }
+        // v43-item2: a register the callee provably restores
+        // (push on entry / pop before every return) survives
+        // the CALL even though its POP counts as a may-write
+        // above. Taint is already excluded above, and a
+        // preserved callee provably contains no inner calls,
+        // so no preserved set can come from a tainted callee.
+        // (Null here during computeClobberRef's own counting
+        // pass -- preservation is computed right after it.)
+        if (preservedRef != null) {
+            Set<Long> pv = preservedRef.get(t.getOffset());
+            if (pv == null) {
+                pv = preservedRef.get(
+                    isa.stripInstructionTag(t.getOffset()));
+            }
+            if (pv != null && !pv.isEmpty()) {
+                List<Long> kept2 = new ArrayList<Long>();
+                for (Long c : kept) {
+                    if (!pv.contains(c)) kept2.add(c);
+                }
+                kept = kept2;
+            }
         }
         long[] r = new long[kept.size()];
         for (int i = 0; i < kept.size(); i++) r[i] = kept.get(i);
@@ -727,6 +765,367 @@ public class ExtractIR extends GhidraScript {
             " tainted=" + tainted.size() +
             " direct-calls=" + totalCalls +
             " refined-calls=" + refinedCalls);
+        return ref;
+    }
+
+    // ---------------- v43-item2: restore-aware clobber ----------------
+    // v13 counts a restoring POP as a may-write, so a caller-saved
+    // register a callee pushes on entry and pops before every
+    // return still dies at the CALL -- PciHostBridge's bulk-IN
+    // helper 0x45f0 lost its 0x511 port in DX across its call to
+    // the TDX-check helper 0x45b0 exactly this way (0x45b0
+    // pushes RBX/RCX/RDX, CPUID/RDMSR clobber them, then pops
+    // all three before its single RET). This slice recovers
+    // that case with a NARROW structural proof, applied in
+    // refinedClobberForCall (must transfer only, same scope
+    // as v13; may/taint transfers keep the conservative kill).
+    //
+    // PROOF (per callee, from its own lifted P-Code only):
+    // a register R is preserved iff ALL of the following hold:
+    //  (1) PROLOGUE: the function's first instruction groups
+    //      are single-register PUSH groups (COPY R->unique;
+    //      INT_SUB SP,ps->SP; STORE [SP]=unique, in that
+    //      dataflow order, full pointer-size, R != SP).
+    //  (2) EPILOGUE: the groups immediately before the single
+    //      RETURN group are POP groups (LOAD [SP]->unique;
+    //      INT_ADD SP,ps->SP; COPY unique->R, full size,
+    //      R != SP; a dead COPY const->unique overwritten by
+    //      the LOAD is tolerated), in exact reverse order of
+    //      the pushes, same SP register, same count.
+    //  (3) SINGLE RETURN: exactly one RETURN op, in the last
+    //      group (whose other ops, if any, are only the RET's
+    //      own LOAD/INT_ADD). No other group is a push/pop.
+    //  (4) BODY DISCIPLINE: the body (between prologue and
+    //      epilogue) contains no CALL/CALLIND (a nested call
+    //      could write through a passed stack pointer or be
+    //      unbalanced -- unproven, so fail-closed), no
+    //      BRANCHIND (unbounded target), no STORE at all (any
+    //      body store could overwrite a saved slot), and no
+    //      write overlapping the SP register (no frame
+    //      adjustment, no SP aliasing).
+    //  (5) CONTROL FLOW: every real branch target (BRANCH /
+    //      CBRANCH with a ram-space target; const-space
+    //      targets are intra-instruction sleigh modeling,
+    //      e.g. the CPUID switch, and cannot leave the
+    //      instruction) is an actual instruction-group
+    //      address in [first-body-addr, first-pop-addr]:
+    //      it can neither skip pushes (targets in the
+    //      prologue), skip pops (targets inside the pop
+    //      sequence or at RET), nor leave the function.
+    //      Fall-through into the pops is the normal merge.
+    //  (6) ORDER: the op list is in non-decreasing address
+    //      order; anything else fails closed.
+    // WHY THIS IS SOUND: on every path from entry, the
+    // prologue executes (entry is the first group; no branch
+    // can target into it or re-enter it), the body runs at
+    // constant stack depth (no SP writes, no pushes/pops,
+    // no calls), and the epilogue executes in full (every
+    // branch either stays in the body or lands exactly on
+    // the first pop; fall-through reaches the pops; the
+    // single RET follows them). LIFO discipline then makes
+    // each pop load exactly the value its matching push
+    // stored -- the entry value -- so R at return equals R
+    // at entry on ALL paths, regardless of what the body
+    // wrote to R in between. Register-only: memory beyond
+    // the saved slots is never consulted (body STOREs are
+    // banned outright, so no aliasing argument is needed).
+    // SCOPE / EXCLUSIONS (fail-closed, not attempted):
+    // multi-register push/pop (ARM STM/LDM), push/pop
+    // inside the body (e.g. conditional saves), callees
+    // with inner calls, multiple returns, returns through
+    // BRANCHIND, sub-pointer-size push/pop, PUSH/POP SP,
+    // and any callee whose op list is unordered. Those
+    // callees simply get an empty preserved set (old
+    // behaviour). CALLOTHER is allowed in the body: it is
+    // a single instruction's own modeling (CPUID/RDMSR/IN),
+    // not a transfer of control, and any memory effect it
+    // had would appear as a STORE op, which rule (4) bans.
+    // Like v13, this trusts Ghidra's lift completeness.
+    private Map<Long, Set<Long>> preservedRef = null;
+
+    private boolean isRegVn(Varnode v, String regSpace) {
+        return v != null && v.getAddress() != null &&
+            regSpace.equals(v.getAddress().getAddressSpace().
+                getName());
+    }
+
+    private boolean isUniqueVn(Varnode v) {
+        return v != null && v.getAddress() != null &&
+            "unique".equals(v.getAddress().getAddressSpace().
+                getName());
+    }
+
+    /** Classify one instruction group as a single-register PUSH.
+        Returns {pushedReg, spReg}, or null. */
+    private long[] classifyPush(List<OpRec> g, String regSpace,
+        int ps) {
+        Varnode copyIn = null, copyOut = null, subReg = null,
+            storePtr = null, storeVal = null;
+        int copyIdx = -1, subIdx = -1, storeIdx = -1;
+        for (int i = 0; i < g.size(); i++) {
+            OpRec op = g.get(i);
+            if (op.mnem.equals("COPY") && op.ins.length == 1 &&
+                op.out != null) {
+                if (!isRegVn(op.ins[0], regSpace) ||
+                    !isUniqueVn(op.out) ||
+                    op.ins[0].getSize() != ps ||
+                    op.out.getSize() != ps) return null;
+                if (copyIn != null) return null;
+                copyIn = op.ins[0]; copyOut = op.out; copyIdx = i;
+            } else if (op.mnem.equals("INT_SUB") &&
+                op.ins.length == 2 && op.out != null) {
+                if (!isRegVn(op.ins[0], regSpace) ||
+                    !op.ins[1].isConstant() ||
+                    op.ins[1].getOffset() != ps ||
+                    !isRegVn(op.out, regSpace) ||
+                    !vkey(op.ins[0]).equals(vkey(op.out))) {
+                    return null;
+                }
+                if (subReg != null) return null;
+                subReg = op.ins[0]; subIdx = i;
+            } else if (op.mnem.equals("STORE") &&
+                op.ins.length == 3) {
+                if (!isRegVn(op.ins[1], regSpace) ||
+                    !isUniqueVn(op.ins[2])) return null;
+                if (storePtr != null) return null;
+                storePtr = op.ins[1]; storeVal = op.ins[2];
+                storeIdx = i;
+            } else {
+                return null;
+            }
+        }
+        if (copyIn == null || subReg == null ||
+            storePtr == null) return null;
+        if (!vkey(storePtr).equals(vkey(subReg))) return null;
+        if (!vkey(storeVal).equals(vkey(copyOut))) return null;
+        if (copyIdx >= storeIdx || subIdx >= storeIdx) return null;
+        if (copyIn.getOffset() == subReg.getOffset()) return null;
+        return new long[] {copyIn.getOffset(),
+            subReg.getOffset()};
+    }
+
+    /** Classify one instruction group as a single-register POP.
+        Returns {poppedReg, spReg}, or null. */
+    private long[] classifyPop(List<OpRec> g, String regSpace,
+        int ps) {
+        Varnode loadPtr = null, loadOut = null, addReg = null,
+            copyIn = null, copyOut = null;
+        int loadIdx = -1, copyIdx = -1;
+        List<String> deadKeys = new ArrayList<String>();
+        List<Integer> deadIdxs = new ArrayList<Integer>();
+        for (int i = 0; i < g.size(); i++) {
+            OpRec op = g.get(i);
+            if (op.mnem.equals("COPY") && op.ins.length == 1 &&
+                op.out != null) {
+                if (op.ins[0].isConstant() &&
+                    isUniqueVn(op.out)) {
+                    // Dead sleigh-template init, overwritten
+                    // by the LOAD below; validated at the end.
+                    deadKeys.add(vkey(op.out));
+                    deadIdxs.add(Integer.valueOf(i));
+                    continue;
+                }
+                if (!isUniqueVn(op.ins[0]) ||
+                    !isRegVn(op.out, regSpace) ||
+                    op.out.getSize() != ps) return null;
+                if (copyIn != null) return null;
+                copyIn = op.ins[0]; copyOut = op.out; copyIdx = i;
+            } else if (op.mnem.equals("LOAD") &&
+                op.ins.length == 2 && op.out != null) {
+                if (!isRegVn(op.ins[1], regSpace) ||
+                    !isUniqueVn(op.out)) return null;
+                if (loadOut != null) return null;
+                loadPtr = op.ins[1]; loadOut = op.out; loadIdx = i;
+            } else if (op.mnem.equals("INT_ADD") &&
+                op.ins.length == 2 && op.out != null) {
+                if (!isRegVn(op.ins[0], regSpace) ||
+                    !op.ins[1].isConstant() ||
+                    op.ins[1].getOffset() != ps ||
+                    !isRegVn(op.out, regSpace) ||
+                    !vkey(op.ins[0]).equals(vkey(op.out))) {
+                    return null;
+                }
+                if (addReg != null) return null;
+                addReg = op.ins[0];
+            } else {
+                return null;
+            }
+        }
+        if (loadOut == null || addReg == null ||
+            copyIn == null) return null;
+        if (!vkey(loadPtr).equals(vkey(addReg))) return null;
+        if (!vkey(copyIn).equals(vkey(loadOut))) return null;
+        if (loadIdx >= copyIdx) return null;
+        // Every dead init must target the LOAD's unique and
+        // precede the LOAD (so the LOAD overwrites it before
+        // the final COPY reads it).
+        for (int k = 0; k < deadKeys.size(); k++) {
+            if (!deadKeys.get(k).equals(vkey(loadOut))) {
+                return null;
+            }
+            if (deadIdxs.get(k).intValue() >= loadIdx) {
+                return null;
+            }
+        }
+        if (copyOut.getOffset() == addReg.getOffset()) return null;
+        return new long[] {copyOut.getOffset(),
+            addReg.getOffset()};
+    }
+
+    /** v43-item2: preserved-register set for one function, or
+        empty when the structural proof above does not hold. */
+    private Set<Long> preservedRegisters(List<OpRec> ops) {
+        Set<Long> none = new HashSet<Long>();
+        if (ops == null || ops.isEmpty()) return none;
+        String regSpace = isa.registerSpaceName();
+        int ps = isa.pointerSize();
+        // Group ops by instruction address, in list order.
+        List<List<OpRec>> groups = new ArrayList<List<OpRec>>();
+        List<Long> addrs = new ArrayList<Long>();
+        long prev = Long.MIN_VALUE;
+        for (OpRec op : ops) {
+            long a;
+            try {
+                a = op.instrAddr.getOffset();
+            } catch (Exception e) {
+                return none;
+            }
+            if (a < prev) return none;
+            prev = a;
+            if (!groups.isEmpty() &&
+                addrs.get(addrs.size() - 1).longValue() == a) {
+                groups.get(groups.size() - 1).add(op);
+            } else {
+                List<OpRec> g = new ArrayList<OpRec>();
+                g.add(op);
+                groups.add(g);
+                addrs.add(Long.valueOf(a));
+            }
+        }
+        int n = groups.size();
+        // (1) Prologue pushes.
+        List<Long> pushes = new ArrayList<Long>();
+        List<Long> pushSps = new ArrayList<Long>();
+        int i = 0;
+        while (i < n) {
+            long[] cl = classifyPush(groups.get(i), regSpace, ps);
+            if (cl == null) break;
+            pushes.add(Long.valueOf(cl[0]));
+            pushSps.add(Long.valueOf(cl[1]));
+            i++;
+        }
+        if (pushes.isEmpty()) return none;
+        long sp = pushSps.get(0).longValue();
+        for (Long s : pushSps) {
+            if (s.longValue() != sp) return none;
+        }
+        int prologueEnd = i;
+        // (3) Last group is the single RETURN group.
+        List<OpRec> retGroup = groups.get(n - 1);
+        int retCount = 0;
+        boolean retGroupOk = false;
+        for (OpRec op : retGroup) {
+            if (op.mnem.equals("RETURN")) {
+                retCount++;
+                retGroupOk = true;
+            } else if (!op.mnem.equals("LOAD") &&
+                !op.mnem.equals("INT_ADD")) {
+                return none;
+            }
+        }
+        if (!retGroupOk) return none;
+        for (int gi = 0; gi < n - 1; gi++) {
+            for (OpRec op : groups.get(gi)) {
+                if (op.mnem.equals("RETURN")) retCount++;
+            }
+        }
+        if (retCount != 1) return none;
+        // (2) Epilogue pops, immediately before RET.
+        int popStart = n - 1;
+        while (popStart - 1 >= prologueEnd) {
+            long[] cl = classifyPop(groups.get(popStart - 1),
+                regSpace, ps);
+            if (cl == null) break;
+            if (cl[1] != sp) return none;
+            popStart--;
+        }
+        int popCount = (n - 1) - popStart;
+        if (popCount == 0 || popCount != pushes.size()) return none;
+        for (int t = 0; t < popCount; t++) {
+            long[] cl = classifyPop(groups.get(popStart + t),
+                regSpace, ps);
+            if (cl == null) return none;
+            if (cl[0] != pushes.get(pushes.size() - 1 - t).
+                longValue()) return none;
+        }
+        // (4)+(5) Body discipline and branch targets.
+        Set<Long> groupAddrSet = new HashSet<Long>(addrs);
+        long firstBodyAddr = addrs.get(prologueEnd).longValue();
+        long popStartAddr = addrs.get(popStart).longValue();
+        for (int gi = prologueEnd; gi < popStart; gi++) {
+            if (classifyPush(groups.get(gi), regSpace, ps) !=
+                null) return none;
+            if (classifyPop(groups.get(gi), regSpace, ps) !=
+                null) return none;
+            for (OpRec op : groups.get(gi)) {
+                if (op.mnem.equals("CALL") ||
+                    op.mnem.equals("CALLIND") ||
+                    op.mnem.equals("BRANCHIND")) return none;
+                if (op.mnem.equals("STORE")) return none;
+                if (op.out != null &&
+                    isRegVn(op.out, regSpace)) {
+                    long o = op.out.getOffset();
+                    int s = op.out.getSize();
+                    if (o < sp + ps && sp < o + s) return none;
+                }
+                if ((op.mnem.equals("BRANCH") ||
+                    op.mnem.equals("CBRANCH")) &&
+                    op.ins.length >= 1) {
+                    Varnode tv = op.ins[0];
+                    if (tv != null && tv.getAddress() != null &&
+                        "ram".equals(tv.getAddress().
+                            getAddressSpace().getName())) {
+                        long tgt = tv.getOffset();
+                        if (!groupAddrSet.contains(
+                            Long.valueOf(tgt))) return none;
+                        if (tgt < firstBodyAddr ||
+                            tgt > popStartAddr) return none;
+                    }
+                }
+            }
+        }
+        return new HashSet<Long>(pushes);
+    }
+
+    /** v43-item2: per-callee preserved sets over the whole
+        program, dual-keyed like the clobber map. */
+    private Map<Long, Set<Long>> computePreservedRef(
+        List<FuncRec> funcRecs) {
+        Map<Long, Set<Long>> ref =
+            new HashMap<Long, Set<Long>>();
+        int with = 0;
+        List<String> shown = new ArrayList<String>();
+        for (FuncRec rec : funcRecs) {
+            List<OpRec> pops = rec.or.ops;
+            Set<Long> pv = preservedRegisters(pops);
+            ref.put(rec.entryKey, pv);
+            long st = isa.stripInstructionTag(rec.entryKey);
+            if (st != rec.entryKey) ref.put(st, pv);
+            if (!pv.isEmpty()) {
+                with++;
+                if (shown.size() < 40) {
+                    String nm;
+                    try {
+                        nm = rec.f.getName();
+                    } catch (Exception e) {
+                        nm = "?";
+                    }
+                    shown.add(nm + "->" + pv);
+                }
+            }
+        }
+        println("[*] preserve: funcs=" + ref.size() +
+            " withPreserved=" + with + " " + shown);
         return ref;
     }
 
@@ -959,10 +1358,16 @@ public class ExtractIR extends GhidraScript {
         - Jump tables hold ABSOLUTE pointers (non-PIC) or base-relative
           OFFSETS (PIC: target = base + loaded). Same-function entries
           become CFG successors here; cross-function entries are left
-          for recoverIndirect (pointer-table edges). RV64 note: the
-          width flag sets stride/pointer/shift, but RV64 offset tables
-          (32-bit offsets via lw) do not match the pointer-sized LOAD
-          check -- RV64 jump-table recovery is untested. */
+          for recoverIndirect (pointer-table edges). RV64 note
+          (v3.23 item 7, proven on hand-built RV64 fixtures, not on
+          a real RV64 binary -- no toolchain or real RV64 firmware
+          was on disk): the width flag sets stride/pointer/shift;
+          jalr &~1 chains unwrap in unwrapJalrChain; absolute
+          tables (ld) and 32-bit offset tables (lw, slli 2) both
+          match, with entry-width-aware reads. Indirect callees
+          and jump-table cases in stripped binaries are created by
+          the item7-table-fns pre-pass when Ghidra has no function
+          at the exact table entry. */
     private class RiscVIsa implements IsaAdapter {
         private final int stride;       // 4 (RV32) or 8 (RV64)
         private final int ptrSize;      // 4 or 8
@@ -1027,8 +1432,93 @@ public class ExtractIR extends GhidraScript {
         public int fallthroughIndex(List<OpRec> ops, int i) {
             return i + 1 < ops.size() ? i + 1 : -1;
         }
-        public int unwrapIndirectDef(List<OpRec> ops, int brIdx, int cur) {
+        /** Fold a varnode to a bit-0-clear mask constant, including
+            INT_NEGATE / INT_2COMP of a constant (constFold does not
+            handle those). The jalr/jr bit-0 clear is INT_AND(value,
+            INT_NEGATE(1)); the value is ~1 at the ISA width. */
+        private Long bit0ClearMask(List<OpRec> ops, Varnode v,
+            int beforeIdx) {
+            Long c = constFold(ops, vkey(v), beforeIdx, 16, addrMask);
+            if (c != null) return c;
+            int def = findDef(ops, vkey(v), beforeIdx);
+            if (def < 0) return null;
+            OpRec d = ops.get(def);
+            if (d.ins.length == 1 && d.ins[0].isConstant()) {
+                if (d.mnem.equals("INT_2COMP")) {
+                    return (-d.ins[0].getOffset()) & addrMask;
+                }
+                if (d.mnem.equals("INT_NEGATE")) {
+                    return (~d.ins[0].getOffset()) & addrMask;
+                }
+            }
+            return null;
+        }
+        /** Unwrap the jalr/jalr-x0 input chain (COPY hops +
+            INT_AND(~1, value)) to the def index of the unwrapped
+            value. v3.23 item 7: without this, every RV64 jalr/jalr
+            indirect site stopped at the INT_AND and stayed
+            unresolved, because RiscVIsa previously returned the def
+            unchanged and isInstructionTagMask is false for RISC-V
+            (the &~1 here is the ISA's jalr semantics, not a tag).
+            Returns the input def when the chain does not match. */
+        private int unwrapJalrChain(List<OpRec> ops, int brIdx,
+            int cur) {
+            for (int hop = 0; hop < 6; hop++) {
+                if (cur < 0) break;
+                OpRec d = ops.get(cur);
+                if (d.mnem.equals("COPY") && d.ins.length == 1 &&
+                    !d.ins[0].isConstant()) {
+                    int nxt = findDef(ops, vkey(d.ins[0]), cur);
+                    if (nxt < 0) break;
+                    cur = nxt;
+                    continue;
+                }
+                if (d.mnem.equals("INT_AND") && d.ins.length == 2) {
+                    boolean unwrapped = false;
+                    for (int s = 0; s < 2; s++) {
+                        Long mv = bit0ClearMask(ops, d.ins[s], cur);
+                        if (mv != null &&
+                            mv.longValue() == (addrMask & ~1L)) {
+                            int nxt = findDef(ops, vkey(d.ins[1 - s]),
+                                cur);
+                            if (nxt >= 0) {
+                                cur = nxt;
+                                unwrapped = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (unwrapped) continue;
+                }
+                // v3.23 item 7: the link-register jalr form computes
+                // ea = (rs1 + imm) & ~1, so after the AND there is
+                // an INT_ADD wrapper. Step through it ONLY when the
+                // constant side is exactly 0 (jalr ra, t, 0); a
+                // nonzero offset would make the stepped-to def the
+                // wrong pointer, so it stays unresolved instead.
+                if (d.mnem.equals("INT_ADD") && d.ins.length == 2) {
+                    boolean unwrapped = false;
+                    for (int s = 0; s < 2; s++) {
+                        Long c = constFold(ops, vkey(d.ins[s]), cur,
+                            16, addrMask);
+                        if (c != null && c.longValue() == 0L) {
+                            int nxt = findDef(ops, vkey(d.ins[1 - s]),
+                                cur);
+                            if (nxt >= 0) {
+                                cur = nxt;
+                                unwrapped = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (unwrapped) continue;
+                }
+                break;
+            }
             return cur;
+        }
+        public int unwrapIndirectDef(List<OpRec> ops, int brIdx, int cur) {
+            return unwrapJalrChain(ops, brIdx, cur);
         }
         public boolean hasOverlappingRegisters() { return false; }
         public long[] clobberForConvention(String conv) {
@@ -1058,15 +1548,28 @@ public class ExtractIR extends GhidraScript {
             for (int i = 0; i < ops.size(); i++) {
                 OpRec br = ops.get(i);
                 if (!br.mnem.equals("BRANCHIND") || br.ins.length < 1) continue;
-                TableMatch m = matchBranchTable(ops, i, ptrSize, ptrShift,
-                    addrMask);
+                // v3.23 item 7: unwrap the jalr &~1 chain first
+                // (BRANCHIND <- INT_AND <- value), as MIPS does for
+                // jr; the old code matched on the INT_AND itself and
+                // never recovered an RV64 jump table.
+                int cur = unwrapJalrChain(ops, i,
+                    findDef(ops, vkey(br.ins[0]), i));
+                if (cur < 0) continue;
+                TableMatch m = matchBranchTableFrom(ops, i, cur,
+                    ptrSize, ptrShift, addrMask);
                 if (m == null) continue;
+                int es = m.entrySize > 0 ? m.entrySize : ptrSize;
                 List<Integer> targets = new ArrayList<Integer>();
                 for (int k = 0; k < 64; k++) {
-                    long entryAddr = m.base + (long) ptrSize * k;
+                    long entryAddr = m.base + (long) es * k;
                     long entry;
                     try {
-                        entry = readPointer(mem, toAddr(entryAddr));
+                        if (es == 4) {
+                            entry = mem.getInt(toAddr(entryAddr));
+                        } else {
+                            entry = readPointer(mem,
+                                toAddr(entryAddr));
+                        }
                     } catch (Exception e) {
                         break;
                     }
@@ -1086,7 +1589,10 @@ public class ExtractIR extends GhidraScript {
         }
     }
 
-    /** MIPS32 adapter (MIPS64 structural via the width flag, untested).
+    /** MIPS32 adapter (MIPS64 structural via the width flag, proven
+        for calls/jump tables by v3.23 item 7 on hand-built MIPS64
+        fixtures -- no real MIPS64 binary was on disk; see the RV64
+        note above for the same caveat).
         All facts are EMPIRICAL (Ghidra 11.4.2 MIPS sleigh + probe runs
         on a real MIPS32BE binary), not from memory:
         - Language auto-detected on import: MIPS:BE:32:default.
@@ -1105,14 +1611,18 @@ public class ExtractIR extends GhidraScript {
           in table matching, not a tag on addresses.
         - Constant materialization: lui = INT_LEFT [imm, 16],
           addiu/ori = INT_ADD/INT_OR. All constant-foldable.
-        - DELAY SLOTS (the subtle part): Ghidra embeds the delay-slot
-          instruction's P-Code in the branch/call instruction's P-Code
-          AND lists the delay slot as its own instruction. The
-          standalone copy must NOT be re-executed: fallthroughIndex
-          skips it (CBRANCH/CALL fallthrough goes to the instruction
-          after the delay slot). Unconditional BRANCH/BRANCHIND keep
-          their current successors (the embedded copy already carries
-          the delay-slot effects). See fallthroughIndex.
+        - DELAY SLOTS (the subtle part, pre-R6 only): Ghidra embeds
+          the delay-slot instruction's P-Code in the branch/call
+          instruction's P-Code AND lists the delay slot as its own
+          instruction. The standalone copy must NOT be re-executed:
+          fallthroughIndex skips it (CBRANCH/CALL fallthrough goes
+          to the instruction after the delay slot). Unconditional
+          BRANCH/BRANCHIND keep their current successors (the
+          embedded copy already carries the delay-slot effects).
+          R6 REMOVED delay slots: for R6 languages fallthroughIndex
+          returns the next op unchanged (v3.23 item 7 -- the old
+          unconditional skip dropped a real STORE after an R6 jal,
+          proven by mips64_delay.elf). See fallthroughIndex.
         - Jump tables hold ABSOLUTE pointers (non-PIC: lui + addiu
           base, sll index, addu, lw, jr). The BRANCHIND input chain
           runs through a pc COPY + AND-~1 (jr bit-0 clear), which is
@@ -1122,13 +1632,20 @@ public class ExtractIR extends GhidraScript {
         private final int ptrSize;      // 4 or 8
         private final int ptrShift;     // 2 or 3
         private final long addrMask;    // 0xffffffffL or -1L
+        private final boolean hasDelaySlot;
         private final List<long[]> mmioWindows;
 
         MipsIsa(boolean is64, List<long[]> windows) {
+            this(is64, windows, true);
+        }
+
+        MipsIsa(boolean is64, List<long[]> windows,
+            boolean hasDelaySlot) {
             stride = is64 ? 8 : 4;
             ptrSize = is64 ? 8 : 4;
             ptrShift = is64 ? 3 : 2;
             addrMask = is64 ? -1L : 0xffffffffL;
+            this.hasDelaySlot = hasDelaySlot;
             mmioWindows = windows;
         }
 
@@ -1181,6 +1698,16 @@ public class ExtractIR extends GhidraScript {
             return mmioWindows;
         }
         public int fallthroughIndex(List<OpRec> ops, int i) {
+            // v3.23 item 7: MIPS R6 removed delay slots, so the
+            // branch/call P-Code embeds nothing and the next op IS
+            // the fallthrough. Skipping it (the old unconditional
+            // behaviour) silently dropped a real instruction after
+            // every R6 call/branch -- proven by mips64_delay.elf
+            // (a STORE immediately after jal vanished from the
+            // report). Pre-R6 keeps the old skip.
+            if (!hasDelaySlot) {
+                return i + 1 < ops.size() ? i + 1 : -1;
+            }
             // Skip the delay-slot instruction's standalone ops: the
             // branch/call instruction's own P-Code already embeds
             // them (verified in the probe dump), so falling through
@@ -1262,8 +1789,35 @@ public class ExtractIR extends GhidraScript {
                     boolean unwrapped = false;
                     for (int s = 0; s < 2; s++) {
                         Long mv = maskConst(ops, d.ins[s], cur);
+                        // v3.23 item 7: the old literal only matched
+                        // 32-bit (~1 = 0xFFFFFFFE). At 64-bit the mask
+                        // folds to -2, so MIPS64 jr/jalr chains never
+                        // unwrapped and every MIPS64 indirect site
+                        // stayed unresolved. Compare at ISA width.
                         if (mv != null &&
-                            mv.longValue() == 0xFFFFFFFEL) {
+                            mv.longValue() == (addrMask & ~1L)) {
+                            int nxt = findDef(ops, vkey(d.ins[1 - s]),
+                                cur);
+                            if (nxt >= 0) {
+                                cur = nxt;
+                                unwrapped = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (unwrapped) continue;
+                }
+                // v3.23 item 7: same INT_ADD-with-zero step as the
+                // RISC-V jalr chain (see there for the exactness
+                // argument); MIPS jr/jalr chains do not carry the
+                // wrapper today, but stepping only on constant 0 is
+                // fail-closed either way.
+                if (d.mnem.equals("INT_ADD") && d.ins.length == 2) {
+                    boolean unwrapped = false;
+                    for (int s = 0; s < 2; s++) {
+                        Long c = constFold(ops, vkey(d.ins[s]), cur,
+                            16, addrMask);
+                        if (c != null && c.longValue() == 0L) {
                             int nxt = findDef(ops, vkey(d.ins[1 - s]),
                                 cur);
                             if (nxt >= 0) {
@@ -1319,12 +1873,21 @@ public class ExtractIR extends GhidraScript {
                 TableMatch m = matchBranchTableFrom(ops, i, cur,
                     ptrSize, ptrShift, addrMask);
                 if (m == null) continue;
+                // v3.23 item 7: stride/decode by the matched entry
+                // width (4-byte MIPS64 lw offset tables), not by
+                // pointerSize alone.
+                int es = m.entrySize > 0 ? m.entrySize : ptrSize;
                 List<Integer> targets = new ArrayList<Integer>();
                 for (int k = 0; k < 64; k++) {
-                    long entryAddr = m.base + (long) ptrSize * k;
+                    long entryAddr = m.base + (long) es * k;
                     long entry;
                     try {
-                        entry = readPointer(mem, toAddr(entryAddr));
+                        if (es == 4) {
+                            entry = mem.getInt(toAddr(entryAddr));
+                        } else {
+                            entry = readPointer(mem,
+                                toAddr(entryAddr));
+                        }
                     } catch (Exception e) {
                         break;
                     }
@@ -1359,15 +1922,19 @@ public class ExtractIR extends GhidraScript {
         best-effort until a 32-bit test binary exists. */
     private class X86Isa implements IsaAdapter {
         private final boolean is64;
+        private final boolean is16;
+        private final AddressSpace defaultSpace;
         private final int ptrSize;
         private final int ptrShift;
         private final long addrMask;
         private final List<long[]> windows;
         private final boolean windowsDefault;
 
-        X86Isa(boolean is64, List<long[]> windows,
-            boolean windowsDefault) {
+        X86Isa(boolean is64, boolean is16, AddressSpace defaultSpace,
+            List<long[]> windows, boolean windowsDefault) {
             this.is64 = is64;
+            this.is16 = is16;
+            this.defaultSpace = defaultSpace;
             this.ptrSize = is64 ? 8 : 4;
             this.ptrShift = is64 ? 3 : 2;
             this.addrMask = is64 ? -1L : 0xffffffffL;
@@ -1466,6 +2033,27 @@ public class ExtractIR extends GhidraScript {
             return mem.getInt(addr) & 0xffffffffL;
         }
         public String formatCodeAddress(long addr) {
+            // v3.23 Phase 3 backlog item 6: 16-bit code lives
+            // in a SEGMENTED ram space (21-bit, addresses print
+            // as "seg:off", e.g. 0x10011 -> "1000:0011"), while
+            // the flat "%08x" form matches only 32/64-bit
+            // spaces. With the flat form, every branch-target
+            // lookup in buildSucc/runFixpoint/isKilledDef MISSED
+            // (firstAt keys are segmented), so branch edges
+            // vanished and fixpoint states never reached code
+            // after a branch -- observed on the item-6 may
+            // test (states null past the JMP). For 16-bit,
+            // delegate to Ghidra's own rendering (exact by
+            // construction, including the >=1MB clamp); a bad
+            // address falls back to the flat form, which
+            // simply misses the lookup (fail-closed).
+            if (is16 && defaultSpace != null) {
+                try {
+                    return defaultSpace.getAddress(addr).toString();
+                } catch (Exception e) {
+                    // Fall through to the flat form below.
+                }
+            }
             return String.format("%08x", addr);
         }
         public boolean isMmioAddress(long addr) {
@@ -2125,6 +2713,13 @@ public class ExtractIR extends GhidraScript {
             provably stack-derived (def-chain to SP/FP), computed
             once in buildOps. Stack stores can never alias globals. */
         boolean addrIsStack = false;
+        /** v3.23 Phase 3 backlog item 6: CALLOTHER userop name
+            (e.g. "segment", "in", "out") resolved once in
+            buildOps from the language's userop table; null for
+            every non-CALLOTHER op and whenever the lookup fails.
+            The segment adapter keys on this, never on the raw
+            userop index (a Ghidra internal). */
+        String userOp = null;
         OpRec(Address a, String asm, String mnem, Varnode[] ins, Varnode out) {
             this.instrAddr = a;
             this.instrAsm = asm;
@@ -2439,6 +3034,151 @@ public class ExtractIR extends GhidraScript {
             } else {
                 putKnown(bvals, vkey(out), Bits.unknown());
             }
+        } else if ((mnem.equals("INT_EQUAL") ||
+            mnem.equals("INT_NOTEQUAL") ||
+            mnem.equals("INT_LESS") || mnem.equals("INT_LESSEQUAL") ||
+            mnem.equals("INT_SLESS") || mnem.equals("INT_SLESSEQUAL") ||
+            mnem.equals("INT_SBORROW") || mnem.equals("BOOL_NEGATE") ||
+            mnem.equals("BOOL_AND") || mnem.equals("BOOL_OR") ||
+            mnem.equals("BOOL_XOR")) && out != null) {
+            // v3.23 Phase 3 backlog item 3: comparison transfer.
+            // The transfer previously had NO case for comparisons,
+            // so every flag/condition value stayed unknown -- which
+            // is why no loop exit condition could ever resolve
+            // exactly and the peel proof could never continue past
+            // unit 1. This case computes the result ONLY when the
+            // known bits force it (forced-true, forced-false, or
+            // unknown); it never guesses. Interval reasoning over
+            // known bits: a value's possible range is
+            // [ones, ones | ~zeroes] (unknown bits free). Forced
+            // equal needs full knowledge + equality; forced unequal
+            // needs one conflicting known bit. Unsigned less is
+            // forced by disjoint intervals; signed less goes
+            // through the order-preserving sign-flip (x ^ sign),
+            // compared with unsigned interval order, so no
+            // 64-bit overflow case exists. INT_SBORROW is unsigned
+            // less by definition (borrow iff a < b). A symbol on
+            // either side means unknown, except identical symbols
+            // under EQUAL/NOTEQUAL (the engine's own symbol
+            // discipline: an identical symbol string denotes the
+            // same value, which is also what meet's agree-or-drop
+            // assumes). Every other shape falls to unknown via
+            // putKnown (which drops unknown keys), never to a
+            // guessed bit. This is precision-increasing only:
+            // values that were unknown stay unknown unless forced,
+            // so the base fixpoint can only gain exactness, never
+            // lose it -- the 36-target regression measures it.
+            if (mnem.equals("BOOL_NEGATE") && ins.length == 1) {
+                Bits a = resolveBits(ins[0], bvals);
+                long m = sizeMask(out.getSize());
+                if (a.sym != null) {
+                    putKnown(bvals, vkey(out), Bits.unknown());
+                } else {
+                    putKnown(bvals, vkey(out), new Bits(
+                        a.zeroes & m, a.ones & m));
+                }
+            } else if ((mnem.equals("BOOL_AND") ||
+                mnem.equals("BOOL_OR") || mnem.equals("BOOL_XOR")) &&
+                ins.length == 2) {
+                Bits a = resolveBits(ins[0], bvals);
+                Bits b = resolveBits(ins[1], bvals);
+                long m = sizeMask(out.getSize());
+                if (a.sym != null || b.sym != null) {
+                    putKnown(bvals, vkey(out), Bits.unknown());
+                } else if (mnem.equals("BOOL_AND")) {
+                    putKnown(bvals, vkey(out), new Bits(
+                        (a.ones & b.ones) & m,
+                        (a.zeroes | b.zeroes) & m));
+                } else if (mnem.equals("BOOL_OR")) {
+                    putKnown(bvals, vkey(out), new Bits(
+                        (a.ones | b.ones) & m,
+                        (a.zeroes & b.zeroes) & m));
+                } else {
+                    putKnown(bvals, vkey(out), new Bits(
+                        ((a.ones & b.zeroes) |
+                            (a.zeroes & b.ones)) & m,
+                        ((a.ones & b.ones) |
+                            (a.zeroes & b.zeroes)) & m));
+                }
+            } else if (ins.length == 2 &&
+                ins[0].getSize() == ins[1].getSize()) {
+                Bits a0 = resolveBits(ins[0], bvals);
+                Bits b0 = resolveBits(ins[1], bvals);
+                long m = sizeMask(out.getSize());
+                int w = ins[0].getSize() * 8;
+                long inMask = sizeMask(ins[0].getSize());
+                // Mask to the compared width: a wider view's high
+                // bits must never force an equality/inequality
+                // verdict about the low bits actually compared.
+                Bits a = new Bits(a0.ones & inMask,
+                    a0.zeroes & inMask, a0.sym, a0.symW);
+                Bits b = new Bits(b0.ones & inMask,
+                    b0.zeroes & inMask, b0.sym, b0.symW);
+                Long res = null;
+                if (a.sym != null || b.sym != null) {
+                    if (a.sym != null && a.sym.equals(b.sym) &&
+                        (mnem.equals("INT_EQUAL") ||
+                            mnem.equals("INT_NOTEQUAL"))) {
+                        res = mnem.equals("INT_EQUAL") ? 1L : 0L;
+                    }
+                } else if (mnem.equals("INT_EQUAL") ||
+                    mnem.equals("INT_NOTEQUAL")) {
+                    boolean forcedEq = (a.ones == b.ones) &&
+                        (a.zeroes == b.zeroes) &&
+                        ((a.ones | a.zeroes) & inMask) == inMask;
+                    boolean forcedNe = ((a.ones & b.zeroes) |
+                        (a.zeroes & b.ones)) != 0;
+                    if (forcedEq) {
+                        res = mnem.equals("INT_EQUAL") ? 1L : 0L;
+                    } else if (forcedNe) {
+                        res = mnem.equals("INT_EQUAL") ? 0L : 1L;
+                    }
+                } else {
+                    // Unsigned interval bounds.
+                    long aLo = a.ones & inMask;
+                    long aHi = (a.ones | ~a.zeroes) & inMask;
+                    long bLo = b.ones & inMask;
+                    long bHi = (b.ones | ~b.zeroes) & inMask;
+                    boolean signed = mnem.equals("INT_SLESS") ||
+                        mnem.equals("INT_SLESSEQUAL");
+                    boolean strict = mnem.equals("INT_LESS") ||
+                        mnem.equals("INT_SLESS") ||
+                        mnem.equals("INT_SBORROW");
+                    boolean forcedTrue;
+                    boolean forcedFalse;
+                    if (!signed) {
+                        forcedTrue = strict ?
+                            (Long.compareUnsigned(aHi, bLo) < 0) :
+                            (Long.compareUnsigned(aHi, bLo) <= 0);
+                        forcedFalse = strict ?
+                            (Long.compareUnsigned(aLo, bHi) >= 0) :
+                            (Long.compareUnsigned(aLo, bHi) > 0);
+                    } else {
+                        long sign = (w >= 64) ? Long.MIN_VALUE :
+                            (1L << (w - 1));
+                        long taLo = aLo ^ sign;
+                        long taHi = aHi ^ sign;
+                        long tbLo = bLo ^ sign;
+                        long tbHi = bHi ^ sign;
+                        forcedTrue = strict ?
+                            (Long.compareUnsigned(taHi, tbLo) < 0) :
+                            (Long.compareUnsigned(taHi, tbLo) <= 0);
+                        forcedFalse = strict ?
+                            (Long.compareUnsigned(taLo, tbHi) >= 0) :
+                            (Long.compareUnsigned(taLo, tbHi) > 0);
+                    }
+                    if (forcedTrue) res = 1L;
+                    else if (forcedFalse) res = 0L;
+                }
+                if (res == null) {
+                    putKnown(bvals, vkey(out), Bits.unknown());
+                } else {
+                    putKnown(bvals, vkey(out),
+                        Bits.exact(res.longValue(), m));
+                }
+            } else {
+                putKnown(bvals, vkey(out), Bits.unknown());
+            }
         } else if (mnem.equals("LOAD") && out != null) {
             putKnown(bvals, vkey(out), loadBits(ins, out, bvals, mem));
         } else if (mnem.equals("STORE") && ins.length >= 3) {
@@ -2729,17 +3469,54 @@ public class ExtractIR extends GhidraScript {
             }
             if (out != null) putKnown(bvals, vkey(out), Bits.unknown());
         } else if (mnem.equals("CALLOTHER")) {
-            // v7 cfgspace: CF8/CFC config-space tracking. The
-            // "cfg:addr" cell holds the last OUT 0xCF8 value. Only a
-            // constant config address can yield a BAR symbol; only
-            // BAR registers (0x10..0x24) yield symbols; a CFC write
-            // dirties the latch (BAR sizing read-backs return a size
-            // mask, never a BAR base); an unknown port may be a CFC
-            // write, so it dirties the latch too. A config WRITE
-            // never creates a symbol. All other config reads stay
-            // unknown. RDMSR/WRMSR fall through to unknown out.
+            // v7 cfgspace: CF8/CFC config-space tracking (see
+            // below). The "cfg:addr" cell holds the last OUT
+            // 0xCF8 value; only a constant config address can
+            // yield a BAR symbol; a CFC write dirties the latch;
+            // an unknown port may be a CFC write, so it dirties
+            // the latch too. A config WRITE never creates a
+            // symbol. All other config reads stay unknown.
+            // RDMSR/WRMSR fall through to unknown out.
             String am = op.instrAsm == null ? "" : op.instrAsm;
-            if (am.equalsIgnoreCase("OUT") && ins.length >= 3) {
+            // v3.23 Phase 3 backlog item 6: segmented-address
+            // adapter (Real Mode ONLY, via seg16RealMode). The
+            // lifter's segment userop is
+            //   out[4] = (zext(base[2]) << 4) + zext(inner[2])
+            // with base = the segment register (DS/ES/SS/CS) and
+            // inner = the offset. It evaluates ONLY when both
+            // legs are exact constants with no symbol; anything
+            // else (runtime-computed segment base, unknown
+            // offset, wrong shape) falls through to unknown --
+            // never a guessed linear address. The result is
+            // deliberately NOT masked to 20 bits: it follows
+            // Ghidra's own formula exactly, so a value in
+            // 0x100000..0x10FFEF is reported as computed (A20
+            // wrap on real hardware would differ; see the
+            // item-6 report's limits). Protected Mode is
+            // excluded by the gate: its (selector << 16) +
+            // offset is not a physical address without a GDT.
+            if (seg16RealMode && "segment".equals(op.userOp) &&
+                ins.length >= 3 && out != null &&
+                out.getSize() == 4 &&
+                ins[1].getSize() == 2 && ins[2].getSize() == 2 &&
+                ins[1].getAddress() != null &&
+                "register".equals(ins[1].getAddress()
+                    .getAddressSpace().getName())) {
+                Bits base = resolveBits(ins[1], bvals);
+                Bits inner = resolveBits(ins[2], bvals);
+                Long bv = (base.sym == null) ?
+                    base.exactValue(0xFFFFL) : null;
+                Long nv = (inner.sym == null) ?
+                    inner.exactValue(0xFFFFL) : null;
+                if (bv != null && nv != null) {
+                    long linear = ((bv.longValue() << 4) +
+                        nv.longValue()) & sizeMask(4);
+                    putKnown(bvals, vkey(out),
+                        Bits.exact(linear, sizeMask(4)));
+                } else {
+                    putKnown(bvals, vkey(out), Bits.unknown());
+                }
+            } else if (am.equalsIgnoreCase("OUT") && ins.length >= 3) {
                 Long port = resolveAddressExact(ins[1], bvals);
                 if (port != null && port == 0xCF8L) {
                     Bits val = resolveBits(ins[2], bvals);
@@ -3063,6 +3840,712 @@ public class ExtractIR extends GhidraScript {
         return new FixResult(in, converged);
     }
 
+    // ---------------- v3.23 Phase 3 backlog item 3: bounded loop peeling ----
+    // PROBLEM: the must-fixpoint joins every loop back edge into the
+    // loop header, so a loop-carried value that changes per iteration
+    // (an address walking a block, a pin index walking an array) meets
+    // with itself and becomes U. Every access whose address depends on
+    // it then records nothing, even when the loop's own code proves
+    // each iteration's address exactly. Three witnesses, one class:
+    // spin_locks_reset's stmia loop (0/32), boot2's SSI polling loops
+    // (21 SSI instructions), pinctrl_configure_pins' GPIO tail (10).
+    //
+    // DESIGN (proven-prefix peeling, merged fixpoint only):
+    // For a loop that passes every fail-closed gate below, unroll it
+    // ONE UNIT AT A TIME, where a unit is one pass over the loop
+    // region (header + body, back and exit edges cut). Unit 1 starts
+    // from the loop's pre-header state (the meet of its outside
+    // predecessors' out-states, taken from the merged fixpoint --
+    // never from the joined header state). Each further unit starts
+    // from the previous unit's back-edge out-state. A unit is
+    // RECORDED only when its entry is proven: unit 1 by loop entry
+    // (the engine's established reachable-arm semantics), unit k+1
+    // by unit k's exit condition resolving EXACTLY to "continue".
+    // Peeling stops at the first unit whose continuation is unproven
+    // (exit condition U, non-converged unit fixpoint, unit cap) or
+    // proven to exit. Units past the stop are left exactly as today
+    // (joined, U, unrecorded) -- the tail is never widened, guessed,
+    // or block-assumed. This is why no trip-count analysis is needed
+    // and no iteration is ever invented: the peeled prefix is exactly
+    // the iterations the loop provably executes, and the proof is
+    // re-checked per unit from the engine's own transfer functions,
+    // not from a pattern match on the induction variable.
+    //
+    // GATES (any failure skips the loop with zero change):
+    //  (a) single back edge into a single header (header dominates
+    //      the back source, both reachable in the merged fixpoint),
+    //      no self-loop; (b) single-entry region: every region op
+    //      except the header has all predecessors inside the region
+    //      (a mid-body entry would break the per-unit proof);
+    //  (c) exactly one exit edge; (d) the exit branch is either the
+    //      header (while shape: header CBRANCH + body-end BRANCH)
+    //      or the back source (do-while shape: end CBRANCH);
+    //  (e) no CALL/CALLIND/BRANCHIND/RETURN in the region (calls
+    //      would need per-unit summary reasoning; the transfer
+    //      handles them soundly, but v1 declines the review
+    //      surface -- a loop with calls simply keeps old behaviour);
+    //  (f) region <= PEEL_MAX_REGION ops, units <= PEEL_MAX_UNITS;
+    //  (g) the merged fixpoint converged and the pre-header state
+    //      is non-null (a header at op 0 has no outside
+    //      predecessors, so it is skipped, not guessed).
+    //
+    // MONOTONICITY / TERMINATION (argued, not assumed):
+    //  The pass adds NO new fixpoint to the pipeline and feeds
+    //  NOTHING back into any fixpoint: peeled findings are recorded
+    //  and never become entry states or summaries, so there is no
+    //  new iteration whose monotonicity could fail. Each within-unit
+    //  sweep uses the base transfer/meet/stripUniques unchanged, over
+    //  the same flat agree-or-U lattice, so it inherits the base
+    //  fixpoint's monotonicity; and it terminates because the unit
+    //  CFG has its back edge cut (a DAG plus at most inner loops),
+    //  swept at most MAX_FIXPOINT_ROUNDS with a fail-closed null on
+    //  non-convergence. The outer work is finite by construction:
+    //  functions x back edges x PEEL_MAX_UNITS x PEEL_MAX_REGION.
+    //
+    // SOUNDNESS (address-must, the engine's established meaning):
+    //  A peeled access is recorded only if (i) its unit's entry is
+    //  proven as above, and (ii) its address is exact in the
+    //  within-unit fixpoint state. Exactness in a joined state means
+    //  every path through the unit agrees (meet drops any
+    //  disagreement to U), so the exit-condition proof is
+    //  path-independent, and an exact address is the address the
+    //  real iteration touches on every path. The unit contains the
+    //  whole loop body with internal branches preserved, so the real
+    //  iteration's path is always one of the unit's paths. No
+    //  may-value is promoted (states are must-Bits), no "base +
+    //  unknown index stays in block" assumption is made anywhere
+    //  (R3 stays forbidden: an unknown address simply records
+    //  nothing), and no iteration past the proven prefix is recorded.
+    //  Appending is deduped on (instr, location) against the exact
+    //  merged+clone identity set (verified by set equality over
+    //  parsed entry ids; any parse or set mismatch skips the
+    //  function entirely), so findings are only ADDED, never
+    //  duplicated or replaced. The may fixpoint, provenance,
+    //  bounds, clones, and Lean inputs are untouched.
+    //
+    // KNOWN NON-CLOSURES (the gates say so, loudly):
+    //  - pinctrl GPIO tail: fails (e) (decode CALLs in the body),
+    //    fails the pre-state (pins pointer U in every clone), and
+    //    would still fail on decode's arg-independent merged return
+    //    summary. Loop precision alone cannot close it; it needs the
+    //    binding-specific-summary machinery (same class as the
+    //    USART2 Gap B redesign), which is out of this item.
+    //  - boot2 SSI loops: the 0x58 loop fails (e) (CALL in body);
+    //    the 0xac polling loop has two back edges and a
+    //    data-dependent (MMIO status bit) exit, so its continuation
+    //    never resolves exactly. Both keep old behaviour.
+    //  - spin_locks_reset: passes every gate (straight-line body,
+    //    single back edge, single exit, in-function constants).
+    //    Expected: 0 -> 32 stores.
+    //
+    // Within-unit fixpoint over the region with explicit successors
+    // (back and exit edges cut). Returns the in-state map, or null
+    // on non-convergence (fail-closed: the caller records nothing
+    // for that unit). Mirrors runFixpoint's sweep exactly: same
+    // transfer, same meet, same unique-stripping rule.
+    private Map<Integer, Map<String, Bits>> peelUnitFixpoint(
+        List<OpRec> ops, Map<Integer, List<Integer>> keptSucc,
+        List<Integer> region, int headerIdx,
+        Map<String, Bits> entry, Memory mem,
+        Set<Integer> loopCallOps) {
+        Map<Integer, Map<String, Bits>> in =
+            new HashMap<Integer, Map<String, Bits>>();
+        in.put(headerIdx, new HashMap<String, Bits>(entry));
+        boolean converged = false;
+        for (int round = 0; round < MAX_FIXPOINT_ROUNDS &&
+            !converged; round++) {
+            boolean changed = false;
+            for (int idx : region) {
+                Map<String, Bits> cur = in.get(idx);
+                if (cur == null) continue;
+                Map<String, Bits> out =
+                    new HashMap<String, Bits>(cur);
+                applyTransfer(out, ops.get(idx), mem, idx,
+                    loopCallOps);
+                List<Integer> ss = keptSucc.get(idx);
+                if (ss == null) continue;
+                for (int s : ss) {
+                    Map<String, Bits> prop = out;
+                    if (!ops.get(s).instrAddr.equals(
+                        ops.get(idx).instrAddr)) {
+                        prop = stripUniques(out);
+                    }
+                    Map<String, Bits> merged =
+                        meet(in.get(s), prop);
+                    if (!sameState(in.get(s), merged)) {
+                        in.put(s, merged);
+                        changed = true;
+                    }
+                }
+            }
+            if (!changed) converged = true;
+        }
+        return converged ? in : null;
+    }
+
+    // Parse one recorded entry's (instr, location) identity back out
+    // of its JSON string, in recordMustFindings' id format. Returns
+    // null when the entry does not match the expected shape (the
+    // caller then skips the function rather than risk a duplicate).
+    private String peelParseId(String json, String kind) {
+        int ii = json.indexOf("\"instr\": \"");
+        if (ii < 0) return null;
+        int is = ii + 10;
+        int ie = json.indexOf("\"", is);
+        if (ie < 0) return null;
+        String instr = json.substring(is, ie);
+        if (kind.equals("mmio")) {
+            int ai = json.indexOf("\"address\": \"0x");
+            if (ai < 0) return null;
+            int as = ai + 14;
+            int ae = json.indexOf("\"", as);
+            if (ae < 0) return null;
+            return "mmio:" + instr + ":0x" + json.substring(as, ae);
+        }
+        if (kind.equals("port")) {
+            int pi = json.indexOf("\"port\": \"0x");
+            if (pi < 0) return null;
+            int ps = pi + 11;
+            int pe = json.indexOf("\"", ps);
+            if (pe < 0) return null;
+            return "port:" + instr + ":0x" + json.substring(ps, pe);
+        }
+        if (kind.equals("msr")) {
+            int mi = json.indexOf("\"index\": \"0x");
+            if (mi < 0) return null;
+            int ms = mi + 12;
+            int me = json.indexOf("\"", ms);
+            if (me < 0) return null;
+            return "msr:" + instr + ":0x" + json.substring(ms, me);
+        }
+        // bar: numeric bus/device/function/bar/offset fields.
+        String[] keys = new String[] { "bus", "device", "function",
+            "bar", "offset" };
+        StringBuilder sb = new StringBuilder("bar:" + instr);
+        for (String k : keys) {
+            int ki = json.indexOf("\"" + k + "\": ");
+            if (ki < 0) return null;
+            int ks = ki + k.length() + 4;
+            int ke = ks;
+            while (ke < json.length() &&
+                Character.isDigit(json.charAt(ke))) ke++;
+            if (ke == ks) return null;
+            sb.append(":").append(json.substring(ks, ke));
+        }
+        return sb.toString();
+    }
+
+    // Bounded loop peeling for one function, additive only. Appends
+    // proven-prefix findings to mmio/portIo/msr/barRel (and boundary
+    // candidates to bndAccesses, exactly like the clone block) and
+    // accumulates counts into peelTotals [loops, units, mmio, port,
+    // msr, bar, skipped]. Never removes, replaces, or duplicates.
+    private void peelLoopsForFunction(FuncRec rec, List<OpRec> ops,
+        FixResult fx, Map<Integer, List<Integer>> branchTargets,
+        Memory mem, List<String> mmio, List<String> portIo,
+        List<String> msr, List<String> barRel,
+        List<BoundaryAccess> bndAccesses,
+        BoundaryProfile bndProfile,
+        Map<Long, List<PerSiteGroup>> persiteByCallee,
+        int[] peelTotals) {
+        try {
+            if (fx == null || fx.inStates == null ||
+                !fx.converged || ops == null || ops.size() < 2) return;
+            List<List<Integer>> succ = buildSucc(ops, branchTargets);
+            int n = ops.size();
+            // Predecessors.
+            List<List<Integer>> preds = new ArrayList<List<Integer>>(n);
+            for (int i = 0; i < n; i++) preds.add(new ArrayList<Integer>());
+            boolean anyBackward = false;
+            for (int i = 0; i < n; i++) {
+                for (int s : succ.get(i)) {
+                    if (s < 0 || s >= n) continue;
+                    preds.get(s).add(i);
+                    if (s < i) anyBackward = true;
+                }
+            }
+            if (!anyBackward) return;
+            // Dominators (BitSet iteration, entry = op 0). A header
+            // dominates its back source, or the edge is not a loop
+            // back edge at all (irreducible jump: skipped).
+            java.util.BitSet[] dom = new java.util.BitSet[n];
+            for (int i = 0; i < n; i++) {
+                dom[i] = new java.util.BitSet(n);
+                if (i == 0) dom[i].set(0);
+                else dom[i].set(0, n);
+            }
+            boolean domChanged = true;
+            while (domChanged) {
+                domChanged = false;
+                for (int i = 1; i < n; i++) {
+                    java.util.BitSet ns = new java.util.BitSet(n);
+                    ns.set(0, n);
+                    for (int p : preds.get(i)) ns.and(dom[p]);
+                    ns.set(i);
+                    if (!ns.equals(dom[i])) {
+                        dom[i] = ns;
+                        domChanged = true;
+                    }
+                }
+            }
+            // Back edges grouped by header; multi-source headers
+            // are skipped (v1: single back edge only).
+            Map<Integer, Integer> backByHeader =
+                new HashMap<Integer, Integer>();
+            Set<Integer> multiHeader = new HashSet<Integer>();
+            for (int i = 0; i < n; i++) {
+                if (fx.inStates[i] == null) continue;
+                for (int s : succ.get(i)) {
+                    if (s < 0 || s >= n || s == i) continue;
+                    if (fx.inStates[s] == null) continue;
+                    if (!dom[i].get(s)) continue;
+                    if (backByHeader.containsKey(s)) {
+                        if (backByHeader.get(s).intValue() != i) {
+                            multiHeader.add(s);
+                        }
+                    } else {
+                        backByHeader.put(s, i);
+                    }
+                }
+            }
+            if (backByHeader.isEmpty()) return;
+            // First-op index per instruction address (same rule as
+            // buildSucc), for resolving CBRANCH taken targets.
+            Map<String, Integer> firstAt = new HashMap<String, Integer>();
+            for (int i = 0; i < n; i++) {
+                String a = ops.get(i).instrAddr.toString();
+                if (!firstAt.containsKey(a)) firstAt.put(a, i);
+            }
+            // Identity set for dedup: parse the current lists
+            // (merged + clone findings, as they stand at this hook)
+            // and require exact set equality with the replayed
+            // merged + clone identities. Any mismatch (parse failure
+            // or set difference) skips the function: a wrong dedup
+            // set could duplicate a finding, and a duplicate is
+            // worse than a missed peel.
+            Set<String> haveMmio = new HashSet<String>();
+            Set<String> havePort = new HashSet<String>();
+            Set<String> haveMsr = new HashSet<String>();
+            Set<String> haveBar = new HashSet<String>();
+            boolean parseOk = true;
+            for (String e : mmio) {
+                String id = peelParseId(e, "mmio");
+                if (id == null) { parseOk = false; break; }
+                haveMmio.add(id);
+            }
+            if (parseOk) {
+                for (String e : portIo) {
+                    String id = peelParseId(e, "port");
+                    if (id == null) { parseOk = false; break; }
+                    havePort.add(id);
+                }
+            }
+            if (parseOk) {
+                for (String e : msr) {
+                    String id = peelParseId(e, "msr");
+                    if (id == null) { parseOk = false; break; }
+                    haveMsr.add(id);
+                }
+            }
+            if (parseOk) {
+                for (String e : barRel) {
+                    String id = peelParseId(e, "bar");
+                    if (id == null) { parseOk = false; break; }
+                    haveBar.add(id);
+                }
+            }
+            if (!parseOk) {
+                peelTotals[6]++;
+                println("[!] peel: " + rec.f.getName() +
+                    " entry-parse failed, skipped.");
+                return;
+            }
+            // Replayed merged identities + clone identities.
+            Set<String> repMmio = new HashSet<String>();
+            Set<String> repPort = new HashSet<String>();
+            Set<String> repMsr = new HashSet<String>();
+            Set<String> repBar = new HashSet<String>();
+            for (int ri = 0; ri < n; ri++) {
+                Map<String, Bits> rb = (ri < fx.inStates.length) ?
+                    fx.inStates[ri] : null;
+                List<String> tM = new ArrayList<String>();
+                List<String> tP = new ArrayList<String>();
+                List<String> tS = new ArrayList<String>();
+                List<String> tB = new ArrayList<String>();
+                List<String> tMi = new ArrayList<String>();
+                List<String> tPi = new ArrayList<String>();
+                List<String> tSi = new ArrayList<String>();
+                List<String> tBi = new ArrayList<String>();
+                recordMustFindings(ops.get(ri), rb, mem,
+                    tM, tP, tS, tB, tMi, tPi, tSi, tBi,
+                    null, null, null);
+                repMmio.addAll(tMi);
+                repPort.addAll(tPi);
+                repMsr.addAll(tSi);
+                repBar.addAll(tBi);
+            }
+            List<PerSiteGroup> pgroups = (persiteByCallee == null) ?
+                null : persiteByCallee.get(rec.entryKey);
+            if (pgroups != null) {
+                for (PerSiteGroup g : pgroups) {
+                    if (g.fx == null || g.fx.inStates == null) continue;
+                    for (int ci = 0; ci < n; ci++) {
+                        Map<String, Bits> cb =
+                            (ci < g.fx.inStates.length) ?
+                            g.fx.inStates[ci] : null;
+                        List<String> tM = new ArrayList<String>();
+                        List<String> tP = new ArrayList<String>();
+                        List<String> tS = new ArrayList<String>();
+                        List<String> tB = new ArrayList<String>();
+                        List<String> tMi = new ArrayList<String>();
+                        List<String> tPi = new ArrayList<String>();
+                        List<String> tSi = new ArrayList<String>();
+                        List<String> tBi = new ArrayList<String>();
+                        recordMustFindings(ops.get(ci), cb, mem,
+                            tM, tP, tS, tB, tMi, tPi, tSi, tBi,
+                            null, null, null);
+                        repMmio.addAll(tMi);
+                        repPort.addAll(tPi);
+                        repMsr.addAll(tSi);
+                        repBar.addAll(tBi);
+                    }
+                }
+            }
+            if (!repMmio.equals(haveMmio) || !repPort.equals(havePort) ||
+                !repMsr.equals(haveMsr) || !repBar.equals(haveBar)) {
+                peelTotals[6]++;
+                println("[!] peel: " + rec.f.getName() +
+                    " identity-set mismatch, skipped.");
+                return;
+            }
+            // Peel each eligible loop.
+            for (Map.Entry<Integer, Integer> be :
+                backByHeader.entrySet()) {
+                int header = be.getKey().intValue();
+                int backSource = be.getValue().intValue();
+                if (multiHeader.contains(header)) continue;
+                // Natural loop: reverse walk from the back source
+                // without crossing the header.
+                Set<Integer> region = new HashSet<Integer>();
+                region.add(header);
+                region.add(backSource);
+                java.util.ArrayDeque<Integer> stack =
+                    new java.util.ArrayDeque<Integer>();
+                stack.push(backSource);
+                while (!stack.isEmpty()) {
+                    int cur = stack.pop();
+                    for (int p : preds.get(cur)) {
+                        if (p == header) continue;
+                        if (region.add(p)) stack.push(p);
+                    }
+                }
+                if (region.size() > PEEL_MAX_REGION) continue;
+                boolean gateFail = false;
+                for (int o : region) {
+                    String m = ops.get(o).mnem;
+                    if (m.equals("CALL") || m.equals("CALLIND") ||
+                        m.equals("BRANCHIND") || m.equals("RETURN")) {
+                        gateFail = true;
+                        break;
+                    }
+                }
+                if (gateFail) continue;
+                // Single entry: only the header may have outside
+                // predecessors. Back edges into the header from the
+                // region must be exactly the one counted.
+                int backCount = 0;
+                for (int o : region) {
+                    if (o != header) {
+                        for (int p : preds.get(o)) {
+                            if (!region.contains(p)) {
+                                gateFail = true;
+                                break;
+                            }
+                        }
+                        if (gateFail) break;
+                    }
+                    for (int s : succ.get(o)) {
+                        if (s == header) backCount++;
+                    }
+                }
+                if (gateFail || backCount != 1) continue;
+                // Exactly one exit edge.
+                int exitOp = -1;
+                int exitTarget = -1;
+                int exitCount = 0;
+                for (int o : region) {
+                    for (int s : succ.get(o)) {
+                        if (s < 0 || s >= n) continue;
+                        if (region.contains(s)) continue;
+                        if (o == backSource && s == header) continue;
+                        exitOp = o;
+                        exitTarget = s;
+                        exitCount++;
+                    }
+                }
+                if (exitCount != 1) continue;
+                boolean whileShape;
+                int bodyEntry = -1;
+                if (exitOp == header) {
+                    // While shape: header CBRANCH (body/exit) +
+                    // body-end BRANCH back to the header.
+                    if (!ops.get(header).mnem.equals("CBRANCH") ||
+                        ops.get(header).ins.length < 2) continue;
+                    if (!ops.get(backSource).mnem.equals("BRANCH")) continue;
+                    if (succ.get(backSource).size() != 1 ||
+                        succ.get(backSource).get(0).intValue() != header) continue;
+                    if (succ.get(header).size() != 2) continue;
+                    for (int s : succ.get(header)) {
+                        if (s == exitTarget) continue;
+                        if (region.contains(s)) bodyEntry = s;
+                    }
+                    if (bodyEntry < 0) continue;
+                    whileShape = true;
+                } else if (exitOp == backSource) {
+                    // Do-while shape: end CBRANCH (back/exit).
+                    if (!ops.get(backSource).mnem.equals("CBRANCH") ||
+                        ops.get(backSource).ins.length < 2) continue;
+                    if (succ.get(backSource).size() != 2) continue;
+                    boolean hasH = false;
+                    boolean hasE = false;
+                    for (int s : succ.get(backSource)) {
+                        if (s == header) hasH = true;
+                        if (s == exitTarget) hasE = true;
+                    }
+                    if (!hasH || !hasE) continue;
+                    whileShape = false;
+                } else {
+                    continue;
+                }
+                // Pre-header state: meet of outside predecessors'
+                // out-states (transfer + unique-strip on
+                // instruction change, exactly like runFixpoint).
+                Map<String, Bits> pre = null;
+                for (int p : preds.get(header)) {
+                    if (region.contains(p)) continue;
+                    if (p < 0 || p >= fx.inStates.length) continue;
+                    Map<String, Bits> pist = fx.inStates[p];
+                    if (pist == null) continue;
+                    Map<String, Bits> out =
+                        new HashMap<String, Bits>(pist);
+                    applyTransfer(out, ops.get(p), mem, p,
+                        rec.loopCallOps);
+                    if (!ops.get(p).instrAddr.equals(
+                        ops.get(header).instrAddr)) {
+                        out = stripUniques(out);
+                    }
+                    pre = meet(pre, out);
+                }
+                if (pre == null) continue;
+                // Kept successors: inside the region, minus the
+                // back edge. (Exit successors are outside the
+                // region, so they are already excluded.)
+                Map<Integer, List<Integer>> keptSucc =
+                    new HashMap<Integer, List<Integer>>();
+                for (int o : region) {
+                    List<Integer> ks = new ArrayList<Integer>();
+                    for (int s : succ.get(o)) {
+                        if (!region.contains(s)) continue;
+                        if (o == backSource && s == header) continue;
+                        ks.add(s);
+                    }
+                    keptSucc.put(o, ks);
+                }
+                List<Integer> regionOrder = new ArrayList<Integer>(region);
+                java.util.Collections.sort(regionOrder);
+                Map<String, Bits> entry = pre;
+                int recordedUnits = 0;
+                int addMmio = 0;
+                int addPort = 0;
+                int addMsr = 0;
+                int addBar = 0;
+                for (int unit = 1; unit <= PEEL_MAX_UNITS; unit++) {
+                    Map<Integer, Map<String, Bits>> unitIn =
+                        peelUnitFixpoint(ops, keptSucc, regionOrder,
+                            header, entry, mem, rec.loopCallOps);
+                    if (unitIn == null) break;
+                    if (whileShape) {
+                        // The header condition decides this unit's
+                        // body: body-entry means proven, exit
+                        // means stop WITHOUT recording, U means
+                        // stop WITHOUT recording (prefix kept).
+                        OpRec cop = ops.get(header);
+                        Map<String, Bits> hst = unitIn.get(header);
+                        if (hst == null) break;
+                        Bits cb = resolveBits(cop.ins[1], hst);
+                        Long cv = (cb == null) ? null : cb.exactValue(
+                            sizeMask(cop.ins[1].getSize()));
+                        if (cv == null) break;
+                        Integer takenIdx = null;
+                        long tt = cop.ins[0].getOffset();
+                        takenIdx = firstAt.get(
+                            isa.formatCodeAddress(tt));
+                        if (takenIdx == null) {
+                            takenIdx = firstAt.get(
+                                isa.formatCodeAddress(
+                                    isa.stripInstructionTag(tt)));
+                        }
+                        int fallIdx =
+                            isa.fallthroughIndex(ops, header);
+                        Integer chosen = (cv.longValue() != 0) ?
+                            takenIdx : ((fallIdx < 0) ? null :
+                                Integer.valueOf(fallIdx));
+                        if (chosen == null) break;
+                        if (chosen.intValue() == exitTarget) break;
+                        if (chosen.intValue() != bodyEntry) break;
+                        // Record, then advance from the back
+                        // branch's out-state.
+                        int[] added = peelRecordUnit(ops, unitIn,
+                            regionOrder, mem, mmio, portIo, msr,
+                            barRel, bndAccesses, bndProfile,
+                            haveMmio, havePort, haveMsr, haveBar);
+                        addMmio += added[0];
+                        addPort += added[1];
+                        addMsr += added[2];
+                        addBar += added[3];
+                        recordedUnits++;
+                        Map<String, Bits> bout =
+                            unitIn.get(backSource);
+                        if (bout == null) break;
+                        Map<String, Bits> nentry =
+                            new HashMap<String, Bits>(bout);
+                        applyTransfer(nentry, ops.get(backSource),
+                            mem, backSource, rec.loopCallOps);
+                        if (!ops.get(backSource).instrAddr.equals(
+                            ops.get(header).instrAddr)) {
+                            nentry = stripUniques(nentry);
+                        }
+                        entry = nentry;
+                    } else {
+                        // Do-while: entry already proven, so the
+                        // unit records first; then its end
+                        // condition decides continuation. A U
+                        // condition keeps this unit and stops:
+                        // the prefix is proven even when the
+                        // tail is not.
+                        int[] added = peelRecordUnit(ops, unitIn,
+                            regionOrder, mem, mmio, portIo, msr,
+                            barRel, bndAccesses, bndProfile,
+                            haveMmio, havePort, haveMsr, haveBar);
+                        addMmio += added[0];
+                        addPort += added[1];
+                        addMsr += added[2];
+                        addBar += added[3];
+                        recordedUnits++;
+                        OpRec cop = ops.get(backSource);
+                        Map<String, Bits> bst = unitIn.get(backSource);
+                        if (bst == null) break;
+                        Bits cb = resolveBits(cop.ins[1], bst);
+                        Long cv = (cb == null) ? null : cb.exactValue(
+                            sizeMask(cop.ins[1].getSize()));
+                        if (cv == null) break;
+                        Integer takenIdx = null;
+                        long tt = cop.ins[0].getOffset();
+                        takenIdx = firstAt.get(
+                            isa.formatCodeAddress(tt));
+                        if (takenIdx == null) {
+                            takenIdx = firstAt.get(
+                                isa.formatCodeAddress(
+                                    isa.stripInstructionTag(tt)));
+                        }
+                        int fallIdx =
+                            isa.fallthroughIndex(ops, backSource);
+                        Integer chosen = (cv.longValue() != 0) ?
+                            takenIdx : ((fallIdx < 0) ? null :
+                                Integer.valueOf(fallIdx));
+                        if (chosen == null) break;
+                        if (chosen.intValue() == exitTarget) break;
+                        if (chosen.intValue() != header) break;
+                        Map<String, Bits> nentry =
+                            new HashMap<String, Bits>(bst);
+                        applyTransfer(nentry, cop, mem, backSource,
+                            rec.loopCallOps);
+                        if (!ops.get(backSource).instrAddr.equals(
+                            ops.get(header).instrAddr)) {
+                            nentry = stripUniques(nentry);
+                        }
+                        entry = nentry;
+                    }
+                }
+                if (recordedUnits > 0) {
+                    peelTotals[0]++;
+                    peelTotals[1] += recordedUnits;
+                    peelTotals[2] += addMmio;
+                    peelTotals[3] += addPort;
+                    peelTotals[4] += addMsr;
+                    peelTotals[5] += addBar;
+                    println("[*] peel: " + rec.f.getName() +
+                        " loop@" + ops.get(header).instrAddr +
+                        " units=" + recordedUnits +
+                        " +mmio=" + addMmio + " +port=" + addPort +
+                        " +msr=" + addMsr + " +bar=" + addBar);
+                }
+            }
+        } catch (Exception e) {
+            peelTotals[6]++;
+            println("[!] peel: " + rec.f.getName() + " failed: " + e);
+        }
+    }
+
+    // Record one proven unit's ops with the shared recorder and
+    // append only identities absent from the combined sets (which
+    // the caller keeps updated, so later units dedup against
+    // earlier units too). Returns [mmio, port, msr, bar] counts.
+    private int[] peelRecordUnit(List<OpRec> ops,
+        Map<Integer, Map<String, Bits>> unitIn,
+        List<Integer> regionOrder, Memory mem,
+        List<String> mmio, List<String> portIo, List<String> msr,
+        List<String> barRel, List<BoundaryAccess> bndAccesses,
+        BoundaryProfile bndProfile, Set<String> haveMmio,
+        Set<String> havePort, Set<String> haveMsr,
+        Set<String> haveBar) {
+        List<String> tM = new ArrayList<String>();
+        List<String> tP = new ArrayList<String>();
+        List<String> tS = new ArrayList<String>();
+        List<String> tB = new ArrayList<String>();
+        List<String> tMi = new ArrayList<String>();
+        List<String> tPi = new ArrayList<String>();
+        List<String> tSi = new ArrayList<String>();
+        List<String> tBi = new ArrayList<String>();
+        List<BoundaryAccess> tBnd = new ArrayList<BoundaryAccess>();
+        List<BoundaryAccess> tBndExt = new ArrayList<BoundaryAccess>();
+        for (int idx : regionOrder) {
+            recordMustFindings(ops.get(idx), unitIn.get(idx), mem,
+                tM, tP, tS, tB, tMi, tPi, tSi, tBi,
+                tBnd, tBndExt, bndProfile);
+        }
+        if (bndProfile != null) {
+            bndAccesses.addAll(tBnd);
+            bndAccesses.addAll(tBndExt);
+        }
+        int[] added = new int[4];
+        for (int i = 0; i < tM.size(); i++) {
+            if (haveMmio.add(tMi.get(i))) {
+                mmio.add(tM.get(i));
+                added[0]++;
+            }
+        }
+        for (int i = 0; i < tP.size(); i++) {
+            if (havePort.add(tPi.get(i))) {
+                portIo.add(tP.get(i));
+                added[1]++;
+            }
+        }
+        for (int i = 0; i < tS.size(); i++) {
+            if (haveMsr.add(tSi.get(i))) {
+                msr.add(tS.get(i));
+                added[2]++;
+            }
+        }
+        for (int i = 0; i < tB.size(); i++) {
+            if (haveBar.add(tBi.get(i))) {
+                barRel.add(tB.get(i));
+                added[3]++;
+            }
+        }
+        return added;
+    }
+
     // ---------------- v3.2 MAY-analysis ----------------
     // Same CFG as the must-fixpoint, but the join is UNION: the state
     // maps each varnode to the FINITE SET of values it may hold (at most
@@ -3384,6 +4867,31 @@ public class ExtractIR extends GhidraScript {
             }
             for (String k : drop) m.remove(k);
             if (out != null) mayPut(m, vkey(out), null);
+        } else if (mnem.equals("CALLOTHER") &&
+            seg16RealMode && "segment".equals(op.userOp) &&
+            ins.length >= 3 && out != null &&
+            out.getSize() == 4 &&
+            ins[1].getSize() == 2 && ins[2].getSize() == 2 &&
+            ins[1].getAddress() != null &&
+            "register".equals(ins[1].getAddress()
+                .getAddressSpace().getName())) {
+            // v3.23 Phase 3 backlog item 6: may mirror of the
+            // must segment adapter above (same Real-Mode-only
+            // gate, same shape checks). The linear set is the
+            // cartesian (base << 4) + inner over the may sets;
+            // mayCombine caps it (oversize -> null -> TOP, i.e.
+            // unknown, never a truncated set). A null leg map
+            // (unknown base or offset) yields null likewise.
+            Map<Long, Set<Integer>> bmap = mayResolve(ins[1], m);
+            Map<Long, Set<Integer>> nmap = mayResolve(ins[2], m);
+            Map<Long, Set<Integer>> r = null;
+            if (bmap != null && nmap != null) {
+                r = mayCombine(bmap, nmap,
+                    (x, y) -> ((x & 0xFFFFL) << 4) +
+                        (y & 0xFFFFL),
+                    sizeMask(out.getSize()));
+            }
+            mayPut(m, vkey(out), r);
         } else {
             if (out != null) mayPut(m, vkey(out), null);
         }
@@ -3714,6 +5222,31 @@ public class ExtractIR extends GhidraScript {
                 }
                 nt.removeAll(drop);
                 if (oj.out != null) nt.remove(vkey(oj.out));
+            } else if (mn.equals("CALLOTHER") &&
+                "segment".equals(oj.userOp)) {
+                // v3.23 Phase 3 backlog item 6: taint flows
+                // through the segment linearisation (base /
+                // inner -> linear output), exactly like the
+                // arithmetic ops above. Without this, the
+                // may-recording dead-def filter treats every
+                // segment-linearised address as killed (the
+                // def's taint never reaches the segment
+                // unique) and drops true may addresses. Other
+                // CALLOTHERs (IN/OUT/MSR) keep the generic
+                // fresh-result rule below: their outputs are
+                // hardware values, not functions of the inputs.
+                boolean anyIn = false;
+                for (Varnode in : oj.ins) {
+                    if (!in.isConstant() &&
+                        taint.contains(vkey(in))) {
+                        anyIn = true;
+                        break;
+                    }
+                }
+                if (oj.out != null) {
+                    nt.remove(vkey(oj.out));
+                    if (anyIn) nt.add(vkey(oj.out));
+                }
             } else if (oj.out != null) {
                 // LOAD, comparisons, BOOL ops: fresh result, no flow.
                 nt.remove(vkey(oj.out));
@@ -3832,6 +5365,18 @@ public class ExtractIR extends GhidraScript {
         return -1;
     }
 
+    /** v3.23 item 4: whole-function def lookup, used ONLY
+        by chainKeyWide (tail-veto branch match). Never
+        used by constprop/points-to/Prov. */
+    private static int findDefAll(List<OpRec> ops, String key,
+        int beforeIdx) {
+        for (int j = beforeIdx - 1; j >= 0; j--) {
+            Varnode out = ops.get(j).out;
+            if (out != null && vkey(out).equals(key)) return j;
+        }
+        return -1;
+    }
+
     private static class IndirectResult {
         final List<String> sites;
         final int edges;
@@ -3860,14 +5405,24 @@ public class ExtractIR extends GhidraScript {
     private static class TableMatch {
         final long base;
         final boolean offset;
+        // Entry width in bytes. Pointer-sized for absolute tables and
+        // for 32-bit offset tables; 4 for 64-bit offset tables (RV64
+        // lw / MIPS64 lw entries -- v3.23 item 7). Readers must stride
+        // and decode by this width, never by pointerSize alone.
+        final int entrySize;
         TableMatch(long base, boolean offset) {
+            this(base, offset, -1);
+        }
+        TableMatch(long base, boolean offset, int entrySize) {
             this.base = base;
             this.offset = offset;
+            this.entrySize = entrySize;
         }
     }
 
     /** Constant-fold a varnode's def chain (COPY / INT_ADD / INT_SUB /
         INT_LEFT / INT_MULT / INT_AND / INT_OR / INT_XOR of constants,
+        plus INT_SEXT / INT_ZEXT of constants since v3.23 item 7,
         depth-capped). Follows lui (INT_LEFT by 12) and auipc
         (INT_LEFT + INT_ADD of a PC constant), so RISC-V table bases
         built by lui+addi or auipc+addi fold to one constant. Results
@@ -3889,6 +5444,29 @@ public class ExtractIR extends GhidraScript {
         OpRec d = ops.get(def);
         if (d.mnem.equals("COPY") && d.ins.length == 1) {
             return constFold(ops, vkey(d.ins[0]), def, depth - 1, mask);
+        }
+        // v3.23 item 7: single-input extensions. MIPS64 lui lifts as
+        // INT_SEXT of a 32-bit constant (aui); RV64 lw sign-extends
+        // through INT_SEXT. Folding them is exact constant arithmetic
+        // (the input size comes from the input varnode), so a chain
+        // that previously folded to null now folds to its true value;
+        // no previously-folding chain changes value.
+        if (d.ins.length == 1) {
+            if (d.mnem.equals("INT_SEXT") ||
+                d.mnem.equals("INT_ZEXT")) {
+                Long v = constFold(ops, vkey(d.ins[0]), def,
+                    depth - 1, mask);
+                if (v == null) return null;
+                int bits = 8 * d.ins[0].getSize();
+                if (bits >= 64) return v.longValue() & mask;
+                long lowMask = (1L << bits) - 1L;
+                if (d.mnem.equals("INT_SEXT") &&
+                    ((v.longValue() >> (bits - 1)) & 1L) != 0) {
+                    return (v.longValue() | ~lowMask) & mask;
+                }
+                return (v.longValue() & lowMask) & mask;
+            }
+            return null;
         }
         if (d.ins.length == 2) {
             Long a = constFold(ops, vkey(d.ins[0]), def, depth - 1, mask);
@@ -3960,8 +5538,25 @@ public class ExtractIR extends GhidraScript {
         if (def < 0) return null;
         OpRec d = ops.get(def);
         if (d.mnem.equals("COPY") && d.ins.length == 1) {
-            Long c = constFold(ops, vkey(d.ins[0]), def, 16, mask);
-            if (c != null) return null; // whole expr constant: not a table
+            // v3.23 item 7: do NOT short-circuit when the COPY input
+            // folds to a constant. A constant-folded address can
+            // still be a table access with a constant index (MIPS64:
+            // lui+daddiu base, constant a0=1, dsll index, daddu, ld
+            // through a COPY hop -- the load address folds to
+            // base+8, yet the INT_ADD structure underneath still
+            // carries the scaled index and the true table base;
+            // the old short-circuit left every such MIPS64 indexed
+            // call unresolved). Recursing is sound: the INT_ADD
+            // branch only returns a base when one side folds AND
+            // the other side is a genuine scaled-index node
+            // (INT_LEFT by pointerShift / INT_MULT by pointerSize),
+            // and a fully-constant address with no scaled node
+            // anywhere still returns null. A COPY of a plain
+            // constant has no def, so it still returns null below.
+            // Edging the whole table for a constant index is the
+            // same over-approximation recoverIndirect already
+            // applies to unknown-index tables (the true entry is
+            // always included).
             return matchAddr(ops, vkey(d.ins[0]), def, acc, depth - 1,
                 mask, pointerSize, pointerShift);
         }
@@ -4007,18 +5602,50 @@ public class ExtractIR extends GhidraScript {
         if (d.mnem.equals("INT_ADD") && d.ins.length == 2) {
             // Offset table: one side loads the entry, the other side
             // must fold to the same base as the load's address chain.
+            // Candidate entry widths: pointer-sized first (existing
+            // behaviour, unchanged), then 4-byte entries when the
+            // pointer is 64-bit (v3.23 item 7: RV64/MIPS64 lw offset
+            // tables, indexed by slli 2). The load side may pass
+            // through one INT_SEXT/INT_ZEXT/COPY level (RV64 lw
+            // sign-extends to XLEN; x86 MOVSXD is handled by its own
+            // adapter and never reaches this shared matcher).
+            int[] candSizes = pointerSize == 8 ?
+                new int[] {8, 4} : new int[] {pointerSize};
             for (int s = 0; s < 2; s++) {
                 int defLoad = findDef(ops, vkey(d.ins[s]), cur);
+                for (int hop = 0; hop < 4 && defLoad >= 0; hop++) {
+                    OpRec lx = ops.get(defLoad);
+                    if (lx.mnem.equals("LOAD")) break;
+                    if ((lx.mnem.equals("INT_SEXT") ||
+                        lx.mnem.equals("INT_ZEXT") ||
+                        lx.mnem.equals("COPY")) &&
+                        lx.ins.length == 1 &&
+                        !lx.ins[0].isConstant()) {
+                        defLoad = findDef(ops, vkey(lx.ins[0]),
+                            defLoad);
+                        continue;
+                    }
+                    defLoad = -1;
+                }
                 if (defLoad < 0) continue;
                 OpRec ld = ops.get(defLoad);
                 if (!ld.mnem.equals("LOAD") || ld.ins.length < 2 ||
-                    ld.out == null || ld.out.getSize() != pointerSize) continue;
-                Long base = matchAddr(ops, vkey(ld.ins[1]), defLoad, 0L,
-                    8, mask, pointerSize, pointerShift);
-                if (base == null) continue;
-                Long side = constFold(ops, vkey(d.ins[1 - s]), cur, 16, mask);
-                if (side != null && side.longValue() == base.longValue()) {
-                    return new TableMatch(base.longValue(), true);
+                    ld.out == null) continue;
+                for (int ci = 0; ci < candSizes.length; ci++) {
+                    int es = candSizes[ci];
+                    if (ld.out.getSize() != es) continue;
+                    int esShift = es == 8 ? 3 : (es == 4 ? 2 :
+                        (es == 2 ? 1 : 0));
+                    Long base = matchAddr(ops, vkey(ld.ins[1]),
+                        defLoad, 0L, 8, mask, es, esShift);
+                    if (base == null) continue;
+                    Long side = constFold(ops, vkey(d.ins[1 - s]), cur,
+                        16, mask);
+                    if (side != null &&
+                        side.longValue() == base.longValue()) {
+                        return new TableMatch(base.longValue(), true,
+                            es);
+                    }
                 }
             }
             return null;
@@ -4028,7 +5655,7 @@ public class ExtractIR extends GhidraScript {
         Long base = matchAddr(ops, vkey(d.ins[1]), cur, 0L, 8, mask,
             pointerSize, pointerShift);
         if (base == null) return null;
-        return new TableMatch(base.longValue(), false);
+        return new TableMatch(base.longValue(), false, pointerSize);
     }
 
     /** Backward slice for pointer-table dispatch: from a CALLIND /
@@ -4063,8 +5690,124 @@ public class ExtractIR extends GhidraScript {
         if (!d.mnem.equals("LOAD") || d.ins.length < 2 ||
             d.out == null || d.out.getSize() != isa.pointerSize()) return null;
         long mask = isa.pointerSize() == 4 ? 0xffffffffL : -1L;
-        return matchAddr(ops, vkey(d.ins[1]), cur, 0L, 8, mask,
+        Long m = matchAddr(ops, vkey(d.ins[1]), cur, 0L, 8, mask,
             isa.pointerSize(), isa.pointerIndexShift());
+        if (m != null) return m;
+        // v3.23 item 7: direct load from a constant table base, no
+        // index (ld t, 0(t0) with t0 constant: auipc+addi, lui+
+        // addi). matchAddr needs a scaled index, so it returns null
+        // here; the load address itself is the table base. The
+        // fallback is narrow on purpose: the address chain, after
+        // COPYs, must be INT_ADD(baseChain, directConstant 0) --
+        // offset 0 means the load reads entry 0 exactly -- and the
+        // base chain must fold to a constant with NO scaled-index
+        // node (a constant index would make this a single entry,
+        // not a table base, and must stay unresolved). Anything
+        // else returns null.
+        return directTableBase(ops, cur, d, mask);
+    }
+
+    /** True when a def chain contains a pointer-index scaling node
+        (INT_LEFT by pointerShift, or INT_MULT by pointerSize).
+        Used by directTableBase to refuse constant-indexed loads. */
+    private boolean containsScaledIndex(List<OpRec> ops, String key,
+        int beforeIdx, int depth, int pointerSize, int pointerShift,
+        long mask) {
+        if (depth <= 0) return false;
+        int def = findDef(ops, key, beforeIdx);
+        if (def < 0) return false;
+        OpRec d = ops.get(def);
+        if (d.mnem.equals("INT_LEFT") && d.ins.length == 2) {
+            Long sh = constFold(ops, vkey(d.ins[1]), def, 16, mask);
+            if (sh != null && sh.longValue() == (long) pointerShift) {
+                return true;
+            }
+        }
+        if (d.mnem.equals("INT_MULT") && d.ins.length == 2) {
+            for (int t = 0; t < 2; t++) {
+                Long c = constFold(ops, vkey(d.ins[t]), def, 16, mask);
+                if (c != null && c.longValue() == (long) pointerSize) {
+                    return true;
+                }
+            }
+        }
+        for (int t = 0; t < d.ins.length; t++) {
+            if (!d.ins[t].isConstant() &&
+                containsScaledIndex(ops, vkey(d.ins[t]), def,
+                    depth - 1, pointerSize, pointerShift, mask)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Long directTableBase(List<OpRec> ops, int loadIdx,
+        OpRec ld, long mask) {
+        // The load address is tableBase + ldOffset, where ldOffset
+        // is the load instruction's own immediate: in P-Code the
+        // address def (after COPYs) is INT_ADD(baseChain, const).
+        // Only offset 0 is accepted -- the load then reads entry 0
+        // exactly, so the folded base chain IS the table start
+        // (the same operational-base assumption matchAddr already
+        // makes for indexed tables). A nonzero offset would make
+        // the site call a later slot, not the whole table, so it
+        // stays unresolved. The base chain itself (auipc+addi,
+        // lui+daddiu) folds via constFold in one step; no further
+        // stripping is attempted, so an addi inside base
+        // construction (e.g. auipc's -4 residual) is not mistaken
+        // for an entry offset.
+        if (ld.ins[1].isConstant()) {
+            return ld.ins[1].getOffset() & mask;
+        }
+        String key = vkey(ld.ins[1]);
+        int beforeIdx = loadIdx;
+        for (int hop = 0; hop < 4; hop++) {
+            int dIdx = findDef(ops, key, beforeIdx);
+            if (dIdx < 0) return null;
+            OpRec dd = ops.get(dIdx);
+            if (dd.mnem.equals("COPY") && dd.ins.length == 1 &&
+                !dd.ins[0].isConstant()) {
+                key = vkey(dd.ins[0]);
+                beforeIdx = dIdx;
+                continue;
+            }
+            break;
+        }
+        int dIdx = findDef(ops, key, beforeIdx);
+        if (dIdx < 0) return null;
+        OpRec dd = ops.get(dIdx);
+        String candKey = key;
+        int candBefore = beforeIdx;
+        if (dd.mnem.equals("INT_ADD") && dd.ins.length == 2) {
+            // The zero side is usually a COPY of const 0 (RISC-V
+            // lifts the ld offset through a unique), not a direct
+            // constant varnode, so fold it instead of testing
+            // isConstant. A zero side that hides a scaled index
+            // (constant index 0) is refused: that load reads one
+            // indexed entry, not entry 0 of a table.
+            boolean ok = false;
+            for (int s = 0; s < 2; s++) {
+                Long c = constFold(ops, vkey(dd.ins[s]), dIdx, 16,
+                    mask);
+                if (c != null && c.longValue() == 0L &&
+                    !containsScaledIndex(ops, vkey(dd.ins[s]), dIdx,
+                        16, isa.pointerSize(),
+                        isa.pointerIndexShift(), mask)) {
+                    candKey = vkey(dd.ins[1 - s]);
+                    candBefore = dIdx;
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) return null;
+        }
+        // Refuse if the base chain hides a scaled index: that is a
+        // constant-indexed single entry, not a table base.
+        if (containsScaledIndex(ops, candKey, candBefore, 16,
+            isa.pointerSize(), isa.pointerIndexShift(), mask)) {
+            return null;
+        }
+        return constFold(ops, candKey, candBefore, 16, mask);
     }
 
     /** v3.4 (fixed): recover call-graph edges AND intra-function
@@ -4190,6 +5933,76 @@ public class ExtractIR extends GhidraScript {
                     }
                 }
             }
+            // v3.23 item 7: offset-table BRANCHINDs (RV64/MIPS64 lw
+            // tables). The pointer-table read above merges pairs of
+            // 4-byte offsets into garbage, so it finds nothing; the
+            // jump-table matcher reads them at entry width instead.
+            // Only runs when the pointer path found nothing, and
+            // only for BRANCHIND (CALLIND offset tables are not a
+            // thing: a call target is a pointer, never an offset).
+            // Same-function targets become successors (deduped
+            // against recoverJumpTableTargets by the FuncRec merge);
+            // function-entry targets become edges, exactly as the
+            // pointer path does. Unmodelled forms stay unresolved.
+            if (targets.isEmpty() && mySucc.isEmpty() &&
+                call.mnem.equals("BRANCHIND")) {
+                int bdef = findDef(ops, vkey(call.ins[0]), i);
+                if (bdef >= 0) {
+                    bdef = isa.unwrapIndirectDef(ops, i, bdef);
+                }
+                if (bdef >= 0) {
+                    long mask7 = isa.pointerSize() == 4 ?
+                        0xffffffffL : -1L;
+                    TableMatch tm = matchBranchTableFrom(ops, i, bdef,
+                        isa.pointerSize(), isa.pointerIndexShift(),
+                        mask7);
+                    if (tm != null) {
+                        int es = tm.entrySize > 0 ? tm.entrySize :
+                            isa.pointerSize();
+                        for (int k = 0; k < 64; k++) {
+                            long entryAddr = tm.base + (long) es * k;
+                            long raw;
+                            try {
+                                raw = es == 4 ?
+                                    mem.getInt(toAddr(entryAddr)) :
+                                    isa.readPointer(mem,
+                                        toAddr(entryAddr));
+                            } catch (Exception e) {
+                                break;
+                            }
+                            long t = tm.offset ?
+                                (tm.base + (int) raw) & mask7 :
+                                isa.stripInstructionTag(raw);
+                            Function fn = null;
+                            try {
+                                fn = fm.getFunctionAt(toAddr(t));
+                            } catch (Exception e) {
+                                break;
+                            }
+                            if (fn != null) {
+                                String nm = fn.getName();
+                                if (!targets.contains(nm)) {
+                                    targets.add(nm);
+                                }
+                                continue;
+                            }
+                            Integer j = firstAt.get(
+                                isa.formatCodeAddress(t));
+                            if (j == null) {
+                                j = firstAt.get(isa.formatCodeAddress(
+                                    isa.stripInstructionTag(t)));
+                            }
+                            if (j != null) {
+                                if (!mySucc.contains(j)) {
+                                    mySucc.add(j);
+                                }
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
             if (!targets.isEmpty()) {
                 StringBuilder tb = new StringBuilder();
                 for (int k = 0; k < targets.size(); k++) {
@@ -4236,9 +6049,29 @@ public class ExtractIR extends GhidraScript {
                         truncated = true;
                         break;
                     }
-                    ops.add(new OpRec(instr.getAddress(),
+                    OpRec rec = new OpRec(instr.getAddress(),
                         instr.getMnemonicString(), op.getMnemonic(),
-                        op.getInputs(), op.getOutput()));
+                        op.getInputs(), op.getOutput());
+                    // v3.23 Phase 3 backlog item 6: resolve the
+                    // CALLOTHER userop name once here (see OpRec
+                    // .userOp). Only the first input (the userop
+                    // index constant) is consulted; any failure
+                    // leaves userOp null and the op unmodelled.
+                    if (op.getMnemonic().equals("CALLOTHER") &&
+                        op.getInputs() != null &&
+                        op.getInputs().length >= 1 &&
+                        op.getInputs()[0] != null &&
+                        op.getInputs()[0].isConstant()) {
+                        try {
+                            rec.userOp = currentProgram
+                                .getLanguage().getUserDefinedOpName(
+                                    (int) op.getInputs()[0]
+                                        .getOffset());
+                        } catch (Exception e) {
+                            rec.userOp = null;
+                        }
+                    }
+                    ops.add(rec);
                     opCount++;
                 }
                 if (truncated) break;
@@ -4457,9 +6290,34 @@ public class ExtractIR extends GhidraScript {
     private Set<String> resolveIndirectSet(List<OpRec> ops, Memory mem,
         FunctionManager fm, Map<Long, Set<String>> byOffset,
         Map<Long, Set<String>> byAddr, int i, boolean unwrapCopy) {
+        return resolveIndirectSetTier(ops, mem, fm, byOffset,
+            byAddr, i, unwrapCopy, null);
+    }
+
+    /** v3.23 item 4: which tier of resolveIndirectSetTier
+        produced a target set. Tiers are exclusive by
+        construction (constant/resolvable address -> ADDR,
+        scaled table index -> TABLE, else [reg + const] ->
+        OFFSET), so the tier names the evidence class, not
+        just the set. Only recoverTailCalls reads the tier;
+        recoverPointsTo keeps the set-only wrapper above,
+        so CALLIND may-edges are byte-identical. */
+    private static final int TIER_NONE = 0;
+    private static final int TIER_ADDR = 1;
+    private static final int TIER_TABLE = 2;
+    private static final int TIER_OFFSET = 3;
+
+    private Set<String> resolveIndirectSetTier(List<OpRec> ops, Memory mem,
+        FunctionManager fm, Map<Long, Set<String>> byOffset,
+        Map<Long, Set<String>> byAddr, int i, boolean unwrapCopy,
+        int[] tierOut) {
         Set<String> tset = new HashSet<String>();
+        int tier = TIER_NONE;
         OpRec call = ops.get(i);
-        if (call.ins.length < 1) return tset;
+        if (call.ins.length < 1) {
+            if (tierOut != null) tierOut[0] = tier;
+            return tset;
+        }
         int def = findDef(ops, vkey(call.ins[0]), i);
         if (def >= 0) {
             def = isa.unwrapIndirectDef(ops, i, def);
@@ -4491,20 +6349,26 @@ public class ExtractIR extends GhidraScript {
                 }
             }
         }
-        if (def < 0) return tset;
+        if (def < 0) {
+            if (tierOut != null) tierOut[0] = tier;
+            return tset;
+        }
         OpRec d = ops.get(def);
         if (!d.mnem.equals("LOAD") || d.ins.length < 2 ||
             d.out == null || d.out.getSize() != isa.pointerSize()) {
+            if (tierOut != null) tierOut[0] = tier;
             return tset;
         }
         Varnode addrV = d.ins[1];
         if (addrV.isConstant()) {
+            tier = TIER_ADDR;
             addMemFunc(mem, fm, addrV.getOffset(), tset);
             Set<String> st = byAddr.get(addrV.getOffset());
             if (st != null) tset.addAll(st);
         } else {
             Long a = resolveValue(addrV, ops, mem, def, 4);
             if (a != null) {
+                tier = TIER_ADDR;
                 addMemFunc(mem, fm, a.longValue(), tset);
                 Set<String> st = byAddr.get(a.longValue());
                 if (st != null) tset.addAll(st);
@@ -4546,6 +6410,7 @@ public class ExtractIR extends GhidraScript {
                                 }
                             }
                             if (scaled) {
+                                tier = TIER_TABLE;
                                 for (int k = 0; k < 64; k++) {
                                     long ea = cval + (long) isa.pointerSize() * k;
                                     try {
@@ -4561,6 +6426,7 @@ public class ExtractIR extends GhidraScript {
                                     }
                                 }
                             } else {
+                                tier = TIER_OFFSET;
                                 Set<String> st =
                                     byOffset.get(cval);
                                 if (st != null) {
@@ -4572,7 +6438,1248 @@ public class ExtractIR extends GhidraScript {
                 }
             }
         }
+        if (tierOut != null) tierOut[0] = tier;
         return tset;
+    }
+
+    /** v3.23 item 4: a normalized struct-field address key.
+        An address A normalizes to (root, links, field) when
+        A = *(*(root + links[0]) + links[1])... + field, i.e.
+        root is a device pointer value, each link is a field
+        offset of a struct pointer loaded from the previous
+        struct, and field is the final field offset. E.g.
+        the UART callback cell is (dev, [16, 0], 0): dev is
+        the device pointer, +16 is its data field, +0 is the
+        int_driven pointer field, and the callback itself is
+        field 0 of that struct. rootIsArg distinguishes an
+        argument-register root (a caller-supplied device)
+        from a constant root (a hardcoded device address);
+        a RAM-space root (an absolute global address) is
+        not a struct key and yields null. */
+    private static class ChainKey {
+        final boolean rootIsArg;
+        final long root;
+        final List<Long> links;
+        final long field;
+        ChainKey(boolean a, long r, List<Long> l, long f) {
+            rootIsArg = a;
+            root = r;
+            links = l;
+            field = f;
+        }
+        String form() {
+            StringBuilder sb = new StringBuilder();
+            sb.append(rootIsArg ? "A" : "C");
+            sb.append(root).append(":");
+            for (int i = 0; i < links.size(); i++) {
+                if (i > 0) sb.append(",");
+                sb.append(links.get(i));
+            }
+            sb.append(":").append(field);
+            return sb.toString();
+        }
+    }
+
+    /** v3.23 item 4: one step of a chain walk: a varnode
+        plus the position before which its def must lie. */
+    private static class Strip {
+        final Varnode v;
+        final int pos;
+        Strip(Varnode v, int p) { this.v = v; this.pos = p; }
+    }
+
+    /** v3.23 item 4: follow COPY defs and Thumb-bit INT_AND
+        strips backward from (v, pos). Returns the stripped
+        varnode and its def position, or null when a step
+        is not a COPY / tag-mask INT_AND. A COPY of a
+        constant yields that constant (callers treat a
+        constant as a root, never as a chain step). */
+    private Strip stripCopyAnd(List<OpRec> ops, Varnode v,
+        int pos) {
+        return stripCopyAndW(ops, v, pos, false);
+    }
+
+    /** v3.23 item 4: stripCopyAnd with an optional
+        whole-function def window. Wide is used ONLY by the
+        tail-veto branch match (see chainKeyWide); every
+        other caller keeps the 40-op window, whose
+        narrowing is a deliberate behaviour lock (widening
+        findDef globally moved BMP may sets). */
+    private Strip stripCopyAndW(List<OpRec> ops, Varnode v,
+        int pos, boolean wide) {
+        Varnode cur = v;
+        int p = pos;
+        for (int hop = 0; hop < 8; hop++) {
+            if (cur == null || cur.isConstant()) {
+                return new Strip(cur, p);
+            }
+            int def = wide ? findDefAll(ops, vkey(cur), p) :
+                findDef(ops, vkey(cur), p);
+            if (def < 0) return new Strip(cur, p);
+            OpRec dd = ops.get(def);
+            if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
+                cur = dd.ins[0];
+                p = def;
+                continue;
+            }
+            if (dd.mnem.equals("INT_AND") &&
+                dd.ins.length == 2) {
+                boolean stripped = false;
+                for (int s = 0; s < 2; s++) {
+                    Varnode vv = dd.ins[s];
+                    if (vv.isConstant() &&
+                        isa.isInstructionTagMask(vv.getOffset())) {
+                        cur = dd.ins[1 - s];
+                        stripped = true;
+                        break;
+                    }
+                }
+                if (stripped) {
+                    p = def;
+                    continue;
+                }
+                return null;
+            }
+            // Not a strip step: return cur with p UNCHANGED
+            // so the caller can still find this def (dd) with
+            // findDef(cur, p); advancing p to def would hide it.
+            return new Strip(cur, p);
+        }
+        return null;
+    }
+
+    /** v3.23 item 4: normalize an address operand's backward
+        def-chain to a ChainKey, or null when the shape is
+        not a struct-field address. The outermost address
+        expression contributes the final field (its INT_ADD
+        constant, or an implied 0 for a bare register);
+        each LOAD consumed thereafter contributes one link
+        (its own address expression's INT_ADD constant, or
+        an implied 0), collected innermost-first and
+        reversed at the end; the walk ends at a root that
+        is either an argument register (no def in this
+        function) or, when allowConstRoot, a constant —
+        including a constant obtained by reading a
+        literal-pool word from initialized program memory
+        (a hardcoded device pointer loaded from flash;
+        mem may be null, in which case pool roots fail).
+        A LOAD whose output is not pointer-sized is not a
+        pointer step and fails the walk, as does any
+        arithmetic other than a single-constant INT_ADD, a
+        RAM-space root that is not a readable pool word,
+        or a root in any other space. The walk is purely
+        syntactic over one function's ops plus initialized
+        image words: it proves the address SHAPE, never a
+        runtime RAM value. */
+    private ChainKey chainKey(List<OpRec> ops, Varnode addrV,
+        int pos, boolean allowConstRoot, Memory mem) {
+        return chainKeyW(ops, addrV, pos, allowConstRoot,
+            mem, false);
+    }
+
+    /** v3.23 item 4: chainKey with a whole-function def
+        window, for the tail-veto BRANCH match only. The
+        map side (setter/const/S3 scans) keeps the narrow
+        window, so the admitted map is byte-identical with
+        or without this variant. The wide walk is used
+        ONLY to test whether a branch's loaded cell equals
+        an already-admitted map key; it never adds a
+        target, and a false composition (linear order is
+        not CFG order across branches) can only remove an
+        edge when the composed chain matches the admitted
+        key exactly AND every fail-closed scan passed AND
+        the function is device-enumerated. The 40-op
+        window is too short for real ISR tails: the UART
+        ISR's data LOAD sits ~150 ops before its tail
+        branch, so the narrow walk stops at the scratch
+        register instead of reaching the device argument.
+        */
+    private ChainKey chainKeyWide(List<OpRec> ops,
+        Varnode addrV, int pos, boolean allowConstRoot,
+        Memory mem) {
+        return chainKeyW(ops, addrV, pos, allowConstRoot,
+            mem, true);
+    }
+
+    private ChainKey chainKeyW(List<OpRec> ops, Varnode addrV,
+        int pos, boolean allowConstRoot, Memory mem,
+        boolean wide) {
+        Strip s0 = stripCopyAndW(ops, addrV, pos, wide);
+        if (s0 == null || s0.v == null) return null;
+        Varnode cur = s0.v;
+        int p = s0.pos;
+        long field;
+        if (cur.isConstant()) return null;
+        String sp0 = cur.getAddress() == null ? null :
+            cur.getAddress().getAddressSpace().getName();
+        if ("ram".equals(sp0)) return null;
+        int def0 = wide ? findDefAll(ops, vkey(cur), p) :
+            findDef(ops, vkey(cur), p);
+        if (def0 >= 0) {
+            OpRec dd = ops.get(def0);
+            if (dd.mnem.equals("INT_ADD") &&
+                dd.ins.length == 2) {
+                Varnode a = dd.ins[0];
+                Varnode b = dd.ins[1];
+                if (a.isConstant() && !b.isConstant()) {
+                    field = a.getOffset();
+                    cur = b;
+                    p = def0;
+                } else if (b.isConstant() && !a.isConstant()) {
+                    field = b.getOffset();
+                    cur = a;
+                    p = def0;
+                } else {
+                    return null;
+                }
+            } else {
+                field = 0;
+            }
+        } else {
+            field = 0;
+        }
+        List<Long> linksInner = new ArrayList<Long>();
+        for (int hop = 0; hop < 24; hop++) {
+            Strip s = stripCopyAndW(ops, cur, p, wide);
+            if (s == null || s.v == null) return null;
+            cur = s.v;
+            p = s.pos;
+            if (cur.isConstant()) {
+                if (!allowConstRoot) return null;
+                return new ChainKey(false, cur.getOffset(),
+                    reverseLinks(linksInner), field);
+            }
+            String sp = cur.getAddress() == null ? null :
+                cur.getAddress().getAddressSpace().getName();
+            if ("ram".equals(sp)) return null;
+            int def = wide ? findDefAll(ops, vkey(cur), p) :
+                findDef(ops, vkey(cur), p);
+            if (def < 0) {
+                if (!isa.registerSpaceName().equals(sp)) {
+                    return null;
+                }
+                return new ChainKey(true, cur.getOffset(),
+                    reverseLinks(linksInner), field);
+            }
+            OpRec dd = ops.get(def);
+            if (!dd.mnem.equals("LOAD") ||
+                dd.ins.length < 2 || dd.out == null ||
+                dd.out.getSize() != isa.pointerSize()) {
+                return null;
+            }
+            p = def;
+            Strip sa = stripCopyAndW(ops, dd.ins[1], p, wide);
+            if (sa == null || sa.v == null) return null;
+            Varnode av = sa.v;
+            int pa = sa.pos;
+            long link = 0;
+            if (av.getAddress() != null &&
+                "ram".equals(av.getAddress().getAddressSpace()
+                    .getName())) {
+                // Literal-pool LOAD: the loaded value is
+                // the image word at this address, i.e. a
+                // constant root (a hardcoded pointer).
+                if (!allowConstRoot || mem == null) {
+                    return null;
+                }
+                try {
+                    long w = isa.readPointer(mem,
+                        toAddr(av.getOffset()));
+                    return new ChainKey(false, w,
+                        reverseLinks(linksInner), field);
+                } catch (Exception e) {
+                    return null;
+                }
+            }
+            if (!av.isConstant()) {
+                String spa = av.getAddress() == null ? null :
+                    av.getAddress().getAddressSpace().getName();
+                if ("ram".equals(spa)) return null;
+                int da = wide ? findDefAll(ops, vkey(av), pa) :
+                    findDef(ops, vkey(av), pa);
+                if (da >= 0) {
+                    OpRec ad = ops.get(da);
+                    if (ad.mnem.equals("INT_ADD") &&
+                        ad.ins.length == 2) {
+                        Varnode a = ad.ins[0];
+                        Varnode b = ad.ins[1];
+                        if (a.isConstant() && !b.isConstant()) {
+                            link = a.getOffset();
+                            cur = b;
+                            p = da;
+                        } else if (b.isConstant() &&
+                            !a.isConstant()) {
+                            link = b.getOffset();
+                            cur = a;
+                            p = da;
+                        } else {
+                            return null;
+                        }
+                    } else {
+                        cur = av;
+                        p = pa;
+                    }
+                } else {
+                    cur = av;
+                    p = pa;
+                }
+            } else {
+                return null;
+            }
+            linksInner.add(link);
+        }
+        return null;
+    }
+
+    private static List<Long> reverseLinks(List<Long> inner) {
+        List<Long> r = new ArrayList<Long>();
+        for (int i = inner.size() - 1; i >= 0; i--) {
+            r.add(inner.get(i));
+        }
+        return r;
+    }
+
+    /** v3.23 item 4: index of the argument register a value
+        operand resolves to, following COPY / Thumb-bit
+        strips backward; -1 when the value is not an
+        incoming argument (a constant, a LOAD, arithmetic,
+        or a register defined in this function). */
+    private int valueArgIndex(List<OpRec> ops, Varnode val,
+        int pos, long[] argRegs) {
+        Strip s = stripCopyAnd(ops, val, pos);
+        if (s == null || s.v == null) return -1;
+        Varnode cur = s.v;
+        if (cur.isConstant() || cur.getAddress() == null) {
+            return -1;
+        }
+        String sp = cur.getAddress().getAddressSpace().getName();
+        if (!isa.registerSpaceName().equals(sp)) return -1;
+        int def = findDef(ops, vkey(cur), s.pos);
+        if (def >= 0) return -1;
+        for (int i = 0; i < argRegs.length; i++) {
+            if (argRegs[i] == cur.getOffset()) return i;
+        }
+        return -1;
+    }
+
+    /** v3.23 item 4: the (apiOff, slot) pair of a CALLIND
+        through a device API table: the target register's
+        first LOAD is [X + slot] and X's first LOAD is
+        [dev + apiOff]. Null when the target chain is not
+        that two-LOAD shape. Used only to derive, from a
+        resolved setter site, which table slot the setter
+        occupies, so the veto scans can recognise other
+        loads of the same slot. */
+    private long[] apiSlotOfSite(List<OpRec> ops, int callIdx) {
+        OpRec call = ops.get(callIdx);
+        if (call.ins.length < 1) return null;
+        Strip s = stripCopyAnd(ops, call.ins[0], callIdx);
+        if (s == null || s.v == null) return null;
+        int def = findDef(ops, vkey(s.v), s.pos);
+        if (def < 0) return null;
+        OpRec dd = ops.get(def);
+        if (!dd.mnem.equals("LOAD") || dd.ins.length < 2 ||
+            dd.out == null ||
+            dd.out.getSize() != isa.pointerSize()) {
+            return null;
+        }
+        Strip sa = stripCopyAnd(ops, dd.ins[1], def);
+        if (sa == null || sa.v == null) return null;
+        Varnode av = sa.v;
+        long slot;
+        Varnode x;
+        if (av.isConstant()) return null;
+        String spa = av.getAddress() == null ? null :
+            av.getAddress().getAddressSpace().getName();
+        if ("ram".equals(spa)) return null;
+        int da = findDef(ops, vkey(av), sa.pos);
+        if (da >= 0) {
+            OpRec ad = ops.get(da);
+            if (ad.mnem.equals("INT_ADD") &&
+                ad.ins.length == 2) {
+                Varnode a = ad.ins[0];
+                Varnode b = ad.ins[1];
+                if (a.isConstant() && !b.isConstant()) {
+                    slot = a.getOffset();
+                    x = b;
+                } else if (b.isConstant() && !a.isConstant()) {
+                    slot = b.getOffset();
+                    x = a;
+                } else {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        } else {
+            return null;
+        }
+        Strip sx = stripCopyAnd(ops, x, da);
+        if (sx == null || sx.v == null) return null;
+        int dx = findDef(ops, vkey(sx.v), sx.pos);
+        if (dx < 0) return null;
+        OpRec dxo = ops.get(dx);
+        if (!dxo.mnem.equals("LOAD") || dxo.ins.length < 2 ||
+            dxo.out == null ||
+            dxo.out.getSize() != isa.pointerSize()) {
+            return null;
+        }
+        Strip sb = stripCopyAnd(ops, dxo.ins[1], dx);
+        if (sb == null || sb.v == null) return null;
+        Varnode bv = sb.v;
+        if (bv.isConstant()) return null;
+        String spb = bv.getAddress() == null ? null :
+            bv.getAddress().getAddressSpace().getName();
+        if ("ram".equals(spb)) return null;
+        int db = findDef(ops, vkey(bv), sb.pos);
+        if (db < 0) return null;
+        OpRec adb = ops.get(db);
+        if (adb.mnem.equals("INT_ADD") &&
+            adb.ins.length == 2) {
+            Varnode a = adb.ins[0];
+            Varnode b = adb.ins[1];
+            if (a.isConstant() && !b.isConstant()) {
+                return new long[]{a.getOffset(), slot};
+            }
+            if (b.isConstant() && !a.isConstant()) {
+                return new long[]{b.getOffset(), slot};
+            }
+        }
+        return null;
+    }
+
+    /** v3.23 item 4: op index of the first LOAD in a
+        CALLIND target's def-chain (the table-slot load),
+        or -1. Used to exclude a resolved setter site's own
+        slot load from the slot-load scan. */
+    private int firstLoadOfTarget(List<OpRec> ops, int callIdx) {
+        OpRec call = ops.get(callIdx);
+        if (call.ins.length < 1) return -1;
+        Strip s = stripCopyAnd(ops, call.ins[0], callIdx);
+        if (s == null || s.v == null) return -1;
+        int def = findDef(ops, vkey(s.v), s.pos);
+        if (def < 0) return -1;
+        OpRec dd = ops.get(def);
+        if (!dd.mnem.equals("LOAD") || dd.ins.length < 2) {
+            return -1;
+        }
+        return def;
+    }
+
+    /** v3.23 item 4: instr string of one TailCallResult
+        site JSON string, mirroring parseTailSites. */
+    private static String instrOfSite(String s) {
+        int ii = s.indexOf("\"instr\": \"");
+        if (ii < 0) return null;
+        int a = ii + 10;
+        int b = s.indexOf("\"", a);
+        if (b < 0) return null;
+        return s.substring(a, b);
+    }
+
+    /** v3.23 item 4: numeric address of a STORE op's
+        destination, or null when it does not resolve.
+        A constant or RAM-space address operand IS its own
+        address (resolveValue would instead read memory
+        contents for a RAM varnode, which is wrong here);
+        anything else goes through resolveValue. */
+    private Long storeAddrNumeric(List<OpRec> ops, OpRec op,
+        int opIdx, Memory mem) {
+        if (op.ins.length < 2) return null;
+        Varnode a = op.ins[1];
+        if (a.isConstant()) return a.getOffset();
+        if (a.getAddress() != null &&
+            "ram".equals(a.getAddress().getAddressSpace()
+                .getName())) {
+            return a.getOffset();
+        }
+        return resolveValue(a, ops, mem, opIdx, 4);
+    }
+
+    /** v3.23 item 4: the tail-veto post-pass (see the
+        design note in the item-4 report §4). It runs
+        AFTER ISR enumeration, so deviceEnumPairs and
+        deviceSitesByCallee exist, and BEFORE report
+        emission, which is the only later reader of
+        rec.tc: clobber and eligibility already ran on
+        the un-vetoed edges, and that is deliberate —
+        clobber is a conservative over-approximation
+        (keeping a superset member is safe there), while
+        the report must not name a wrong target. The
+        pass therefore changes ONLY the reported
+        may_tail_call_edges / unresolved_tail_call_count
+        for vetoed sites; MMIO, clones, fixpoints and
+        Lean inputs are untouched by construction.
+        A veto fires only when ALL of these hold for one
+        may-tail site: (a) the site's target set came
+        only from the byOffset tier; (b) the branch
+        destination is a chained field load whose
+        (dev, links, field) key matches an admitted
+        field-value map entry; (c) the map value is NOT
+        among the site's targets (when it is, the set
+        already contains the truth and is kept); (d)
+        every fail-closed scan for that key passed
+        (unique-writer, base stability, numeric cell,
+        uncounted-site scans S1/S2/S3). Anything else
+        leaves the site exactly as recoverTailCalls
+        reported it. */
+    private void applyTailVeto(List<FuncRec> funcRecs,
+        Map<Long, FuncRec> funcByEntry, Memory mem,
+        FunctionManager fm, Map<Long, Set<String>> byOffset,
+        Map<Long, Set<String>> byAddr,
+        List<long[]> deviceEnumPairs,
+        Map<Long, List<CallSite>> deviceSitesByCallee,
+        Map<Long, List<CallSite>> sitesByCallee,
+        Map<Long, long[]> persiteArgRegs, long persiteMask) {
+        Map<Long, Set<Long>> isrDevs =
+            new HashMap<Long, Set<Long>>();
+        for (long[] pair : deviceEnumPairs) {
+            if (pair.length < 3 || pair[2] != 1) continue;
+            Set<Long> ds = isrDevs.get(pair[0]);
+            if (ds == null) {
+                ds = new HashSet<Long>();
+                isrDevs.put(pair[0], ds);
+            }
+            ds.add(pair[1]);
+        }
+        if (isrDevs.isEmpty()) {
+            println("[*] tail-veto: no ISR seeds, nothing " +
+                "to veto.");
+            return;
+        }
+        int ptrSize = isa.pointerSize();
+        // ---- resolved-site index (caller entry + op) ----
+        Set<String> resolvedSites = new HashSet<String>();
+        for (Map.Entry<Long, List<CallSite>> e :
+            sitesByCallee.entrySet()) {
+            if (e.getValue() == null) continue;
+            for (CallSite s : e.getValue()) {
+                resolvedSites.add(s.caller.entryKey + "@" +
+                    s.opIdx);
+            }
+        }
+        for (Map.Entry<Long, List<CallSite>> e :
+            deviceSitesByCallee.entrySet()) {
+            if (e.getValue() == null) continue;
+            for (CallSite s : e.getValue()) {
+                resolvedSites.add(s.caller.entryKey + "@" +
+                    s.opIdx);
+            }
+        }
+        // ---- setter scan: per (setter, links, field) ----
+        // keyForm "links:field" -> per-store value-arg index
+        // (-1 = non-argument store) + owning setter entry.
+        Map<String, List<long[]>> storeGroups =
+            new HashMap<String, List<long[]>>();
+        for (FuncRec fr : funcRecs) {
+            if (fr.f.isExternal()) continue;
+            long[] argRegs = persiteArgRegs.get(fr.entryKey);
+            if (argRegs == null || argRegs.length < 1) continue;
+            List<OpRec> ops = fr.or.ops;
+            for (int oi = 0; oi < ops.size(); oi++) {
+                OpRec op = ops.get(oi);
+                if (!op.mnem.equals("STORE") ||
+                    op.ins.length < 3) continue;
+                ChainKey k = chainKey(ops, op.ins[1], oi,
+                    false, mem);
+                if (k == null || !k.rootIsArg ||
+                    k.root != argRegs[0]) continue;
+                StringBuilder lb = new StringBuilder();
+                for (int li = 0; li < k.links.size(); li++) {
+                    if (li > 0) lb.append(",");
+                    lb.append(k.links.get(li));
+                }
+                String gf = lb.toString() + ":" + k.field;
+                int va = valueArgIndex(ops, op.ins[2], oi,
+                    argRegs);
+                List<long[]> gl = storeGroups.get(gf);
+                if (gl == null) {
+                    gl = new ArrayList<long[]>();
+                    storeGroups.put(gf, gl);
+                }
+                gl.add(new long[]{fr.entryKey, oi, va});
+                // A group spanning two setters is not a
+                // single setter: mark it by keeping both
+                // entries; the map step below blocks any
+                // group whose stores do not share one
+                // setter (fail-closed).
+            }
+        }
+        // ---- map entries per (dev, links, field) ----
+        // mapForm "dev|links:field" -> single callback name.
+        Map<String, String> mapVals =
+            new HashMap<String, String>();
+        Set<String> blockedKeys = new HashSet<String>();
+        Map<String, Long> keySetter =
+            new HashMap<String, Long>();
+        // const-value stores to a (links, field) shape, for
+        // the contradiction check below: shape -> values.
+        Map<String, Set<String>> constStores =
+            new HashMap<String, Set<String>>();
+        for (FuncRec fr : funcRecs) {
+            if (fr.f.isExternal()) continue;
+            long[] argRegs = persiteArgRegs.get(fr.entryKey);
+            if (argRegs == null || argRegs.length < 1) continue;
+            List<OpRec> ops = fr.or.ops;
+            for (int oi = 0; oi < ops.size(); oi++) {
+                OpRec op = ops.get(oi);
+                if (!op.mnem.equals("STORE") ||
+                    op.ins.length < 3) continue;
+                ChainKey k = chainKey(ops, op.ins[1], oi,
+                    false, mem);
+                if (k == null || !k.rootIsArg ||
+                    k.root != argRegs[0]) continue;
+                StringBuilder lb = new StringBuilder();
+                for (int li = 0; li < k.links.size(); li++) {
+                    if (li > 0) lb.append(",");
+                    lb.append(k.links.get(li));
+                }
+                String gf = lb.toString() + ":" + k.field;
+                int va = valueArgIndex(ops, op.ins[2], oi,
+                    argRegs);
+                if (va >= 0) continue;
+                Long rv = resolveValue(op.ins[2], ops, mem,
+                    oi, 4);
+                if (rv == null) {
+                    // Unknown-value store to a chain
+                    // address: it could write any value
+                    // into a key cell, so every key with
+                    // this shape is blocked (fail-closed).
+                    // Recorded as a null marker below.
+                    Set<String> ws = constStores.get(gf);
+                    if (ws == null) {
+                        ws = new HashSet<String>();
+                        constStores.put(gf, ws);
+                    }
+                    ws.add(null);
+                    continue;
+                }
+                long te = isa.stripInstructionTag(
+                    rv.longValue());
+                FuncRec tgt = funcByEntry.get(te);
+                if (tgt == null) {
+                    tgt = funcByEntry.get(rv.longValue());
+                }
+                if (tgt == null) continue;
+                String nm;
+                try {
+                    nm = tgt.f.getName();
+                } catch (Exception e) {
+                    continue;
+                }
+                Set<String> ws = constStores.get(gf);
+                if (ws == null) {
+                    ws = new HashSet<String>();
+                    constStores.put(gf, ws);
+                }
+                ws.add(nm);
+            }
+        }
+        for (Map.Entry<String, List<long[]>> ge :
+            storeGroups.entrySet()) {
+            String gf = ge.getKey();
+            List<long[]> stores = ge.getValue();
+            long setter0 = stores.get(0)[0];
+            boolean multiSetter = false;
+            for (long[] st : stores) {
+                if (st[0] != setter0) multiSetter = true;
+            }
+            if (multiSetter) continue;
+            FuncRec setterRec = funcByEntry.get(setter0);
+            if (setterRec == null) continue;
+            long[] argRegs =
+                persiteArgRegs.get(setter0);
+            if (argRegs == null) continue;
+            List<CallSite> sites = new ArrayList<CallSite>();
+            List<CallSite> ds =
+                deviceSitesByCallee.get(setter0);
+            if (ds != null) sites.addAll(ds);
+            List<CallSite> cs = sitesByCallee.get(setter0);
+            if (cs != null) sites.addAll(cs);
+            if (sites.isEmpty()) continue;
+            boolean blocked = false;
+            Map<Long, Set<String>> valsByDev =
+                new HashMap<Long, Set<String>>();
+            for (CallSite s : sites) {
+                Map<String, Bits> st = null;
+                if (s.caller.fx != null &&
+                    s.caller.fx.inStates != null &&
+                    s.opIdx < s.caller.fx.inStates.length) {
+                    st = s.caller.fx.inStates[s.opIdx];
+                }
+                List<Bits> vals =
+                    persiteBindingFromState(st, argRegs);
+                Bits db = vals.size() > 0 ? vals.get(0) : null;
+                Long dev = db == null ? null :
+                    db.exactValue(persiteMask);
+                if (dev == null) {
+                    blocked = true;
+                    break;
+                }
+                for (long[] sto : stores) {
+                    int va = (int) sto[2];
+                    if (va < 0) continue;
+                    if (va >= vals.size()) {
+                        blocked = true;
+                        break;
+                    }
+                    Bits cb = vals.get(va);
+                    Long cbv = cb == null ? null :
+                        cb.exactValue(persiteMask);
+                    if (cbv == null) {
+                        blocked = true;
+                        break;
+                    }
+                    if (cbv.longValue() == 0) {
+                        continue;
+                    }
+                    long te = isa.stripInstructionTag(
+                        cbv.longValue());
+                    FuncRec tgt = funcByEntry.get(te);
+                    if (tgt == null) {
+                        tgt = funcByEntry.get(
+                            cbv.longValue());
+                    }
+                    if (tgt == null) {
+                        blocked = true;
+                        break;
+                    }
+                    String nm;
+                    try {
+                        nm = tgt.f.getName();
+                    } catch (Exception e) {
+                        blocked = true;
+                        break;
+                    }
+                    Set<String> vs = valsByDev.get(dev);
+                    if (vs == null) {
+                        vs = new HashSet<String>();
+                        valsByDev.put(dev, vs);
+                    }
+                    vs.add(nm);
+                }
+                if (blocked) break;
+            }
+            if (blocked) continue;
+            for (Map.Entry<Long, Set<String>> ve :
+                valsByDev.entrySet()) {
+                if (ve.getValue().size() != 1) continue;
+                String kf = ve.getKey() + "|" + gf;
+                String v = ve.getValue().iterator().next();
+                String old = mapVals.get(kf);
+                if (old != null && !old.equals(v)) {
+                    blockedKeys.add(kf);
+                } else {
+                    mapVals.put(kf, v);
+                    keySetter.put(kf, setter0);
+                }
+            }
+        }
+        // Const-store contradictions: a known constant
+        // store to a shape whose value differs from the
+        // map value blocks that key; an unknown-value
+        // store to the shape blocks it too.
+        for (Map.Entry<String, String> me :
+            new HashMap<String, String>(mapVals).entrySet()) {
+            String kf = me.getKey();
+            int bar = kf.indexOf("|");
+            String gf = kf.substring(bar + 1);
+            Set<String> ws = constStores.get(gf);
+            if (ws == null) continue;
+            for (String w : ws) {
+                if (w == null || !w.equals(me.getValue())) {
+                    blockedKeys.add(kf);
+                    break;
+                }
+            }
+        }
+        for (String bk : blockedKeys) mapVals.remove(bk);
+        // ---- per-key scans: base, numeric, S1, S2, S3 ----
+        Set<String> admitted = new HashSet<String>();
+        for (Map.Entry<String, String> me :
+            mapVals.entrySet()) {
+            String kf = me.getKey();
+            int bar = kf.indexOf("|");
+            long dev = Long.parseLong(kf.substring(0, bar));
+            String gf = kf.substring(bar + 1);
+            int colon = gf.lastIndexOf(":");
+            String linksPart = gf.substring(0, colon);
+            long field = Long.parseLong(
+                gf.substring(colon + 1));
+            List<Long> links = new ArrayList<Long>();
+            if (!linksPart.isEmpty()) {
+                for (String p : linksPart.split(",")) {
+                    links.add(Long.parseLong(p));
+                }
+            }
+            long setterEntry = keySetter.get(kf);
+            boolean ok = true;
+            String why = null;
+            // Base stability: stores to the base cell
+            // (links minus last, field = last link).
+            if (ok && !links.isEmpty()) {
+                List<Long> blinks = new ArrayList<Long>();
+                for (int i = 0; i < links.size() - 1; i++) {
+                    blinks.add(links.get(i));
+                }
+                long bfield = links.get(links.size() - 1);
+                StringBuilder bb = new StringBuilder();
+                for (int i = 0; i < blinks.size(); i++) {
+                    if (i > 0) bb.append(",");
+                    bb.append(blinks.get(i));
+                }
+                String bgf = bb.toString() + ":" + bfield;
+                List<long[]> bstores = storeGroups.get(bgf);
+                if (bstores != null && !bstores.isEmpty()) {
+                    ok = false;
+                    why = "base-cell writer";
+                }
+            }
+            // Numeric cell: follow the chain through
+            // program memory; any failure blocks.
+            Long cellAddr = null;
+            if (ok) {
+                try {
+                    long ptr = dev;
+                    for (Long l : links) {
+                        ptr = isa.readPointer(mem,
+                            toAddr(ptr + l.longValue()));
+                    }
+                    cellAddr = ptr + field;
+                } catch (Exception e) {
+                    ok = false;
+                    why = "numeric cell unreadable";
+                }
+            }
+            if (ok && cellAddr != null) {
+                outer:
+                for (FuncRec fr : funcRecs) {
+                    if (fr.f.isExternal()) continue;
+                    List<OpRec> ops = fr.or.ops;
+                    for (int oi = 0; oi < ops.size(); oi++) {
+                        OpRec op = ops.get(oi);
+                        if (!op.mnem.equals("STORE") ||
+                            op.ins.length < 2) continue;
+                        Long a = storeAddrNumeric(ops, op,
+                            oi, mem);
+                        if (a != null &&
+                            a.longValue() ==
+                                cellAddr.longValue()) {
+                            ok = false;
+                            why = "numeric writer";
+                            break outer;
+                        }
+                    }
+                }
+            }
+            // S1: an exact-target CALLIND to the setter
+            // that is not a counted site.
+            Set<String> fSiteKeys = new HashSet<String>();
+            {
+                List<CallSite> dl =
+                    deviceSitesByCallee.get(setterEntry);
+                if (dl != null) {
+                    for (CallSite s : dl) {
+                        fSiteKeys.add(s.caller.entryKey +
+                            "@" + s.opIdx);
+                    }
+                }
+                List<CallSite> cl =
+                    sitesByCallee.get(setterEntry);
+                if (cl != null) {
+                    for (CallSite s : cl) {
+                        fSiteKeys.add(s.caller.entryKey +
+                            "@" + s.opIdx);
+                    }
+                }
+            }
+            if (ok) {
+                outer:
+                for (FuncRec fr : funcRecs) {
+                    if (fr.f.isExternal()) continue;
+                    if (fr.fx == null ||
+                        fr.fx.inStates == null) continue;
+                    List<OpRec> ops = fr.or.ops;
+                    for (int oi = 0; oi < ops.size(); oi++) {
+                        OpRec op = ops.get(oi);
+                        if (!op.mnem.equals("CALLIND") ||
+                            op.ins.length < 1) continue;
+                        if (oi >= fr.fx.inStates.length ||
+                            fr.fx.inStates[oi] == null) {
+                            continue;
+                        }
+                        Bits tb = resolveBits(op.ins[0],
+                            fr.fx.inStates[oi]);
+                        if (tb == null) continue;
+                        Long t = tb.exactValue(persiteMask);
+                        if (t == null) continue;
+                        long te = isa.stripInstructionTag(
+                            t.longValue());
+                        if (te != setterEntry &&
+                            t.longValue() != setterEntry) {
+                            continue;
+                        }
+                        if (!fSiteKeys.contains(
+                            fr.entryKey + "@" + oi)) {
+                            ok = false;
+                            why = "S1 uncounted setter site";
+                            break outer;
+                        }
+                    }
+                }
+            }
+            // S2 + slot derivation: unresolved CALLINDs
+            // with device == dev must not hide a setter
+            // call: disposed only when their API-slot
+            // chain extracts to a different slot.
+            long[] slotPair = null;
+            {
+                List<CallSite> dl =
+                    deviceSitesByCallee.get(setterEntry);
+                if (dl != null) {
+                    for (CallSite s : dl) {
+                        Map<String, Bits> st = null;
+                        if (s.caller.fx != null &&
+                            s.caller.fx.inStates != null &&
+                            s.opIdx <
+                                s.caller.fx.inStates.length) {
+                            st = s.caller.fx.inStates[s.opIdx];
+                        }
+                        List<Bits> vb = persiteBindingFromState(
+                            st, persiteArgRegs.get(setterEntry));
+                        Long dv = vb.size() > 0 &&
+                            vb.get(0) != null ? vb.get(0)
+                                .exactValue(persiteMask) : null;
+                        if (dv != null &&
+                            dv.longValue() == dev) {
+                            slotPair = apiSlotOfSite(
+                                s.caller.or.ops, s.opIdx);
+                            if (slotPair != null) break;
+                        }
+                    }
+                }
+            }
+            if (ok && slotPair == null) {
+                // No derivable slot: the wrapper hole
+                // cannot be closed for this key.
+                ok = false;
+                why = "S2 slot underivable";
+            }
+            if (ok) {
+                outer:
+                for (FuncRec fr : funcRecs) {
+                    if (fr.f.isExternal()) continue;
+                    if (fr.fx == null ||
+                        fr.fx.inStates == null) continue;
+                    long[] carg =
+                        persiteArgRegs.get(fr.entryKey);
+                    if (carg == null || carg.length < 1) {
+                        continue;
+                    }
+                    List<OpRec> ops = fr.or.ops;
+                    for (int oi = 0; oi < ops.size(); oi++) {
+                        OpRec op = ops.get(oi);
+                        if (!op.mnem.equals("CALLIND") ||
+                            op.ins.length < 1) continue;
+                        if (resolvedSites.contains(
+                            fr.entryKey + "@" + oi)) {
+                            continue;
+                        }
+                        if (oi >= fr.fx.inStates.length ||
+                            fr.fx.inStates[oi] == null) {
+                            continue;
+                        }
+                        Varnode dvn = regVarnode(carg[0],
+                            ptrSize);
+                        if (dvn == null) continue;
+                        Bits db = resolveBits(dvn,
+                            fr.fx.inStates[oi]);
+                        if (db == null) continue;
+                        Long dv = db.exactValue(persiteMask);
+                        if (dv == null ||
+                            dv.longValue() != dev) {
+                            continue;
+                        }
+                        long[] sp = apiSlotOfSite(ops, oi);
+                        if (sp != null &&
+                            sp[0] == slotPair[0] &&
+                            sp[1] == slotPair[1]) {
+                            ok = false;
+                            why = "S2 same-slot unresolved";
+                            break outer;
+                        }
+                        if (sp == null) {
+                            ok = false;
+                            why = "S2 unextractable " +
+                                "unresolved";
+                            break outer;
+                        }
+                        // Different slot: disposed.
+                    }
+                }
+            }
+            // S3: loads of the setter's table slot outside
+            // resolved sites for this dev.
+            if (ok) {
+                Set<String> excludedLoads =
+                    new HashSet<String>();
+                {
+                    List<CallSite> dl =
+                        deviceSitesByCallee.get(setterEntry);
+                    if (dl != null) {
+                        for (CallSite s : dl) {
+                            Map<String, Bits> st = null;
+                            if (s.caller.fx != null &&
+                                s.caller.fx.inStates != null &&
+                                s.opIdx <
+                                    s.caller.fx.inStates.length) {
+                                st = s.caller.fx.inStates[s.opIdx];
+                            }
+                            List<Bits> vb =
+                                persiteBindingFromState(st,
+                                    persiteArgRegs.get(
+                                        setterEntry));
+                            Long dv = vb.size() > 0 &&
+                                vb.get(0) != null ? vb.get(0)
+                                    .exactValue(persiteMask)
+                                    : null;
+                            if (dv == null ||
+                                dv.longValue() != dev) {
+                                continue;
+                            }
+                            int li = firstLoadOfTarget(
+                                s.caller.or.ops, s.opIdx);
+                            if (li >= 0) {
+                                excludedLoads.add(
+                                    s.caller.entryKey + "@" + li);
+                            }
+                        }
+                    }
+                }
+                outer:
+                for (FuncRec fr : funcRecs) {
+                    if (fr.f.isExternal()) continue;
+                    List<OpRec> ops = fr.or.ops;
+                    for (int oi = 0; oi < ops.size(); oi++) {
+                        OpRec op = ops.get(oi);
+                        if (!op.mnem.equals("LOAD") ||
+                            op.ins.length < 2 ||
+                            op.out == null ||
+                            op.out.getSize() != ptrSize) {
+                            continue;
+                        }
+                        if (excludedLoads.contains(
+                            fr.entryKey + "@" + oi)) {
+                            continue;
+                        }
+                        ChainKey lk = chainKey(ops,
+                            op.ins[1], oi, true, mem);
+                        if (lk == null) continue;
+                        if (lk.links.size() != 1 ||
+                            lk.links.get(0) != slotPair[0] ||
+                            lk.field != slotPair[1]) {
+                            continue;
+                        }
+                        boolean couldBeDev = false;
+                        if (!lk.rootIsArg) {
+                            couldBeDev =
+                                lk.root == dev;
+                        } else {
+                            Set<Long> arg0vals =
+                                new HashSet<Long>();
+                            boolean anySite = false;
+                            boolean unknownBinding = false;
+                            long[] hArgRegs =
+                                persiteArgRegs.get(
+                                    fr.entryKey);
+                            List<CallSite> allH =
+                                new ArrayList<CallSite>();
+                            List<CallSite> dl2 =
+                                deviceSitesByCallee.get(
+                                    fr.entryKey);
+                            if (dl2 != null) {
+                                allH.addAll(dl2);
+                            }
+                            List<CallSite> cl2 =
+                                sitesByCallee.get(
+                                    fr.entryKey);
+                            if (cl2 != null) {
+                                allH.addAll(cl2);
+                            }
+                            for (CallSite s : allH) {
+                                anySite = true;
+                                Map<String, Bits> st2 = null;
+                                if (s.caller.fx != null &&
+                                    s.caller.fx.inStates !=
+                                        null &&
+                                    s.opIdx < s.caller.fx
+                                        .inStates.length) {
+                                    st2 = s.caller.fx
+                                        .inStates[s.opIdx];
+                                }
+                                if (hArgRegs == null) {
+                                    unknownBinding = true;
+                                    continue;
+                                }
+                                List<Bits> vb =
+                                    persiteBindingFromState(
+                                        st2, hArgRegs);
+                                Long dv = vb.size() > 0 &&
+                                    vb.get(0) != null ?
+                                        vb.get(0).exactValue(
+                                            persiteMask) : null;
+                                if (dv != null) {
+                                    arg0vals.add(dv);
+                                } else {
+                                    unknownBinding = true;
+                                }
+                            }
+                            couldBeDev = !anySite ||
+                                unknownBinding ||
+                                arg0vals.contains(dev);
+                        }
+                        if (couldBeDev) {
+                            ok = false;
+                            why = "S3 slot load";
+                            break outer;
+                        }
+                    }
+                }
+            }
+            if (ok) {
+                admitted.add(kf);
+            } else {
+                println("[*] tail-veto: key " + kf +
+                    " value " + me.getValue() +
+                    " blocked (" + why + ").");
+            }
+        }
+        // ---- veto application ----
+        int vetoed = 0;
+        for (FuncRec gr : funcRecs) {
+            Set<Long> devs = isrDevs.get(gr.entryKey);
+            if (devs == null || devs.isEmpty()) continue;
+            if (gr.tc == null || gr.tc.sites == null ||
+                gr.tc.sites.isEmpty()) continue;
+            long[] argRegs = persiteArgRegs.get(gr.entryKey);
+            if (argRegs == null || argRegs.length < 1) continue;
+            Map<String, List<String>> oldMap =
+                parseTailSites(gr.tc);
+            List<String> newSites = new ArrayList<String>();
+            Set<String> vetoedInstrs = new HashSet<String>();
+            for (String s : gr.tc.sites) {
+                String instr = instrOfSite(s);
+                if (instr == null) {
+                    newSites.add(s);
+                    continue;
+                }
+                List<String> names = oldMap.get(instr);
+                if (names == null || names.isEmpty()) {
+                    newSites.add(s);
+                    continue;
+                }
+                int opIdx = -1;
+                for (int oi = 0; oi < gr.or.ops.size(); oi++) {
+                    OpRec op = gr.or.ops.get(oi);
+                    if (op.mnem.equals("BRANCHIND") &&
+                        op.instrAddr.toString()
+                            .equals(instr)) {
+                        opIdx = oi;
+                        break;
+                    }
+                }
+                if (opIdx < 0) {
+                    newSites.add(s);
+                    continue;
+                }
+                int[] tierBox = new int[1];
+                Set<String> tset = resolveIndirectSetTier(
+                    gr.or.ops, mem, fm, byOffset, byAddr,
+                    opIdx, true, tierBox);
+                if (tierBox[0] != TIER_OFFSET ||
+                    tset.isEmpty()) {
+                    newSites.add(s);
+                    continue;
+                }
+                OpRec br = gr.or.ops.get(opIdx);
+                if (br.ins.length < 1) {
+                    newSites.add(s);
+                    continue;
+                }
+                Strip sb = stripCopyAnd(gr.or.ops,
+                    br.ins[0], opIdx);
+                if (sb == null || sb.v == null) {
+                    newSites.add(s);
+                    continue;
+                }
+                int bdef = findDef(gr.or.ops,
+                    vkey(sb.v), sb.pos);
+                if (bdef < 0) {
+                    newSites.add(s);
+                    continue;
+                }
+                OpRec bdd = gr.or.ops.get(bdef);
+                if (!bdd.mnem.equals("LOAD") ||
+                    bdd.ins.length < 2) {
+                    newSites.add(s);
+                    continue;
+                }
+                ChainKey bk = chainKeyWide(gr.or.ops,
+                    bdd.ins[1], bdef, false, mem);
+                if (bk == null || !bk.rootIsArg ||
+                    bk.root != argRegs[0] ||
+                    bk.links.isEmpty()) {
+                    newSites.add(s);
+                    continue;
+                }
+                boolean hit = false;
+                for (Long dv : devs) {
+                    StringBuilder lb = new StringBuilder();
+                    for (int li = 0; li < bk.links.size();
+                        li++) {
+                        if (li > 0) lb.append(",");
+                        lb.append(bk.links.get(li));
+                    }
+                    String kf = dv + "|" + lb.toString() +
+                        ":" + bk.field;
+                    if (!admitted.contains(kf)) continue;
+                    String v = mapVals.get(kf);
+                    if (v != null && !names.contains(v)) {
+                        hit = true;
+                        println("[*] tail-veto: " +
+                            gr.f.getName() + " instr=" +
+                            instr + " targets " + names +
+                            " vetoed (map " + kf + " = " +
+                            v + ").");
+                        break;
+                    }
+                }
+                if (hit) {
+                    vetoed++;
+                    vetoedInstrs.add(instr);
+                } else {
+                    newSites.add(s);
+                }
+            }
+            if (!vetoedInstrs.isEmpty()) {
+                Set<String> newNames = new HashSet<String>();
+                int newTargets = 0;
+                for (String s : newSites) {
+                    List<String> ns =
+                        oldMap.get(instrOfSite(s));
+                    if (ns == null) continue;
+                    newTargets += ns.size();
+                    newNames.addAll(ns);
+                }
+                gr.tc = new TailCallResult(newSites,
+                    newTargets,
+                    gr.tc.unresolved + vetoedInstrs.size(),
+                    newNames);
+            }
+        }
+        println("[*] tail-veto: vetoed=" + vetoed +
+            " admittedKeys=" + admitted.size() +
+            " mapKeys=" + mapVals.size() + ".");
     }
 
     /** v3.5 pass 2: resolve CALLINDs to may-call-edges. CALLINDs
@@ -12059,11 +15166,15 @@ public class ExtractIR extends GhidraScript {
                 ")");
         } else if ("MIPS".equals(proc)) {
             boolean is64 = false;
+            // v3.23 item 7: R6 removed delay slots (language ids
+            // like MIPS:LE:64:R6); pre-R6 variants keep them.
+            boolean isR6 = false;
             try {
                 String langId = currentProgram.getLanguage()
                     .getLanguageID().getIdAsString();
                 String[] parts = langId.split(":");
                 is64 = parts.length >= 3 && "64".equals(parts[2]);
+                isR6 = langId.contains("R6");
             } catch (Exception e) {
                 // Fall through to MIPS32.
             }
@@ -12079,9 +15190,9 @@ public class ExtractIR extends GhidraScript {
                         "MIPS defaults.");
                 }
             }
-            isa = new MipsIsa(is64, windows);
+            isa = new MipsIsa(is64, windows, !isR6);
             println("[*] ISA adapter: MIPS (" + (is64 ? "MIPS64" : "MIPS32") +
-                ")");
+                (isR6 ? ", R6, no delay slots" : "") + ")");
         } else if ("x86".equals(proc)) {
             boolean is64 = false;
             boolean is16 = false;
@@ -12091,15 +15202,26 @@ public class ExtractIR extends GhidraScript {
                 String[] parts = langId.split(":");
                 is64 = parts.length >= 3 && "64".equals(parts[2]);
                 is16 = parts.length >= 3 && "16".equals(parts[2]);
+                // v3.23 Phase 3 backlog item 6: the segmented
+                // adapter applies to Real Mode only. Protected
+                // Mode's (selector << 16) + offset is not a
+                // physical address without a GDT, so its segment
+                // ops stay unknown (fail-closed).
+                seg16RealMode = is16 && parts.length >= 4 &&
+                    "Real Mode".equals(parts[3]);
             } catch (Exception e) {
                 // Fall through to x86-32.
             }
-            if (is16) {
-                println("[!] x86-16 real mode is NOT implemented " +
-                    "in v1: analysis proceeds with the 32-bit " +
-                    "adapter as a best effort and results are " +
-                    "NOT reliable (segmented addressing is " +
-                    "unmodelled).");
+            if (is16 && !seg16RealMode) {
+                println("[!] x86-16 Protected Mode: the " +
+                    "segmented adapter is Real-Mode-only, so " +
+                    "segmented addresses stay UNKNOWN here " +
+                    "(fail-closed); port I/O is unaffected.");
+            } else if (seg16RealMode) {
+                println("[*] x86-16 Real Mode: segmented " +
+                    "adapter active: segment:offset linearises " +
+                    "as (segment << 4) + offset when both legs " +
+                    "are exact constants, else UNKNOWN.");
             }
             // Binary default convention: PE -> Windows, ELF ->
             // System V. The format string is the loader's name
@@ -12151,9 +15273,90 @@ public class ExtractIR extends GhidraScript {
                 println("[*] acpi: mmio= override supplied; " +
                     "ACPI bands not added.");
             }
-            isa = new X86Isa(is64, windows, windowsDefault);
+            isa = new X86Isa(is64, is16,
+                currentProgram.getAddressFactory()
+                    .getDefaultAddressSpace(),
+                windows, windowsDefault);
             println("[*] ISA adapter: X86 (" + (is64 ? "X86-64" :
                 (is16 ? "X86-16 (best effort)" : "X86-32")) + ")");
+        }
+        // v3.23 Phase 3 backlog item 6: raw-binary 16-bit
+        // entry. A raw binary imported through the
+        // BinaryLoader has no symbols and no entry point, so
+        // default headless analysis disassembles NOTHING
+        // (verified on the item-6 synthetic: 0 instructions, 0
+        // functions) and the report would be vacuously empty.
+        // When this is a Real-Mode program imported as Raw
+        // Binary with no functions at all, the import contract
+        // is "the first block is code whose entry is its
+        // start" (the ingest_raw16.py wrapper states this);
+        // disassemble that block and create one entry function
+        // over it. Anything else (ELF/PE, a program that
+        // already has functions, a block that yields no
+        // instructions, a failed function creation) is left
+        // exactly as today, with a loud line -- never a
+        // silently invented function.
+        try {
+            if (seg16RealMode) {
+                String fmt16 = null;
+                try {
+                    fmt16 = currentProgram.getExecutableFormat();
+                } catch (Exception e) {
+                    fmt16 = null;
+                }
+                boolean anyFn = currentProgram.getFunctionManager()
+                    .getFunctions(true).hasNext();
+                if ("Raw Binary".equals(fmt16) && !anyFn) {
+                    MemoryBlock firstBlk = null;
+                    for (MemoryBlock mb :
+                        currentProgram.getMemory().getBlocks()) {
+                        if (firstBlk == null ||
+                            mb.getStart().compareTo(
+                                firstBlk.getStart()) < 0) {
+                            firstBlk = mb;
+                        }
+                    }
+                    if (firstBlk != null) {
+                        Address eStart = firstBlk.getStart();
+                        AddressSet eRange = new AddressSet(eStart,
+                            firstBlk.getEnd());
+                        DisassembleCommand edc =
+                            new DisassembleCommand(eStart, eRange,
+                                true);
+                        boolean disOk = edc.applyTo(
+                            currentProgram, monitor);
+                        AddressSet eSet = new AddressSet(
+                            edc.getDisassembledAddressSet());
+                        String eFn = "FAILED";
+                        if (disOk && !eSet.isEmpty()) {
+                            int txe = currentProgram
+                                .startTransaction(
+                                    "phase3-raw16-entry");
+                            try {
+                                CreateFunctionCmd efc =
+                                    new CreateFunctionCmd(eStart);
+                                if (efc.applyTo(currentProgram,
+                                    monitor) &&
+                                    efc.getFunction() != null) {
+                                    eFn = efc.getFunction()
+                                        .getName();
+                                }
+                            } finally {
+                                currentProgram.endTransaction(
+                                    txe, true);
+                            }
+                        }
+                        println("[*] raw16-entry: block=" +
+                            firstBlk.getName() +
+                            " disassembled=" + disOk +
+                            " addrs=" + eSet.getNumAddresses() +
+                            " function=" + eFn);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            println("[!] raw16-entry: creation failed, " +
+                "continuing without it: " + e);
         }
         // Per-callee calling conventions for signature-driven
         // clobbers (x86 v1). Built from Ghidra's per-function
@@ -12197,7 +15400,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.23\",");
+        w.println("  \"extractor_version\": \"v3.24\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -12464,6 +15667,16 @@ public class ExtractIR extends GhidraScript {
                             }
                             if ((word & 1L) == 0) continue;
                             long tgt = word & ~1L;
+                            // No function entry lives in the
+                            // first 256 bytes: on ARM Cortex-M
+                            // that is the vector table (stack
+                            // slot + handler pointers). Small
+                            // data words in tables (1, 3, ...)
+                            // must not decode the vector table
+                            // as code (measured: config-scan
+                            // overrun created FUN_00000000 /
+                            // FUN_00000002 from data words 1/3).
+                            if (tgt < 0x100L) continue;
                             Address tAddr;
                             MemoryBlock xb;
                             try {
@@ -12525,6 +15738,175 @@ public class ExtractIR extends GhidraScript {
                             }
                         }
                     }
+                // v3.23 Phase 3 backlog item 1 (L1b):
+                // device-config callback tables. A device_area
+                // record is [name, config, api, state, data,
+                // init, 0]; the config struct its +4 word
+                // points to can hold function pointers that
+                // no direct call or branch ever names (Zephyr
+                // clock driver: the onoff manager CALLINDs
+                // generic_hfclk_start/stop and lfclk_start/
+                // stop out of the clock config struct, so
+                // neither Ghidra nor the closure below can
+                // reach them). Scan the config struct of
+                // every record passing the same gate L2 uses
+                // (record block readonly, api at +8 into a
+                // *_driver_api_area block, init at +20
+                // already a function) and create any Thumb
+                // function pointer found there under the SAME
+                // gates as the table pass (Thumb bit,
+                // executable block, no covering function).
+                // Bound: 64 words per struct; non-pointer
+                // words fail the gates and create nothing.
+                // This is a static-table scan, not a loosened
+                // rule: the store hypothesis was CHECKED and
+                // rejected (whole-file word scan: pointers to
+                // 5 of the 6 missing clock functions occur
+                // nowhere in runtime sections, only in debug
+                // info -- they are reachable only via the
+                // tail-branch chains the closure below
+                // follows once this pass supplies the root).
+                {
+                    int createdCfg = 0;
+                    try {
+                        for (MemoryBlock db :
+                            currentProgram.getMemory()
+                                .getBlocks()) {
+                            if (!"device_area".equals(
+                                db.getName())) continue;
+                            if (db.isWrite()) continue;
+                            long da = db.getStart().getOffset();
+                            long de = db.getEnd().getOffset();
+                            for (long c = da; c + 27 <= de;
+                                c += 4) {
+                                long cfgPtr;
+                                long apiPtr;
+                                long initPtr;
+                                try {
+                                    cfgPtr = isa.readPointer(
+                                        currentProgram.getMemory(),
+                                        toAddr(c + 4)) & 0xffffffffL;
+                                    apiPtr = isa.readPointer(
+                                        currentProgram.getMemory(),
+                                        toAddr(c + 8)) & 0xffffffffL;
+                                    initPtr = isa.readPointer(
+                                        currentProgram.getMemory(),
+                                        toAddr(c + 20)) & 0xffffffffL;
+                                } catch (Exception ex) {
+                                    continue;
+                                }
+                                MemoryBlock apiBlk;
+                                try {
+                                    apiBlk = currentProgram
+                                        .getMemory().getBlock(
+                                            toAddr(apiPtr));
+                                } catch (Exception ex) {
+                                    continue;
+                                }
+                                if (apiBlk == null ||
+                                    !apiBlk.getName().endsWith(
+                                        "_driver_api_area")) {
+                                    continue;
+                                }
+                                try {
+                                    if (fm1.getFunctionContaining(
+                                        toAddr(initPtr & ~1L))
+                                        == null) continue;
+                                } catch (Exception ex) {
+                                    continue;
+                                }
+                                MemoryBlock cfgBlk;
+                                try {
+                                    cfgBlk = currentProgram
+                                        .getMemory().getBlock(
+                                            toAddr(cfgPtr));
+                                } catch (Exception ex) {
+                                    continue;
+                                }
+                                if (cfgBlk == null ||
+                                    cfgBlk.isExecute() ||
+                                    cfgBlk.isWrite()) continue;
+                                for (int wi = 0; wi < 64 &&
+                                    created < 512; wi++) {
+                                    long word;
+                                    try {
+                                        word = isa.readPointer(
+                                            currentProgram.getMemory(),
+                                            toAddr(cfgPtr + 4L * wi))
+                                            & 0xffffffffL;
+                                    } catch (Exception ex) {
+                                        continue;
+                                    }
+                                    if ((word & 1L) == 0) continue;
+                                    long tgt = word & ~1L;
+                                    // Vector-table exclusion
+                                    // (see table pass gate above).
+                                    if (tgt < 0x100L) continue;
+                                    Address tAddr;
+                                    MemoryBlock xb;
+                                    try {
+                                        tAddr = toAddr(tgt);
+                                        xb = currentProgram.getMemory()
+                                            .getBlock(tAddr);
+                                    } catch (Exception ex) {
+                                        continue;
+                                    }
+                                    if (xb == null ||
+                                        !xb.isExecute()) continue;
+                                    try {
+                                        if (fm1.getFunctionContaining(
+                                            tAddr) != null) continue;
+                                    } catch (Exception ex) {
+                                        continue;
+                                    }
+                                    try {
+                                        if (currentProgram.getListing()
+                                            .getInstructionAt(tAddr)
+                                            == null) {
+                                            AddressSet xr =
+                                                new AddressSet(
+                                                    xb.getStart(),
+                                                    xb.getEnd());
+                                            ArmDisassembleCommand dcC =
+                                                new ArmDisassembleCommand(
+                                                    tAddr, xr, true);
+                                            try {
+                                                ghidra.program.model.lang.Register
+                                                    tmC = currentProgram
+                                                        .getRegister("TMode");
+                                                if (tmC != null) {
+                                                    dcC.setInitialContext(
+                                                        new RegisterValue(tmC,
+                                                            java.math.BigInteger.ONE));
+                                                }
+                                            } catch (Exception ex) {
+                                                // Default context.
+                                            }
+                                            dcC.applyTo(currentProgram,
+                                                monitor);
+                                        }
+                                        CreateFunctionCmd cfcC =
+                                            new CreateFunctionCmd(tAddr);
+                                        cfcC.applyTo(currentProgram,
+                                            monitor);
+                                        if (cfcC.getFunction() != null) {
+                                            created++;
+                                            createdCfg++;
+                                            createdQueue.add(tAddr);
+                                        }
+                                    } catch (Exception ex) {
+                                        // Candidate skipped.
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Exception ex) {
+                        // Config scan is best-effort; the
+                        // table pass + closure still stand.
+                    }
+                    println("[*] table-fns: config-created=" +
+                        createdCfg);
+                }
                 // Closure pass: table-created functions call
                 // further functions that stripped analysis also
                 // missed (e.g. uarte_0_init -> pinctrl_apply_state
@@ -12533,16 +15915,80 @@ public class ExtractIR extends GhidraScript {
                 // targets of created functions to fixpoint
                 // (capped), creating each newly found function
                 // the same way. Intra-function branches are
-                // skipped by the covering-function test;
-                // BRANCHIND (jump tables, callbacks) is never
-                // followed here -- only direct targets.
+                // skipped by the covering-function test,
+                // EXCEPT a target inside an existing body
+                // that passes the disjoint-range +
+                // no-fall-through split test below (a
+                // tail-absorbed function entry, not an
+                // interior block); BRANCHIND (jump tables,
+                // callbacks) is never followed here -- only
+                // direct targets.
                 {
                     // Seed: entries created by the table
                     // pass above (explicit list -- the
                     // created functions' source type is
                     // NOT USER_DEFINED, so it cannot be
                     // used to identify them).
+                    // v3.23 Phase 3 backlog item 1 (L1c):
+                    // ALSO seed with every recovered function.
+                    // Tail-branch-only functions (nrfx_clock_*
+                    // reached only by b.w from nrfx_clock_init
+                    // / nrfx_power_clock_irq_handler / the
+                    // clock_stop dispatchers) are missed by
+                    // Ghidra even though their callers ARE
+                    // recovered, so a created-only seed can
+                    // never reach them. Gates are UNCHANGED
+                    // (direct CALL/BRANCH only, executable
+                    // block, no covering function, BRANCHIND
+                    // never followed, same 512 cap); the
+                    // wider seed only lets the same rule
+                    // start from recovered callers. On
+                    // unstripped binaries every target is
+                    // already a function, so this is a no-op
+                    // there (verified by the regression).
                     List<Address> queue = createdQueue;
+                    // Entries created by the table + config
+                    // passes above (BEFORE the all-functions
+                    // seed is appended). A contained target
+                    // may be split out ONLY from a container
+                    // in this set (see the split test below):
+                    // splitting a Ghidra-original function
+                    // LOSES findings (measured: f4uart_o2
+                    // HAL_RCC_OscConfig 62 -> 52, cdc_msc
+                    // divmod_u64u64_unsafe 25 -> 8), because
+                    // code analysed under a caller with exact
+                    // bindings, once split out, is analysed
+                    // standalone with unknown arguments and
+                    // the engine has no tail-call clones to
+                    // restore the bindings. An L1-created
+                    // mega-body, by contrast, is already
+                    // broken (generic_hfclk_start's spanned
+                    // body scored 0 for all of it), so
+                    // splitting it can only repair.
+                    java.util.Set<Long> createdEntries =
+                        new java.util.HashSet<Long>();
+                    for (Address q : queue) {
+                        createdEntries.add(q.getOffset());
+                    }
+                    try {
+                        java.util.Set<Long> seenQ =
+                            new java.util.HashSet<Long>();
+                        for (Address q : queue) {
+                            seenQ.add(q.getOffset());
+                        }
+                        FunctionIterator allFns =
+                            fm1.getFunctions(true);
+                        while (allFns.hasNext()) {
+                            Address ep = allFns.next()
+                                .getEntryPoint();
+                            if (ep != null &&
+                                seenQ.add(ep.getOffset())) {
+                                queue.add(ep);
+                            }
+                        }
+                    } catch (Exception ex) {
+                        // Seed stays table-created only.
+                    }
                     int qi = 0;
                     while (qi < queue.size() &&
                         created < 512) {
@@ -12584,9 +16030,192 @@ public class ExtractIR extends GhidraScript {
                             }
                             if (xb2 == null ||
                                 !xb2.isExecute()) continue;
+                            // Vector-table exclusion (see
+                            // table pass gate above): a pcode
+                            // CALL/BRANCH target below 0x100
+                            // is a small-data artifact, not a
+                            // function entry.
+                            if (ta.getOffset() < 0x100L) continue;
                             try {
-                                if (fm1.getFunctionContaining(
-                                    ta) != null) continue;
+                                Function container =
+                                    fm1.getFunctionContaining(ta);
+                                if (container != null &&
+                                    !createdEntries.contains(
+                                        container.getEntryPoint()
+                                            .getOffset())) {
+                                    // Ghidra-original container:
+                                    // never split (see the
+                                    // createdEntries note above
+                                    // -- measured f4uart_o2 /
+                                    // cdc_msc losses). Its
+                                    // absorbed code stays
+                                    // analysed under the caller
+                                    // (total unchanged, only the
+                                    // function-level attribution
+                                    // stays caller-side).
+                                    continue;
+                                }
+                                if (container != null) {
+                                    // ta lies inside an existing
+                                    // function's flow body. That
+                                    // body may have over-absorbed
+                                    // a tail-branch target (e.g.
+                                    // nrfx_clock_stop's body
+                                    // spans clock_stop's code,
+                                    // generic_hfclk_start's
+                                    // created body spans
+                                    // 0x1a60-0x45e4). Splitting
+                                    // is allowed ONLY when BOTH
+                                    // hold, otherwise ta is an
+                                    // interior block of the
+                                    // container and splitting
+                                    // would carve a real
+                                    // function apart (measured:
+                                    // pinctrl's loop head 1fca,
+                                    // epilogue 1fd0 and jump
+                                    // targets 203e/20ce were
+                                    // carved this way, losing
+                                    // pinctrl's only finding):
+                                    // (i) DISJOINT RANGE: ta's
+                                    // body range differs from
+                                    // the container entry's
+                                    // range (a tail-absorbed
+                                    // function is a separate
+                                    // range; an interior block
+                                    // shares the entry range);
+                                    // (ii) NO FALL-THROUGH
+                                    // PREDECESSOR: the
+                                    // instruction ending at ta
+                                    // is a nop pad, an
+                                    // unconditional transfer
+                                    // (branch/return), or absent
+                                    // with a literal-pool word
+                                    // proving it. A conditional
+                                    // branch or CALL falls
+                                    // through and does NOT
+                                    // prove entry. Interior
+                                    // blocks fail (ii): their
+                                    // predecessor (movw, movs,
+                                    // str, beq, ...) falls
+                                    // through into them. True
+                                    // entries pass (ii): their
+                                    // predecessor is a return,
+                                    // a branch, or a pool word.
+                                    // If either test cannot be
+                                    // evaluated, fail closed.
+                                    boolean splitOk = false;
+                                    try {
+                                        ghidra.program.model.address
+                                            .AddressSetView cBody =
+                                            container.getBody();
+                                        ghidra.program.model.address
+                                            .AddressRange eRange = null;
+                                        ghidra.program.model.address
+                                            .AddressRange tRange = null;
+                                        ghidra.program.model.address
+                                            .AddressRangeIterator ri =
+                                            cBody.getAddressRanges();
+                                        while (ri.hasNext()) {
+                                            ghidra.program.model.address
+                                                .AddressRange r =
+                                                ri.next();
+                                            if (r.contains(container
+                                                .getEntryPoint())) {
+                                                eRange = r;
+                                            }
+                                            if (r.contains(ta)) {
+                                                tRange = r;
+                                            }
+                                        }
+                                        boolean disjoint =
+                                            eRange != null &&
+                                            tRange != null &&
+                                            (eRange.getMinAddress()
+                                                .getOffset() !=
+                                                tRange.getMinAddress()
+                                                .getOffset() ||
+                                            eRange.getMaxAddress()
+                                                .getOffset() !=
+                                                tRange.getMaxAddress()
+                                                .getOffset());
+                                        boolean noFall = false;
+                                        try {
+                                            Instruction pred =
+                                                currentProgram
+                                                    .getListing()
+                                                    .getInstructionContaining(
+                                                        ta.subtract(1));
+                                            if (pred == null) {
+                                                // No instruction ends
+                                                // at ta: allow ONLY
+                                                // for a literal-pool
+                                                // word (a word that
+                                                // points into a mapped
+                                                // block). Undisassembled
+                                                // code bytes (the
+                                                // tbb-orphaned block
+                                                // before pinctrl's
+                                                // 20ce) must fail
+                                                // closed, not pass
+                                                // as "padding".
+                                                try {
+                                                    long poolWord =
+                                                        isa.readPointer(
+                                                            currentProgram.getMemory(),
+                                                            toAddr(ta.getOffset() - 4))
+                                                            & 0xffffffffL;
+                                                    MemoryBlock poolBlk =
+                                                        currentProgram.getMemory()
+                                                            .getBlock(toAddr(poolWord));
+                                                    noFall = poolBlk != null;
+                                                } catch (Exception ex3) {
+                                                    noFall = false;
+                                                }
+                                            } else if ("nop".equals(
+                                                pred.getMnemonicString())) {
+                                                // Alignment padding.
+                                                noFall = true;
+                                            } else {
+                                                // Only an unconditional
+                                                // transfer (BRANCH /
+                                                // BRANCHIND / RETURN)
+                                                // proves no fall-through:
+                                                // a conditional branch
+                                                // (CBRANCH) and a CALL
+                                                // BOTH fall through
+                                                // (measured: lfclk_start's
+                                                // 2a42 block follows a
+                                                // beq, clock_stop's
+                                                // 28fa follows a bne --
+                                                // both are interior
+                                                // blocks, not entries).
+                                                // Ownership is NOT
+                                                // consulted: an orphaned
+                                                // fall-through block is
+                                                // still fall-through.
+                                                boolean falls = true;
+                                                for (PcodeOp pop :
+                                                    pred.getPcode()) {
+                                                    String pm =
+                                                        pop.getMnemonic();
+                                                    if (pm.equals("BRANCH") ||
+                                                        pm.equals("BRANCHIND") ||
+                                                        pm.equals("RETURN")) {
+                                                        falls = false;
+                                                        break;
+                                                    }
+                                                }
+                                                noFall = !falls;
+                                            }
+                                        } catch (Exception ex2) {
+                                            noFall = false;
+                                        }
+                                        splitOk = disjoint && noFall;
+                                    } catch (Exception ex2) {
+                                        splitOk = false;
+                                    }
+                                    if (!splitOk) continue;
+                                }
                             } catch (Exception ex) {
                                 continue;
                             }
@@ -12622,6 +16251,8 @@ public class ExtractIR extends GhidraScript {
                                     monitor);
                                 if (cfc2.getFunction() != null) {
                                     created++;
+                                    createdEntries.add(
+                                        ta.getOffset());
                                     queue.add(ta);
                                 }
                             } catch (Exception ex) {
@@ -12638,6 +16269,162 @@ public class ExtractIR extends GhidraScript {
             }
         } catch (Exception e) {
             println("[!] table-fns: discovery failed, " +
+                "continuing without it: " + e);
+        }
+        // v3.23 Phase 3 backlog item 7: 64-bit RISC-V/MIPS
+        // table-target function creation. Ghidra's own switch
+        // recovery does not extend MIPS64 function bodies
+        // (measured: dispatch cases stay outside every function),
+        // and stripped binaries have no function at an indirect
+        // callee at all, so recoverIndirect can never edge them
+        // (it only edges real function entries, by design). This
+        // pre-pass creates functions at exact table entries --
+        // pointer tables for CALLIND, pointer or offset tables for
+        // BRANCHIND -- BEFORE the FuncRec pass, so the main
+        // analysis edges and analyses them. Gated to 64-bit
+        // RISC-V/MIPS only (adapter name + pointerSize 8):
+        // RV32/MIPS32 already recover through Ghidra, and creating
+        // extra functions there would move their totals.
+        // Fail-closed per candidate: the target must lie in an
+        // executable block, must not lie inside any existing
+        // function (never split, per the ARM lesson), and must
+        // disassemble; a failure skips that candidate only. The
+        // entry scan stops at the first entry that is not an
+        // executable code address (table end), capped at 64,
+        // mirroring recoverIndirect.
+        try {
+            String isaName7 = isa.name();
+            if (("RISCV".equals(isaName7) || "MIPS".equals(isaName7)) &&
+                isa.pointerSize() == 8) {
+                FunctionManager fmP =
+                    currentProgram.getFunctionManager();
+                Memory memP = currentProgram.getMemory();
+                Listing listingP = currentProgram.getListing();
+                List<Function> seeds = new ArrayList<Function>();
+                FunctionIterator sit = fmP.getFunctions(true);
+                while (sit.hasNext() && !monitor.isCancelled()) {
+                    seeds.add(sit.next());
+                }
+                List<Long> candidates = new ArrayList<Long>();
+                long mask7 = -1L;
+                for (Function sf : seeds) {
+                    OpsResult sor;
+                    try {
+                        sor = buildOps(sf);
+                    } catch (Exception e) {
+                        continue;
+                    }
+                    List<OpRec> sops = sor.ops;
+                    for (int i = 0; i < sops.size(); i++) {
+                        OpRec op = sops.get(i);
+                        if (!op.mnem.equals("CALLIND") &&
+                            !op.mnem.equals("BRANCHIND")) continue;
+                        if (op.ins.length < 1) continue;
+                        Long tbase = null;
+                        boolean tOffset = false;
+                        int tEs = isa.pointerSize();
+                        if (op.mnem.equals("BRANCHIND")) {
+                            int cur = findDef(sops, vkey(op.ins[0]),
+                                i);
+                            if (cur >= 0) {
+                                cur = isa.unwrapIndirectDef(sops, i,
+                                    cur);
+                            }
+                            if (cur < 0) continue;
+                            TableMatch tm = matchBranchTableFrom(
+                                sops, i, cur, isa.pointerSize(),
+                                isa.pointerIndexShift(), mask7);
+                            if (tm == null) continue;
+                            tbase = tm.base;
+                            tOffset = tm.offset;
+                            tEs = tm.entrySize > 0 ? tm.entrySize :
+                                isa.pointerSize();
+                        } else {
+                            Long pb = findPtrTableBase(sops, i);
+                            if (pb == null) continue;
+                            tbase = pb;
+                            tOffset = false;
+                            tEs = isa.pointerSize();
+                        }
+                        for (int k = 0; k < 64; k++) {
+                            long eAddr = tbase.longValue() +
+                                (long) tEs * k;
+                            long raw;
+                            try {
+                                raw = tEs == 4 ?
+                                    memP.getInt(toAddr(eAddr)) :
+                                    isa.readPointer(memP,
+                                        toAddr(eAddr));
+                            } catch (Exception e) {
+                                break;
+                            }
+                            long t = tOffset ?
+                                (tbase.longValue() + (int) raw) :
+                                isa.stripInstructionTag(raw);
+                            MemoryBlock xb;
+                            try {
+                                xb = memP.getBlock(toAddr(t));
+                            } catch (Exception e) {
+                                break;
+                            }
+                            if (xb == null || !xb.isExecute()) break;
+                            try {
+                                if (fmP.getFunctionContaining(
+                                    toAddr(t)) != null) {
+                                    continue;
+                                }
+                            } catch (Exception e) {
+                                break;
+                            }
+                            if (!candidates.contains(t)) {
+                                candidates.add(t);
+                            }
+                        }
+                    }
+                }
+                int created7 = 0;
+                if (!candidates.isEmpty()) {
+                    int tx7 = currentProgram.startTransaction(
+                        "item7-table-fns");
+                    try {
+                        for (Long t : candidates) {
+                            try {
+                                Address tAddr = toAddr(t);
+                                if (fmP.getFunctionContaining(
+                                    tAddr) != null) continue;
+                                if (listingP.getInstructionAt(
+                                    tAddr) == null) {
+                                    MemoryBlock xb =
+                                        memP.getBlock(tAddr);
+                                    AddressSet xr = new AddressSet(
+                                        xb.getStart(), xb.getEnd());
+                                    DisassembleCommand dc =
+                                        new DisassembleCommand(
+                                            tAddr, xr, true);
+                                    dc.applyTo(currentProgram,
+                                        monitor);
+                                }
+                                if (listingP.getInstructionAt(
+                                    tAddr) == null) continue;
+                                CreateFunctionCmd cfc =
+                                    new CreateFunctionCmd(tAddr);
+                                cfc.applyTo(currentProgram, monitor);
+                                if (cfc.getFunction() != null) {
+                                    created7++;
+                                }
+                            } catch (Exception e) {
+                                // Candidate skipped.
+                            }
+                        }
+                    } finally {
+                        currentProgram.endTransaction(tx7, true);
+                    }
+                }
+                println("[*] item7-table-fns: candidates=" +
+                    candidates.size() + " created=" + created7);
+            }
+        } catch (Exception e) {
+            println("[!] item7-table-fns: discovery failed, " +
                 "continuing without it: " + e);
         }
         FunctionManager fmA = currentProgram.getFunctionManager();
@@ -12851,6 +16638,10 @@ public class ExtractIR extends GhidraScript {
         // ---- v13 clobber refinement: per-callee may-write sets
         // (must-only; may/taint transfers stay conservative) ----
         clobberRef = computeClobberRef(funcRecs, funcByEntry);
+        // ---- v43-item2: per-callee push/pop preserved sets
+        // (must-only, same scope; computed after clobberRef
+        // so refinedClobberForCall sees both) ----
+        preservedRef = computePreservedRef(funcRecs);
         // ---- v2 item #2, Phase B: worklist iteration over entries ----
         Map<Long, Map<String, Bits>> entries =
             new HashMap<Long, Map<String, Bits>>();
@@ -13875,6 +17666,24 @@ public class ExtractIR extends GhidraScript {
         } catch (Exception e) {
             // ISR enumeration is best-effort, as above.
         }
+        // v3.23 item 4: tail-veto post-pass. Runs here
+        // because it needs ISR seeds + device sites (both
+        // complete at this point) and because every later
+        // reader of rec.tc except report emission has
+        // already run; see applyTailVeto's contract note.
+        // Best-effort like the enumeration above: a veto
+        // failure must never lose the report, so any
+        // exception leaves all tail edges exactly as
+        // recoverTailCalls reported them.
+        try {
+            applyTailVeto(funcRecs, funcByEntry, memA, fmA,
+                funcPtrByOffset, funcPtrByAddr,
+                deviceEnumPairs, deviceSitesByCallee,
+                sitesByCallee, persiteArgRegs, persiteMask);
+        } catch (Exception e) {
+            println("[!] tail-veto: pass failed, keeping " +
+                "un-vetoed edges: " + e);
+        }
         // Seed groups from merged contexts (caller final
         // fixpoints), grouped by binding vector.
         for (FuncRec callee : funcRecs) {
@@ -14173,6 +17982,9 @@ public class ExtractIR extends GhidraScript {
         int persiteExtraBar = 0;
         int persiteSkippedIdent = 0;
         int persiteReplayMismatch = 0;
+        // v3.23 Phase 3 backlog item 3: bounded loop peeling totals
+        // [loops, units, mmio, port, msr, bar, skipped].
+        int[] peelTotals = new int[7];
         {
             int shown = 0;
             for (Map.Entry<Long, List<PerSiteGroup>> e :
@@ -14917,6 +18729,21 @@ public class ExtractIR extends GhidraScript {
                     }
                 }
             }
+            // v3.23 Phase 3 backlog item 3: bounded loop peeling.
+            // Runs AFTER the clone block so its dedup set covers
+            // merged + clone findings, and BEFORE the protocol /
+            // tdcall blocks (different entry classes, no collision).
+            // Additive only: it can only append proven-prefix
+            // findings, never remove or replace. Any failure inside
+            // is caught and logged there, never loses a finding.
+            try {
+                peelLoopsForFunction(rec, ops, fx, branchTargets,
+                    mem, mmio, portIo, msr, barRel, bndAccesses,
+                    bndProfile, persiteByCallee, peelTotals);
+            } catch (Exception e) {
+                println("[!] peel: " + rec.f.getName() +
+                    " hook failed: " + e);
+            }
             // v2 item #3: protocol/BS call resolution from the
             // provenance fixpoint (Phase P). A resolved site is
             // explained, so it is excluded from the points-to
@@ -15427,6 +19254,11 @@ public class ExtractIR extends GhidraScript {
             " msr=" + persiteExtraMsr + " bar=" + persiteExtraBar +
             ", skippedByIdentity=" + persiteSkippedIdent +
             ", replayMismatch=" + persiteReplayMismatch + ".");
+        println("[*] peel: loops=" + peelTotals[0] +
+            " units=" + peelTotals[1] +
+            " +mmio=" + peelTotals[2] + " +port=" + peelTotals[3] +
+            " +msr=" + peelTotals[4] + " +bar=" + peelTotals[5] +
+            ", skipped=" + peelTotals[6] + ".");
         println("[*] boundary: checked=" + totalBoundaryChecked +
             " violations=" + totalBoundaryViolations +
             " unknown_agent=" + totalBoundaryUnknownAgent +

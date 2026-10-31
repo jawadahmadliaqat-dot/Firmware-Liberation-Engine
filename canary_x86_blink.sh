@@ -18,7 +18,14 @@ fi
 BIN=""
 if [ -f "$WS/regress/x86_blink.elf" ]; then BIN="$WS/regress/x86_blink.elf";
 elif [ -f "$WS/binaries/x86_blink.elf" ]; then BIN="$WS/binaries/x86_blink.elf";
-else echo "CANARY FAILED: x86_blink.elf not found in regress/ or binaries/" >&2; exit 1; fi
+elif [ -f "$WS/targets/x86_blink/x86_blink.elf.b64" ]; then
+  # Decode to regress/, NOT binaries/: the ingest wrapper copies its input
+  # into binaries/ itself, and decoding straight to binaries/ makes it crash
+  # with SameFileError (proven by the scratch fresh-clone test, 2026-10-31).
+  mkdir -p "$WS/regress"
+  base64 -d "$WS/targets/x86_blink/x86_blink.elf.b64" > "$WS/regress/x86_blink.elf"
+  BIN="$WS/regress/x86_blink.elf";
+else echo "CANARY FAILED: x86_blink.elf not found in regress/, binaries/, or targets/x86_blink/x86_blink.elf.b64" >&2; exit 1; fi
 mkdir -p "$WS/headless_logs"
 LOG="$WS/headless_logs/canary_x86_blink_$(date +%Y%m%d-%H%M%S).log"
 cd "$WS" || exit 1
