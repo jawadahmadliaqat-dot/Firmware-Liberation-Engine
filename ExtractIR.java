@@ -12239,6 +12239,66 @@ public class ExtractIR extends GhidraScript {
         vs same-struct FIELD; guards in order signed, wide (ZEXT
         only), guard-call, multi-word; multiword sizeOff -1 means
         any size field, >= 0 requires the matched FIELD offset). */
+    /** Finding C gate: does the FIRST CBRANCH after a comparison at
+        cmpIdx, before the copy call at callOpIdx, gate the copy?
+        On flag-based branches the first branch after a comparison
+        is the one that consumes its flags (any intervening
+        flag-setting instruction would clobber them), and later
+        branches must not rescue the comparison — notably the
+        unsound check's own return branch, which gates the copy but
+        belongs to a different comparison. Gate = exactly one of
+        the branch's two successor groups reaches the copy group
+        via grpSucc (same reachability test the multiword matcher
+        uses). Fail-closed: unresolvable target, missing
+        fall-through, or null grpSucc means NO gate. */
+    private boolean boundsFirstBranchGates(List<OpRec> ops,
+        int[] opGroup, List<List<Integer>> grpSucc,
+        Map<String, Integer> addrToGroup, int cmpIdx,
+        int callOpIdx) {
+        if (grpSucc == null) return false;
+        if (callOpIdx < 0 || callOpIdx >= ops.size()) return false;
+        int callGroup = opGroup[callOpIdx];
+        int cb = -1;
+        for (int i = cmpIdx + 1; i < callOpIdx; i++) {
+            if (ops.get(i).mnem.equals("CBRANCH")) {
+                cb = i;
+                break;
+            }
+        }
+        if (cb < 0) return false;
+        OpRec br = ops.get(cb);
+        if (br.ins.length < 1) return false;
+        Integer tgtGroup = null;
+        try {
+            long t = br.ins[0].getOffset();
+            tgtGroup = addrToGroup.get(
+                isa.formatCodeAddress(t));
+            if (tgtGroup == null) {
+                tgtGroup = addrToGroup.get(
+                    isa.formatCodeAddress(
+                        isa.stripInstructionTag(t)));
+            }
+        } catch (Exception e) {
+            tgtGroup = null;
+        }
+        int fallOp = -1;
+        try {
+            fallOp = isa.fallthroughIndex(ops, cb);
+        } catch (Exception e) {
+            fallOp = -1;
+        }
+        if (tgtGroup == null || fallOp < 0 ||
+            fallOp >= ops.size()) {
+            return false;
+        }
+        int fallGroup = opGroup[fallOp];
+        boolean reachTgt =
+            boundsGroupReaches(grpSucc, tgtGroup, callGroup);
+        boolean reachFall =
+            boundsGroupReaches(grpSucc, fallGroup, callGroup);
+        return reachTgt != reachFall;
+    }
+
     private BoundsEval boundsEvalSite(List<BoundsCmp> cmps,
         List<BoundsCall> calls, List<Integer> cbranchIdx,
         Map<Long, Boolean> signedCheckByEntry, List<OpRec> ops,
@@ -12289,8 +12349,17 @@ public class ExtractIR extends GhidraScript {
                 (boundsIsOffset(c.b, offIdx) &&
                     c.a.kind.equals("CONST") &&
                     c.a.constVal == 0)) {
-                guard = "signed-check";
-                break;
+                // Finding C: a signed comparison counts as a sound
+                // guard only if the first branch after it gates
+                // the copy path; an unrelated (debug, other-branch)
+                // comparison must not mask the site. Keep scanning
+                // on a non-gating match — a later comparison may
+                // be the real guard.
+                if (boundsFirstBranchGates(ops, opGroup, grpSucc,
+                    addrToGroup, c.idx, callOpIdx)) {
+                    guard = "signed-check";
+                    break;
+                }
             }
         }
         if (guard.equals("none")) {
@@ -12307,8 +12376,15 @@ public class ExtractIR extends GhidraScript {
                     wide = true;
                 }
                 if (wide) {
-                    guard = "wide-check";
-                    break;
+                    // Finding C: same gate as signed-check (see
+                    // above); a non-gating widened comparison must
+                    // not mask the site. Keep scanning otherwise.
+                    if (boundsFirstBranchGates(ops, opGroup,
+                        grpSucc, addrToGroup, c.idx,
+                        callOpIdx)) {
+                        guard = "wide-check";
+                        break;
+                    }
                 }
             }
         }
@@ -15400,7 +15476,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.24\",");
+        w.println("  \"extractor_version\": \"v3.25\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped

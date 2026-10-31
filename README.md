@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.24-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.25-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -57,7 +57,7 @@ A binary passed as a path is used directly (no Drive needed); a bare name syncs 
 - **Boundary** — no must-proven access crossing a configured security boundary
   (violation, unknown-agent and unknown-region counts reported, never silent).
 
-## Results (extractor v3.24, 36-target regression, 0 mismatches)
+## Results (extractor v3.25, 36-target regression, 0 mismatches)
 
 | Target | Fixed findings | May | Lean verdict |
 |---|---|---|---|
@@ -109,6 +109,7 @@ syndemo-clock-violation, x86-syndemo-port); none is a violation in shipped firmw
 | v3.22 | CpuDxe MSR allowlist gap closed (below); CpuDxe PASSes generic. |
 | v3.23 | LocalApicTimerDxe + PlatformPei MSR allowlist gaps closed (below); both PASS generic. |
 | v3.24 | Phase 3 backlog: stripped 241 → 311, PciHostBridge 10 ports, spinlock 32 exact, 16-bit raw import + segmented adapter, RV64/MIPS64 calls/jump tables on fixtures; USART2 Gap B design-only. |
+| v3.25 | Finding C signed-masking fix (below); class-level negative control fc_signed_mask; 0 corpus-output changes. |
 | v3.1–v3.13 | Fixpoint tracker, MAY analysis, jump tables, call graph, points-to, tail calls, per-site transfer, clobber refinement, stack slots. |
 
 **v3.21 (V1.5) in short:** a table entry becomes a boundary region only when its
@@ -154,6 +155,21 @@ MIPS64 R6 fallthrough fixed). USART2 Gap B stays DESIGN-ONLY
 subsystem, and RV64/MIPS64 real targets remain open — see the backlog
 report in `~/workspace/v43-phase3backlog/BACKLOG-REPORT.md`.
 
+**v3.25 (Finding C signed-masking fix) in short:** the bounds
+classifier's signed-check loop now requires the first branch after a
+comparison, before the copy, to gate the copy (mirroring the
+guard-call loop) — a non-gating signed comparison placed before a copy
+no longer suppresses a flag. Proven on a new synthetic fixture
+`fc_signed_mask` (standalone, class-level negative control, not a CVE
+copy): pre-fix flagged=false/signed-check/bounds true, post-fix
+flagged=true/no sound guard/bounds false. Caveats, stated plainly:
+0 corpus-output changes on the current 46-target set; classifier
+behavior changed for code shapes not yet in corpus (see
+`fc_signed_mask`). Wide half of Finding C unproven — no report in
+corpus has ever exercised a wide-check guard; treat as untested, not
+fixed, on these ISAs. Only signed-masking is proven; the wide-masking
+control was NOT reproduced.
+
 **OVMF evaluation round (v3.23 Lean, counted):** 124 inventoried OVMF targets run — 51 PASS / 73 FAIL, all 73 FAILs empty-trace coverage (0 trace ops) with 0 real bugs and 0 bounds sites. Shell + TlsDxe needed a one-off 1G heap attempt (512M cap restored after); the 512M ceiling is no longer an open gap for this corpus.
 
 ## Honest limits (one line each)
@@ -167,7 +183,7 @@ report in `~/workspace/v43-phase3backlog/BACKLOG-REPORT.md`.
 - Boundary V1.5 scope: static profiles + learned tables + thread attribution; config-write learning design-only; a boundary violation is a necessary condition for privilege escalation, NOT proof of an exploit.
 - Non-live 21 (all-slots seeding) is DELIBERATELY NOT enabled — a finding must mean "does call", not "could call"; deferred until a labelled JSON shape exists.
 - 16-bit real mode has a raw-binary import path plus a segmented adapter, proven on synthetic Real-Mode targets; far-target discovery, Protected Mode, and A20 policy remain open.
-- Real violations found in shipped firmware: 0. In the 36-target sweep, the FAILs that exist are intentional synthetic violation demos and Sata/Virtio's genuinely-empty traces (empty-trace FAILs, not violations); the MPU/SAU boundary violations are on purpose-built proof targets. The 124-target OVMF evaluation round's 73 FAILs are likewise empty-trace coverage FAILs, counted separately above — none of these FAILs is a violation found in shipped firmware.
+- Real violations found in shipped firmware: 0. In the 36-target sweep, the FAILs that exist are intentional synthetic violation demos and the genuinely-empty traces of Sata, Virtio and acpi-mcfg (empty-trace FAILs, not violations); the MPU/SAU boundary violations are on purpose-built proof targets. The 124-target OVMF evaluation round's 73 FAILs are likewise empty-trace coverage FAILs, counted separately above — none of these FAILs is a violation found in shipped firmware.
 - PciHostBridge (resolved, not a finding): ports 0x510/0x514/0x518 are QEMU fw_cfg; the allowlist grants the four named ports only, and it now PASSES.
 
 ## Screenshots (real terminal output)
