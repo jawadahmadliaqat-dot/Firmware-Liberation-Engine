@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.25-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.26-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -57,7 +57,7 @@ A binary passed as a path is used directly (no Drive needed); a bare name syncs 
 - **Boundary** — no must-proven access crossing a configured security boundary
   (violation, unknown-agent and unknown-region counts reported, never silent).
 
-## Results (extractor v3.25, 36-target regression, 0 mismatches)
+## Results (extractor v3.26, 36-target regression, 0 mismatches)
 
 | Target | Fixed findings | May | Lean verdict |
 |---|---|---|---|
@@ -110,6 +110,7 @@ syndemo-clock-violation, x86-syndemo-port); none is a violation in shipped firmw
 | v3.23 | LocalApicTimerDxe + PlatformPei MSR allowlist gaps closed (below); both PASS generic. |
 | v3.24 | Phase 3 backlog: stripped 241 → 311, PciHostBridge 10 ports, spinlock 32 exact, 16-bit raw import + segmented adapter, RV64/MIPS64 calls/jump tables on fixtures; USART2 Gap B design-only. |
 | v3.25 | Finding C signed-masking fix (below); class-level negative control fc_signed_mask; 0 corpus-output changes. |
+| v3.26 | Caller-check masking fix (below); two class-level controls cm_caller_mask + cm_caller_gate; 0 corpus-output changes. |
 | v3.1–v3.13 | Fixpoint tracker, MAY analysis, jump tables, call graph, points-to, tail calls, per-site transfer, clobber refinement, stack slots. |
 
 **v3.21 (V1.5) in short:** a table entry becomes a boundary region only when its
@@ -169,6 +170,30 @@ behavior changed for code shapes not yet in corpus (see
 corpus has ever exercised a wide-check guard; treat as untested, not
 fixed, on these ISAs. Only signed-masking is proven; the wide-masking
 control was NOT reproduced.
+
+**v3.26 (Caller-check masking fix) in short:** the bounds
+classifier's caller-validation path now requires a recorded caller
+check to actually gate the call edge (mirroring the Finding C
+first-branch rule) — a signed comparison recorded anywhere in the
+caller, on a branch that does not determine the call, no longer
+suppresses a whole callee-side site. Proven on two new synthetic
+fixtures: `cm_caller_mask` (standalone, class-level negative control,
+not a CVE copy): pre-fix flagged=false/caller-check/bounds true,
+post-fix flagged=true/no sound guard/bounds false; and
+`cm_caller_gate` (positive control, deliberately kept alongside):
+a genuinely gating caller check still suppresses as designed, so
+the fix is not over-broad — the test set is honest only with both,
+catch proven AND no new false positives. Caveats, stated plainly:
+0 corpus-output changes on the current 46-target set; behavior
+changed for caller-check shapes not yet in corpus (see
+`cm_caller_mask`). Wide half of this fix (same as Finding C direct
+fix) remains unproven — wide-check loop has no live case on these
+ISAs, caller-boundary or direct. Only signed caller-check masking
+is proven; the repro was a signed `if (off < 0)` scenario — no
+wide-masking caller-check fixture was built. This is the second
+independent class-level control in the repo (first: intra-function
+guard-existence-without-dominance, `fc_signed_mask`; second:
+caller-callee trust-boundary suppression, `cm_caller_mask`).
 
 **OVMF evaluation round (v3.23 Lean, counted):** 124 inventoried OVMF targets run — 51 PASS / 73 FAIL, all 73 FAILs empty-trace coverage (0 trace ops) with 0 real bugs and 0 bounds sites. Shell + TlsDxe needed a one-off 1G heap attempt (512M cap restored after); the 512M ceiling is no longer an open gap for this corpus.
 

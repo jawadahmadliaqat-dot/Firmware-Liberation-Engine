@@ -12442,7 +12442,58 @@ public class ExtractIR extends GhidraScript {
         } else {
             return false;
         }
-        if (fv.signedArgs.contains(m)) return true;
+        // Caller-check masking (v46, mirroring Finding C's
+        // boundsFirstBranchGates): a recorded caller check
+        // suppresses only if its first branch gates the call edge.
+        // Existence alone — a signed comparison anywhere in the
+        // caller, on a branch that does not determine the call —
+        // must not suppress a whole callee-side site. Group maps
+        // are built once here and reused by the signed and wide
+        // paths; any failure to build them fails closed (no
+        // suppression on that path).
+        int[] cgOpGroup = null;
+        List<List<Integer>> cgGrpSucc = null;
+        Map<String, Integer> cgAddrToGroup = null;
+        if (fv.ops != null && fv.branchTargets != null) {
+            try {
+                List<List<Integer>> cgSucc =
+                    buildSucc(fv.ops, fv.branchTargets);
+                BoundsGroups cgBg =
+                    boundsGroupMaps(fv.ops, cgSucc);
+                cgOpGroup = cgBg.opGroup;
+                cgGrpSucc = cgBg.grpSucc;
+                cgAddrToGroup = cgBg.addrToGroup;
+            } catch (Exception e) {
+                cgGrpSucc = null;
+            }
+        }
+        if (fv.signedArgs.contains(m) && fv.cmps != null &&
+            cgGrpSucc != null) {
+            for (BoundsCmp c : fv.cmps) {
+                if (!c.isSigned()) continue;
+                boolean match = false;
+                if ((c.a.kind.equals("ARG") ||
+                    c.a.kind.equals("ROOT")) &&
+                    c.a.argIdx == m &&
+                    c.b.kind.equals("CONST") &&
+                    c.b.constVal == 0) {
+                    match = true;
+                } else if ((c.b.kind.equals("ARG") ||
+                    c.b.kind.equals("ROOT")) &&
+                    c.b.argIdx == m &&
+                    c.a.kind.equals("CONST") &&
+                    c.a.constVal == 0) {
+                    match = true;
+                }
+                if (!match) continue;
+                // Keep scanning on a non-gating match — a later
+                // comparison may be the real guard.
+                if (boundsFirstBranchGates(fv.ops, cgOpGroup,
+                    cgGrpSucc, cgAddrToGroup, c.idx, ed.idx)) {
+                    return true;
+                }
+            }
+        }
         if (sizeOff < 0 || fv.cmps == null) return false;
         BExpr mapped = null;
         if (structBase != null && structBase.kind.equals("ARG")) {
@@ -12467,7 +12518,14 @@ public class ExtractIR extends GhidraScript {
                 c.a.base.equals(mapped)) {
                 wide = true;
             }
-            if (wide) return true;
+            // Same gating as the signed path above (v46): a
+            // widened comparison suppresses only if its first
+            // branch gates the call edge.
+            if (wide && cgGrpSucc != null &&
+                boundsFirstBranchGates(fv.ops, cgOpGroup,
+                    cgGrpSucc, cgAddrToGroup, c.idx, ed.idx)) {
+                return true;
+            }
         }
         if (fv.ops == null || fv.branchTargets == null) {
             return false;
@@ -15476,7 +15534,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.25\",");
+        w.println("  \"extractor_version\": \"v3.26\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
