@@ -9,8 +9,8 @@
 <body>
 <header class="hero">
 <h1>Formal proof of what your firmware really touches.</h1>
-<p>Ghidra lifts firmware to P-Code. ExtractIR extracts MMIO, port, MSR, protocol and BAR facts. A Lean 4 verifier checks whether every recovered access stays inside its allowed window and peripheral family. This site shows only real, trimmed reports. It does not run firmware.</p>
-<p>Engine v3.22 &middot; 36-target regression, 0 mismatches &middot; Corpus: 1,695 fixed findings across 6 stacks, plus 11 P5 real targets reported separately below.</p>
+<p>Ghidra lifts firmware to P-Code. ExtractIR extracts MMIO, port, MSR, protocol and BAR facts. A Lean 4 verifier checks whether every recovered access stays inside its allowed window and peripheral family. This site shows only real reports, plus two labelled synthetic demos. It does not run firmware.</p>
+<p>Engine v3.26 &middot; 36-target regression 31 PASS / 5 FAIL, 0 mismatches &middot; Corpus: 1,885 fixed findings across 6 stacks, plus 11 P5 real targets reported separately below.</p>
 </header>
 <main>
 <p>How to read a card: <b>fixed</b> = accesses the engine is certain about; <b>may</b> = accesses that are possible but not certain; <b>verdict</b> = the Lean checker's answer on the recovered accesses. A PASS means only that what was found stayed inside its allowed window. It is not proof the extraction is complete.</p>
@@ -21,44 +21,44 @@
 <div class="card">
 <h3><a href="bmp.html">Black Magic Probe v2.0.0</a></h3>
 <p><span class="badge pass">PASS</span> bmp mode + generic mode</p>
-<p>Fixed MMIO: <b>447</b> &middot; May: <b>7 sites</b></p>
-<p>Extractor v3.22 &middot; STM32F1, ARM Cortex-M</p>
-<p>The canonical real firmware: official v2.0.0 release, source cross-checked. Stripped build: 327 MMIO, generic mode only (never bmp mode on stripped input).</p>
+<p>Fixed MMIO: <b>483</b> &middot; May: <b>7 sites</b></p>
+<p>Extractor v3.26 &middot; STM32F1, ARM Cortex-M</p>
+<p>The canonical real firmware: official v2.0.0 release, source cross-checked. Stripped build: 335 MMIO, generic mode only (never bmp mode on stripped input).</p>
 </div>
 <div class="card">
 <h3><a href="rp2040.html">RP2040 hello_uart</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
-<p>Fixed MMIO: <b>236</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; pico-examples, built from source</p>
+<p>Fixed MMIO: <b>268</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.26 &middot; pico-examples, built from source</p>
 <p>Ground truth 198/198 code-true at v3.12; SIO + boot2 windows added in v3.19, PPB band in v3.20.</p>
 </div>
 <div class="card">
 <h3><a href="stm32f4.html">STM32F4 UART</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
 <p>Fixed MMIO: <b>186 (-O0) / 187 (-O2)</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; STM32CubeF4, built from source</p>
+<p>Extractor v3.26 &middot; STM32CubeF4, built from source</p>
 <p>GPIO plane recovered in v3.13; PPB band in v3.20. USART2 data plane still missed (Gap B, redesign pending).</p>
 </div>
 <div class="card">
 <h3><a href="nrf52.html">nRF52 UART</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
 <p>Fixed MMIO: <b>220</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; nRF5 SDK 17.1.0, nRF52832, built from source</p>
+<p>Extractor v3.26 &middot; nRF5 SDK 17.1.0, nRF52832, built from source</p>
 <p>Ground truth 182/182 code-true at v3.12. UART TX path recovered in v3.13 (+23, tail-call sites); PPB band in v3.20.</p>
 </div>
 <div class="card">
 <h3><a href="tinyusb.html">TinyUSB cdc_msc</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
-<p>Fixed MMIO: <b>324</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; TinyUSB on Raspberry Pi Pico, built from source</p>
-<p>CDC + MSC device example. Count rose 224 &rarr; 303 in v3.19 (SIO/SSI windows) and 303 &rarr; 324 in v3.20 (PPB band).</p>
+<p>Fixed MMIO: <b>398</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.26 &middot; TinyUSB on Raspberry Pi Pico, built from source</p>
+<p>CDC + MSC device example. Count rose 224 &rarr; 303 in v3.19 (SIO/SSI windows), 303 &rarr; 324 in v3.20 (PPB band), and 324 &rarr; 398 in v3.24.</p>
 </div>
 <div class="card">
 <h3><a href="zephyr.html">Zephyr echo_bot</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
-<p>Fixed MMIO: <b>282</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; Zephyr v4.4.2, nRF52840 DK, built from source</p>
-<p>Device-API resolver recovered the UARTE layer in v3.14 (127 &rarr; 196, UARTE 0 &rarr; 65); PPB band in v3.20 (196 &rarr; 282).</p>
+<p>Fixed MMIO: <b>330</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.26 &middot; Zephyr v4.4.2, nRF52840 DK, built from source</p>
+<p>Device-API resolver recovered the UARTE layer in v3.14 (127 &rarr; 196, UARTE 0 &rarr; 65); PPB band in v3.20 (196 &rarr; 282); NVIC IPR loop in v3.24 (282 &rarr; 330).</p>
 </div>
 </div>
 
@@ -69,56 +69,56 @@
 <h3><a href="ovmf-dxecore.html">DxeCore</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
 <p>Fixed MMIO: <b>0</b> &middot; Port: <b>11</b> &middot; MSR: <b>1</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; Trace 12</p>
+<p>Extractor v3.26 &middot; Trace 12</p>
 <p>Fixed 0 because BAR is runtime, provenance recovered.</p>
 </div>
 <div class="card">
 <h3><a href="ovmf-pcibus.html">PciBusDxe</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
 <p>Fixed MMIO: <b>0</b> &middot; Port: <b>2</b> &middot; MSR: <b>0</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; Trace 2 &middot; Protocol edges 50</p>
+<p>Extractor v3.26 &middot; Trace 2 &middot; Protocol edges 50</p>
 <p>Fixed 0 because BAR is runtime, provenance recovered.</p>
 </div>
 <div class="card">
 <h3><a href="ovmf-pcihostbridge.html">PciHostBridgeDxe</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
-<p>Fixed MMIO: <b>0</b> &middot; Port: <b>9</b> &middot; MSR: <b>1</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; Trace 10</p>
-<p>Previously FAIL: ports 0x510 / 0x514 / 0x518 are QEMU fw_cfg (selector, DMA address high, DMA address low/trigger) — four named ports allowlisted, and it now PASSES.</p>
+<p>Fixed MMIO: <b>0</b> &middot; Port: <b>10</b> &middot; MSR: <b>1</b> &middot; May: <b>0</b></p>
+<p>Extractor v3.26 &middot; Trace 11</p>
+<p>Previously FAIL: ports 0x510 / 0x511 / 0x514 / 0x518 are QEMU fw_cfg (selector, data, DMA address high, DMA address low/trigger) — four named ports allowlisted, and it now PASSES.</p>
 </div>
 <div class="card">
 <h3><a href="ovmf-qemuvideo.html">QemuVideoDxe (PE)</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
 <p>Fixed MMIO: <b>0</b> &middot; Port: <b>3</b> &middot; MSR: <b>0</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; Trace 3</p>
+<p>Extractor v3.26 &middot; Trace 3</p>
 <p>Fixed 0 because BAR is runtime, provenance recovered.</p>
 </div>
 <div class="card">
 <h3><a href="ovmf-qemuvideo-te.html">QemuVideoDxe (TE)</a></h3>
 <p><span class="badge pass">PASS</span> generic mode</p>
 <p>Fixed MMIO: <b>0</b> &middot; Port: <b>3</b> &middot; MSR: <b>0</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; Trace 3 &middot; TE loader parity with PE</p>
+<p>Extractor v3.26 &middot; Trace 3 &middot; TE loader parity with PE</p>
 <p>Fixed 0 because BAR is runtime, provenance recovered.</p>
 </div>
 <div class="card">
 <h3><a href="ovmf-sata.html">SataControllerDxe</a></h3>
 <p><span class="badge fail">FAIL</span> genuinely-empty trace</p>
 <p>Fixed MMIO: <b>0</b> &middot; Port: <b>0</b> &middot; MSR: <b>0</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; Trace 0</p>
+<p>Extractor v3.26 &middot; Trace 0</p>
 <p>No fixed findings recovered. Not a bug report — an empty result, stated plainly.</p>
 </div>
 <div class="card">
 <h3><a href="ovmf-virtio.html">VirtioBlkDxe</a></h3>
 <p><span class="badge fail">FAIL</span> genuinely-empty trace</p>
 <p>Fixed MMIO: <b>0</b> &middot; Port: <b>0</b> &middot; MSR: <b>0</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; Trace 0</p>
+<p>Extractor v3.26 &middot; Trace 0</p>
 <p>No fixed findings recovered. Not a bug report — an empty result, stated plainly.</p>
 </div>
 </div>
-<p>OVMF ports, PE+TE twin counted separately: DxeCore 11, PciBus 2, PciHostBridge 9, QemuVideo PE 3 + TE 3 (25 counting the twin once). Corpus total (6 stacks): 447 + 236 + 186 + 220 + 324 + 282 = <b>1,695</b>. Lean sweep: 6 FAILs, all pre-existing (Sata/Virtio empty traces + 4 intentional synthetic FAILs).</p>
+<p>OVMF ports, PE+TE twin counted separately: DxeCore 11, PciBus 2, PciHostBridge 10, QemuVideo PE 3 + TE 3 (26 counting the twin once). Corpus total (6 stacks): 483 + 268 + 186 + 220 + 398 + 330 = <b>1,885</b>. Lean sweep: 6 FAILs, all pre-existing — 3 empty-trace coverage FAILs (Sata, Virtio, acpi-mcfg) and 3 intentional synthetic violation demos.</p>
 
 <h2>P5 real-target hunt (Oct 30, 2026) — honest zero</h2>
-<p>11 new real targets were run fresh at v3.21/v3.22, hunting for a genuine confinement violation in shipped code. <b>Verdict: zero real violations found.</b> Every FAIL met is triaged below — none is a bug in the target. These 11 are reported separately and are NOT merged into the 1,695 corpus total above.</p>
+<p>11 new real targets were run fresh at v3.21/v3.22, hunting for a genuine confinement violation in shipped code. <b>Verdict: zero real violations found.</b> Every FAIL met is triaged below — none is a bug in the target. These 11 are reported separately and are NOT merged into the 1,885 corpus total above.</p>
 <table class="stats">
 <tr><th>Target</th><th>Fixed findings</th><th>Lean generic</th><th>Triage</th></tr>
 <tr><td>CpuDxe (OVMF DXE)</td><td>0 MMIO / 8 ports / 15 MSRs</td><td>PASS (v3.22)</td><td>Was FAIL at v3.21 on 4 MSR sites — allowlist gap, not a bug; closed in v3.22 with 4 named MSRs (see below)</td></tr>
@@ -133,16 +133,16 @@
 <tr><td>Zephyr hello_world_user (musca_b1)</td><td>213 must / 4 may</td><td>PASS, profiled</td><td>User thread coverage VACUOUS: user_function has 0 must/may accesses — stated, not hidden</td></tr>
 <tr><td>Zephyr prod_consumer (musca_b1)</td><td>211 must / 4 may</td><td>PASS both directions, profiled</td><td>Genuine, probe-proven: flipping owned regions to privileged-only flags exactly the right accesses (7 + 4 sites, probe controls only)</td></tr>
 </table>
-<p>Plus 124 further PEs inventoried from the same OVMF firmware volume (139 extracted, 6 byte-identical to the existing corpus, 9 run here) — inventoried for future runs, not run, not counted. CVE-shaped targets surveyed (2025-9408, 2026-10645, 2026-19184, 2020-10067) were all rejected as lens-invisible and not built.</p>
+<p>Plus the 124-target OVMF evaluation round (Oct 30&ndash;31, 2026): the same 124 PEs inventoried above (139 extracted, 6 byte-identical to the existing corpus, 9 run in P5) were all run — 51 PASS / 73 FAIL, every FAIL an empty-trace coverage limit (0 trace ops), 0 real bugs, 0 bounds sites. Counted separately, not merged into the corpus total. CVE-shaped targets surveyed (2025-9408, 2026-10645, 2026-19184, 2020-10067) were all rejected as lens-invisible and not built.</p>
 
-<h2>What the engine checks (v3.22, Lean generic mode)</h2>
+<h2>What the engine checks (v3.26, Lean generic mode)</h2>
 <ul>
 <li><b>In-window addresses</b> — every fixed access inside the architecture's MMIO window.</li>
 <li><b>Driver confinement</b> (bmp mode) — each driver family touches only its own peripherals.</li>
-<li><b>Port/MSR confinement</b> — every port/MSR entry against an architectural allowlist. v3.22 closed the CpuDxe gap with four named MSRs, each identified from Intel documentation: 0x17 IA32_PLATFORM_ID (read), 0x79 IA32_BIOS_UPDT_TRIG (microcode trigger), 0x830 IA32_X2APIC_ICR (AP bring-up), 0x982 IA32_TME_ACTIVATE (memory-encryption status). Named entries only, no blanket range; the allowlist stays index-granular, not direction-granular.</li>
+<li><b>Port/MSR confinement</b> — every port/MSR entry against an architectural allowlist. v3.22 closed the CpuDxe gap with four named MSRs, each identified from Intel documentation: 0x17 IA32_PLATFORM_ID (read), 0x79 IA32_BIOS_UPDT_TRIG (microcode trigger), 0x830 IA32_X2APIC_ICR (AP bring-up), 0x982 IA32_TME_ACTIVATE (memory-encryption status). Named entries only, no blanket range; the allowlist stays index-granular, not direction-granular. v3.23 closed two further allowlist gaps from the evaluation round with five named MSRs, each identified from Intel documentation: 0x3A IA32_FEATURE_CONTROL, 0x80F Spurious Interrupt Vector Register, 0x832 LVT Timer Register, 0x838 Initial Count Timer, 0x83E Divide Config Timer.</li>
 <li><b>Clock-enable-before-use</b> — every used STM32 peripheral's gate register touched.</li>
-<li><b>Bounds</b> — no computed-pointer copy/transfer with an unsound-only guard. Synthetic precision TP=17, FP=0, FN=0, TN=16 (33 cases).</li>
-<li><b>Boundary</b> — no must-proven access crossing a configured security boundary (violation, unknown-agent and unknown-region counts reported, never silent). Synthetic contract 16/16; Zephyr MPU trophy exactly 1 violation; SAU NS 5 / SEC 1.</li>
+<li><b>Bounds</b> — no computed-pointer copy/transfer with an unsound-only guard. Synthetic precision TP=17, FP=0, FN=0, TN=16 (33 cases). v3.25 closed the signed-masking gap: the first branch after a comparison, before the copy, must gate the copy — proven on the class-level control <code>fc_signed_mask</code>. v3.26 closed the caller-check masking gap: a recorded caller check must gate the call edge — proven on <code>cm_caller_mask</code> with the <code>cm_caller_gate</code> control (genuine gating still suppresses, so the fix is not over-broad). Caveats, stated plainly: 0 corpus-output changes on the current 46-target set for both fixes; only signed-masking is proven in both — the wide half is unproven (no report in corpus has ever exercised a wide-check guard; treat as untested, not fixed, on these ISAs).</li>
+<li><b>Boundary</b> — no must-proven access crossing a configured security boundary (violation, unknown-agent and unknown-region counts reported, never silent). Synthetic contract 16/16; Zephyr MPU trophy exactly 1 violation; SAU two-stage proof, both axes: the non-secure build FAILs with exactly 5 violations, the secure build FAILs with exactly 1.</li>
 </ul>
 
 <h2>Reproduce a known CVE</h2>
@@ -157,8 +157,9 @@
 <li>F4 USART2 invisible (Gap B, needs a redesign, not a patch); LPUART enable&rarr;disable&rarr;use not caught.</li>
 <li>Boundary V1.5 scope: static profiles + learned tables + thread attribution; config-write learning design-only; a boundary violation is a necessary condition for privilege escalation, NOT proof of an exploit.</li>
 <li>Non-live 21 (all-slots seeding) is DELIBERATELY NOT enabled — a finding must mean "does call", not "could call"; deferred until a labelled JSON shape exists.</li>
-<li>16-bit real mode needs a raw-binary import path plus a segmented adapter; still open.</li>
-<li>Real violations found in shipped firmware: 0. The FAILs that exist are synthetic demos and Sata/Virtio's genuinely-empty traces; the MPU/SAU boundary violations are on purpose-built proof targets.</li>
+<li>16-bit real mode now has a raw-binary import path plus a segmented adapter, proven on synthetic Real-Mode targets; far-target discovery, Protected Mode, and A20 policy remain open.</li>
+<li>RV64/MIPS64 calls and jump tables resolve on fixtures only; real targets are unproven (no toolchain here).</li>
+<li>Real violations found in shipped firmware: 0. The FAILs that exist are intentional synthetic demos and the genuinely-empty traces of Sata, Virtio and acpi-mcfg; the 124-target OVMF evaluation round's 73 FAILs are likewise empty-trace coverage FAILs, counted separately; the MPU/SAU boundary violations are on purpose-built proof targets.</li>
 </ul>
 
 <h2>Synthetic Confinement Demo</h2>
@@ -168,14 +169,14 @@
 <h3><a href="syndemo-driver.html">Shape 1: Driver confinement</a></h3>
 <p><span class="badge synth">SYNTHETIC</span> <span class="badge fail">FAIL by design</span></p>
 <p>Fixed MMIO: <b>4</b> &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; bmp mode</p>
+<p>Extractor v3.26 &middot; bmp mode</p>
 <p>An rcc-family function touches GPIOA, outside its allowed range.</p>
 </div>
 <div class="card">
 <h3><a href="syndemo-port.html">Shape 2: Port confinement</a></h3>
 <p><span class="badge synth">SYNTHETIC</span> <span class="badge fail">FAIL by design</span></p>
 <p>Fixed port: <b>1</b> (0x1234) &middot; May: <b>0</b></p>
-<p>Extractor v3.22 &middot; generic mode</p>
+<p>Extractor v3.26 &middot; generic mode</p>
 <p>Built firmware writes to port 0x1234, outside the architectural allowlist.</p>
 </div>
 </div>

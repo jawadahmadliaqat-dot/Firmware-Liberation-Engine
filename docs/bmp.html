@@ -12,25 +12,25 @@
 <h2>Black Magic Probe v2.0.0 <span class="badge pass">PASS</span></h2>
 <p>The canonical real firmware for this engine: the official v2.0.0 release binary for the STM32F1-based Black Magic Probe, analyzed end to end and checked against its public source.</p>
 <table class="stats">
-<tr><th>Fixed MMIO</th><td>447</td></tr>
+<tr><th>Fixed MMIO</th><td>483</td></tr>
 <tr><th>May accesses</th><td>7 sites</td></tr>
 <tr><th>Port / MSR</th><td>0 / 0</td></tr>
-<tr><th>Extractor version</th><td>v3.22</td></tr>
+<tr><th>Extractor version</th><td>v3.26</td></tr>
 <tr><th>Lean mode</th><td>bmp</td></tr>
-<tr><th>Classifier (STM32F1 profile)</th><td>427 known / 0 suspects; may 13 known / 0 suspects (v3.13 classifier run; totals re-verified at v3.22)</td></tr>
+<tr><th>Classifier (STM32F1 profile)</th><td>427 known / 0 suspects; may 13 known / 0 suspects (v3.13 classifier run; totals re-verified at v3.26)</td></tr>
 <tr><th>Unresolved indirect calls</th><td>19 (classified: libc/stdio, parameter callbacks, vector table)</td></tr>
 </table>
 <h3>Lean log (verdict lines)</h3>
-<pre>trace ops: 447
-trace ops by kind (mmio, port, msr): (447, 0, 0)
+<pre>trace ops: 483
+trace ops by kind (mmio, port, msr): (483, 0, 0)
 driver confinement (each family touches only its own peripherals): true
 may confinement (every possible address within its family): true
 VERDICT: PASS</pre>
 <h3>Ground truth</h3>
-<p>Source cross-check against the public BMP v2.0.0 source and libopencm3: at the v3.6 stage, field truth was 116/116 (100%). Later additions were spot-checked against source, including libopencm3 parameter helpers (for example DMA channel-5 registers via <code>dma_channel_reset</code>) and the ADC1_CR2 read in <code>adc_is_calibrating</code> added by callee clobber refinement in v3.12. No finding has been lost across versions; counts moved 235 &rarr; 346 &rarr; 422 &rarr; 423 &rarr; 427 as analyses improved. The v3.13 step adds 4 (TIM3_CR1 and TIM1_BDTR pairs, via direct-branch tail-call sites). The v3.20 step adds 20 (ARM private-peripheral band, 0xE0000000&ndash;0xE0100000: SysTick, SCB, NVIC accesses), total 447.</p>
+<p>Source cross-check against the public BMP v2.0.0 source and libopencm3: at the v3.6 stage, field truth was 116/116 (100%). Later additions were spot-checked against source, including libopencm3 parameter helpers (for example DMA channel-5 registers via <code>dma_channel_reset</code>) and the ADC1_CR2 read in <code>adc_is_calibrating</code> added by callee clobber refinement in v3.12. No finding has been lost across versions; counts moved 235 &rarr; 346 &rarr; 422 &rarr; 423 &rarr; 427 as analyses improved. The v3.13 step adds 4 (TIM3_CR1 and TIM1_BDTR pairs, via direct-branch tail-call sites). The v3.20 step adds 20 (ARM private-peripheral band, 0xE0000000&ndash;0xE0100000: SysTick, SCB, NVIC accesses), total 447; the v3.24 backlog takes the total 447 &rarr; 483.</p>
 <h3>Provenance</h3>
 <p>Binary: official Black Magic Probe v2.0.0 release ELF (1,230,888 bytes, MD5 fa07d791edffdaec79be3c92d5d8373a). ARM Cortex-M, not stripped, with debug info. Profiles: hand-written STM32F1 profile, reproduced by the CMSIS-SVD importer (53 blocks). Source: public BMP repository (v2.0.0) and libopencm3.</p>
-<div class="note"><b>Known limits.</b> Stripped builds of this binary must use generic mode only: bmp mode passes vacuously on stripped input (function names are lost) and proves nothing. Stripped build at v3.22: 327 MMIO, generic PASS. The engine reports what code can touch, not only what runs.</div>
+<div class="note"><b>Known limits.</b> Stripped builds of this binary must use generic mode only: bmp mode passes vacuously on stripped input (function names are lost) and proves nothing. Stripped build at v3.26: 335 MMIO, generic PASS. The engine reports what code can touch, not only what runs.</div>
 </main>
 <footer class="disclaimer"><div>This is a static proof tool. It does not execute firmware and does not claim to find all vulnerabilities. PASS does not mean firmware is secure.</div></footer>
 </body>

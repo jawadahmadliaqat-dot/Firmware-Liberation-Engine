@@ -245,6 +245,8 @@ decision.
     stated as such — same fallback rule as step 5.
 
 ## 7. The Lean window dependency (MIPS finding, applies to x86)
+
+> NOTE — HISTORICAL (v3.26 docs refresh): this section predates the x86 landing. It was written when x86 support was still planned; OVMF x86 drivers now pass Lean generic (see docs/index.html and docs/ovmf-*), so §7's prediction that "x86 Lean generic will fail the same way" is no longer current truth. Do not use this section to promise or deny a Lean PASS on any current x86 report — use the engine README and the docs pages instead. The section is kept for history, not deleted.
 Lean generic hardcodes `checkWindow 0x40000000 0x60000000`
 (`lean/Main.lean`, `printGeneric`; same window in
 `lean/Verifier/Common.lean:151`). That is the ARM Cortex-M /

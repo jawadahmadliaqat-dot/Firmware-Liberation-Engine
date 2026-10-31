@@ -13,22 +13,22 @@
 <p>UEFI PCI host-bridge driver from the OVMF corpus (EDK2 2025.11). This card previously showed FAIL, and the reason was stated, not hidden. It now PASSES: the three ports behind the old FAIL were identified as QEMU fw_cfg. Fixed 0 because BAR is runtime, provenance recovered.</p>
 <table class="stats">
 <tr><th>Fixed MMIO</th><td>0</td></tr>
-<tr><th>Port</th><td>9</td></tr>
+<tr><th>Port</th><td>10</td></tr>
 <tr><th>MSR</th><td>1</td></tr>
 <tr><th>May accesses</th><td>0</td></tr>
 <tr><th>Protocol-call edges</th><td>9</td></tr>
 <tr><th>Unresolved indirect calls</th><td>23</td></tr>
-<tr><th>Extractor version</th><td>v3.22</td></tr>
+<tr><th>Extractor version</th><td>v3.26</td></tr>
 <tr><th>Lean mode</th><td>generic</td></tr>
 </table>
 <h3>Lean log (verdict lines)</h3>
-<pre>trace ops: 10
-trace ops by kind (mmio, port, msr): (0, 9, 1)
+<pre>trace ops: 11
+trace ops by kind (mmio, port, msr): (0, 10, 1)
 may trace ops: 0
 port/MSR confinement (every port/MSR in the architectural allowlist): true
 VERDICT: PASS</pre>
 <h3>Resolved: the old FAIL was QEMU fw_cfg, not a violation</h3>
-<p>At v3.13 this driver FAILED confinement on exactly three ports: 0x510, 0x514, and 0x518. Port 0x510 is the QEMU fw_cfg selector, written by <code>FUN_0000185b</code> (OUT at 000018bf, reached by a tail jump from a site that loads the literal 0x510); 0x514 and 0x518 are written by the generic I/O helper <code>FUN_00001bac</code>. The values are literal immediates at real call sites, faithfully recovered from the binary — not inferred. Identification (fw_cfg precedent): 0x510 = fw_cfg SELECTOR (the data port is 0x511), 0x514 = fw_cfg DMA address HIGH, 0x518 = DMA address LOW/trigger — all legitimate QEMU guest/host communication. The allowlist grants the four named ports only (0x510/0x511/0x514/0x518), never a range, and the driver now PASSES. The 9th port (v3.19) comes from the 0x511 PIO-fallback IN path. The other port findings pass: port 0x0 (legacy DMA range) and CF8/CFC (PCI config range), and the MSR read is SEV_STATUS (0xC0010131, allowlisted). This resolution is about the engine's allowlist, not a claim about the driver — and the old FAIL is kept in this paragraph, not erased.</p>
+<p>At v3.13 this driver FAILED confinement on exactly three ports: 0x510, 0x514, and 0x518. Port 0x510 is the QEMU fw_cfg selector, written by <code>FUN_0000185b</code> (OUT at 000018bf, reached by a tail jump from a site that loads the literal 0x510); 0x514 and 0x518 are written by the generic I/O helper <code>FUN_00001bac</code>. The values are literal immediates at real call sites, faithfully recovered from the binary — not inferred. Identification (fw_cfg precedent): 0x510 = fw_cfg SELECTOR (the data port is 0x511), 0x514 = fw_cfg DMA address HIGH, 0x518 = DMA address LOW/trigger — all legitimate QEMU guest/host communication. The allowlist grants the four named ports only (0x510/0x511/0x514/0x518), never a range, and the driver now PASSES. The 9th port (v3.19) comes from the 0x511 PIO-fallback IN path. The 10th port (v3.24) comes from the second 0x511 site (FUN_000045f0, IN at 00004606). The other port findings pass: port 0x0 (legacy DMA range) and CF8/CFC (PCI config range), and the MSR read is SEV_STATUS (0xC0010131, allowlisted). This resolution is about the engine's allowlist, not a claim about the driver — and the old FAIL is kept in this paragraph, not erased.</p>
 <h3>Provenance</h3>
 <p>Source: Ubuntu package ovmf-generic 2025.11-3ubuntu7.3, EDK2 2025.11. PE image, 52 functions. No BAR-relative findings: BAR bases arrive at runtime as hardware inputs.</p>
 </main>

@@ -12,20 +12,20 @@
 <h2>Zephyr echo_bot <span class="badge pass">PASS</span></h2>
 <p>Interrupt-driven UART echo sample from Zephyr v4.4.2, for the nRF52840 DK, built from public source. Ground truth is derived from the board devicetree: UART0 is UARTE0 at 0x40002000, 115200 baud, TX P0.6 / RTS P0.5 / RX P0.8 / CTS P0.7; the system clock is RTC-based (no SysTick — correctly absent).</p>
 <table class="stats">
-<tr><th>Fixed MMIO</th><td>282</td></tr>
+<tr><th>Fixed MMIO</th><td>330</td></tr>
 <tr><th>May accesses</th><td>0 sites / 0 addresses</td></tr>
 <tr><th>Port / MSR</th><td>0 / 0</td></tr>
-<tr><th>Extractor version</th><td>v3.22</td></tr>
+<tr><th>Extractor version</th><td>v3.26</td></tr>
 <tr><th>Lean mode</th><td>generic</td></tr>
-<tr><th>Classifier (SVD profile)</th><td>127 known / 0 suspect (v3.13 classifier run; total now 282 at v3.22)</td></tr>
+<tr><th>Classifier (SVD profile)</th><td>127 known / 0 suspect (v3.13 classifier run; total now 330 at v3.26)</td></tr>
 </table>
 <h3>Lean log (verdict lines)</h3>
-<pre>trace ops: 282
+<pre>trace ops: 330
 may trace ops: 0
 VERDICT: PASS</pre>
 <h3>Ground truth</h3>
 <p>126/126 code-true at v3.12, 0 unexplained extras. At v3.13, +1: RTC1 CC[0] (compare_set STORE 0x40011540), total 127. Recovered at v3.13: SoC init errata 29, clock control 59, RTC system timer 32, SoC init 4, NVMC wait 1, GPPI channel-enable 1 (from the UARTE driver — the only recovered UART-layer touch at that version, and it is a PPI register).</p>
-<div class="note"><b>Recovered in v3.14 — and what is still open at v3.22.</b> The v3.13 structural miss is closed: the device-API resolver (v3.14) resolves the peripheral base through the read-only device config struct, recovering the UARTE layer (0 &rarr; 65) and taking the total 127 &rarr; 196 with zero losses. The v3.20 PPB band then adds the ARM private-peripheral accesses (196 &rarr; 282). Still open at v3.22, stated plainly: the Zephyr GPIO tail (10 accesses, needs a loop-precision redesign) and non-live 21, which is DELIBERATELY NOT enabled — a finding must mean "does call", not "could call" — until a labelled JSON shape exists. Generic PASS means only that what was found stayed in-window.</div>
+<div class="note"><b>Recovered in v3.14 — and what is still open at v3.26.</b> The v3.13 structural miss is closed: the device-API resolver (v3.14) resolves the peripheral base through the read-only device config struct, recovering the UARTE layer (0 &rarr; 65) and taking the total 127 &rarr; 196 with zero losses. The v3.20 PPB band then adds the ARM private-peripheral accesses (196 &rarr; 282). The v3.24 backlog recovers the NVIC IPR loop (z_arm_interrupt_init 0 &rarr; 48), total 282 &rarr; 330. Still open at v3.26, stated plainly: the Zephyr GPIO tail (10 accesses, needs a loop-precision redesign) and non-live 21, which is DELIBERATELY NOT enabled — a finding must mean "does call", not "could call" — until a labelled JSON shape exists. Generic PASS means only that what was found stayed in-window.</div>
 <h3>Provenance</h3>
 <p>Source: Zephyr tag v4.4.2 (HEAD dccb0959), sample <code>samples/drivers/uart/echo_bot</code>, board <code>nrf52840dk/nrf52840</code>. Modules: hal_nordic 44fd3d44, cmsis 512cc7e8, cmsis_6 30a859f4. SVD: nrfx <code>nrf52840/nrf52840.svd</code> (SHA-256 36811b78&hellip;), 84 peripherals via pure SVD import. Toolchain: arm-none-eabi-gcc 13.2.1 via the gnuarmemb variant, -Os default. Built ELF MD5: 96d7bae0635eee8d6b0e9bd5ee4881e6.</p>
 </main>
