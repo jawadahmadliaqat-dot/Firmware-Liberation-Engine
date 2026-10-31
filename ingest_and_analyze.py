@@ -2,13 +2,51 @@ import os
 import subprocess
 import json
 import sys
+import signal
 import datetime
 
 # System Parameters & Resource Limits
 # Overridable so anyone can run this on their own Linux box:
 #   FIRMWARE_WORKSPACE=/path/to/work GHIDRA_HEADLESS=/path/to/analyzeHeadless
+# Ghidra subprocess timeout (seconds): INGEST_TIMEOUT overrides the 300s
+# default WITHOUT changing the one-command usage (no new flag, no new
+# step). Large real-world targets need more than 300s (a 28MB kernel
+# runs for over an hour); set e.g. INGEST_TIMEOUT=7200 for those.
+# An invalid value warns and falls back to 300.
 GHIDRA_HEADLESS_PATH = os.environ.get("GHIDRA_HEADLESS", "/opt/ghidra/support/analyzeHeadless")
 LOCAL_WORKSPACE = os.environ.get("FIRMWARE_WORKSPACE", "/home/hatch/firmware_workspace")
+DEFAULT_GHIDRA_TIMEOUT = 300
+
+def _ingest_timeout():
+    """Timeout for the Ghidra subprocess, in seconds (default 300)."""
+    raw = os.environ.get("INGEST_TIMEOUT")
+    if raw is None or raw == "":
+        return DEFAULT_GHIDRA_TIMEOUT
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[!] WARNING: invalid INGEST_TIMEOUT={raw!r}; using default {DEFAULT_GHIDRA_TIMEOUT}s.")
+        return DEFAULT_GHIDRA_TIMEOUT
+    if value <= 0:
+        print(f"[!] WARNING: invalid INGEST_TIMEOUT={raw!r}; using default {DEFAULT_GHIDRA_TIMEOUT}s.")
+        return DEFAULT_GHIDRA_TIMEOUT
+    return value
+
+def _coerce_text(data):
+    """Coerce subprocess output to str for log writing.
+
+    HARDENING (v51 harness fix): on a timeout, CPython's
+    TimeoutExpired.stdout/stderr are BYTES even when the subprocess
+    ran with text=True (reproduced on Python 3.12.3) — writing them
+    to a text-mode file raises TypeError and crashes the timeout
+    handler itself, losing the partial log. Bytes decode as UTF-8
+    with replacement, so any log content (bytes or str) saves.
+    """
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return data
 GDRIVE_TARGET_DIR = "gdrive:Firmware_DataLake/raw_binaries"
 GDRIVE_OUTPUT_DIR = "gdrive:Firmware_DataLake/analysis_reports"
 
@@ -47,9 +85,9 @@ def save_headless_log(binary_name, stdout, stderr):
     log_path = f"{log_dir}/{safe}_{stamp}.log"
     with open(log_path, "w") as f:
         f.write("=== STDOUT ===\n")
-        f.write(stdout or "")
+        f.write(_coerce_text(stdout))
         f.write("\n=== STDERR ===\n")
-        f.write(stderr or "")
+        f.write(_coerce_text(stderr))
     print(f"[*] Full headless log saved to {log_path}")
     return log_path
 
@@ -70,6 +108,18 @@ def run_ghidra_analysis(binary_name, project_name="PoC_Project"):
     # Ghidra Headless Command Format
     # analyzeHeadless <project_location> <project_name> -import <file> -postScript <analysis_script>
     json_output_path = f"{LOCAL_WORKSPACE}/analysis_reports/{binary_name}_report.json"
+    # STALE-REPORT GUARD (v51): a previous run's report must never
+    # masquerade as this run's result — the canary already deleted
+    # first for exactly this reason, and the java-missing case
+    # proved the gap live (instant failure + old report present =
+    # false success). Remove it before launching, so that after
+    # the run, presence of the file proves THIS run produced it.
+    # A failed run therefore leaves no report — the honest outcome,
+    # not data loss: reports are regenerable artifacts, while the
+    # headless log (the diagnostic evidence) is always preserved.
+    if os.path.exists(json_output_path):
+        print(f"[*] Removing stale report {json_output_path} (a run's report must come from that run).")
+        os.remove(json_output_path)
     ghidra_cmd = [
         GHIDRA_HEADLESS_PATH,
         project_path,
@@ -80,19 +130,59 @@ def run_ghidra_analysis(binary_name, project_name="PoC_Project"):
         "-overwrite"
     ]
 
+    timeout = _ingest_timeout()
+    # Popen (not run) + its own session, so a timeout kill takes the
+    # WHOLE Ghidra tree, not just the launcher. GROUP-KILL (v51):
+    # subprocess.run's timeout kills only the direct child; the
+    # analyzeHeadless JVM survived a 1s test kill, finished the
+    # analysis anyway, wrote a report AFTER the wrapper had declared
+    # failure, and meanwhile held the project lock so the next
+    # canary run failed on initLock. A "killed" run that keeps
+    # running is not a kill — kill the process group instead.
+    proc = subprocess.Popen(ghidra_cmd, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
     try:
-        process = subprocess.run(ghidra_cmd, env=env, capture_output=True, text=True, timeout=300)
-        print("[+] Ghidra Analysis Finished.")
-        save_headless_log(binary_name, process.stdout, process.stderr)
-        print(process.stdout[-500:]) # Print tail of log (console stays short)
-        return True
-    except subprocess.TimeoutExpired as e:
-        print("[!] Ghidra timed out.")
-        save_headless_log(binary_name, e.stdout or "", e.stderr or "")
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"[!] FAILURE: Ghidra timed out after {timeout}s (killing the whole Ghidra process group; no report produced).")
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        stdout, stderr = proc.communicate()
+        try:
+            save_headless_log(binary_name, stdout, stderr)
+        except Exception as save_err:
+            print(f"[!] WARNING: could not save partial headless log: {save_err}")
+        print("[!] Pipeline FAILED: Ghidra analysis did not complete (timeout). See the partial headless log above.")
+        return False
+    except KeyboardInterrupt:
+        print("[!] FAILURE: interrupted (killing the whole Ghidra process group).")
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.communicate()
         return False
     except Exception as e:
         print(f"[!] Analysis failed: {e}")
         return False
+    print("[+] Ghidra Analysis Finished.")
+    save_headless_log(binary_name, stdout, stderr)
+    print(stdout[-500:]) # Print tail of log (console stays short)
+    # REPORT CHECK (v51 harness fix, same fail-loud principle):
+    # analyzeHeadless exits 0 even when the post-script fails to
+    # load (verified: script-load error + "Import succeeded" +
+    # exit 0, no report) and even when java is missing — so the
+    # exit code proves nothing. The report file is the only
+    # honest success signal, exactly as the canary already
+    # checks. A run with no (or empty) report is a FAILURE,
+    # never a success, whatever the subprocess exit code was.
+    if not os.path.exists(json_output_path) or os.path.getsize(json_output_path) == 0:
+        print(f"[!] FAILURE: Ghidra finished but no report was produced at {json_output_path} (see headless log above).")
+        return False
+    return True
 
 def sync_results_to_gdrive(report_file):
     """Syncs analysis reports back to Google Drive Data Lake"""
@@ -129,3 +219,12 @@ if __name__ == "__main__":
             if os.path.exists(json_report) and not no_upload:
                 sync_results_to_gdrive(json_report)
             print("[✓] Pipeline step executed successfully.")
+        else:
+            # FAIL LOUD (v51 harness fix): a killed/failed run must
+            # never exit 0 as if it succeeded — the old code fell
+            # through silently, which is how a timed-out kernel run
+            # could look like a pass to any caller checking only the
+            # exit code. The canary script is unaffected: it checks
+            # the report file itself, not this exit code.
+            print("[!] Pipeline FAILED: Ghidra analysis did not complete successfully. No valid report was produced.")
+            sys.exit(1)
