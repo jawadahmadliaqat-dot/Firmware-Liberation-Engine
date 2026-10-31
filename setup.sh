@@ -22,7 +22,10 @@ fi
 # analyzeHeadless hardcodes MAXMEM; the env var alone does NOT override it.
 # 512M keeps small VMs alive (no swap). Bigger machines can raise this.
 sudo sed -i 's/^MAXMEM=2G/MAXMEM=512M/' /opt/ghidra/support/analyzeHeadless || true
-grep -n "^MAXMEM" /opt/ghidra/support/analyzeHeadless
+grep -q '^MAXMEM=512M' /opt/ghidra/support/analyzeHeadless || {
+  echo "SETUP FAILED: analyzeHeadless MAXMEM is not 512M after patching." >&2
+  exit 1
+}
 
 # Hardening (Oct 29, 2026): a launcher-exists check CANNOT catch a
 # partial tree — a fresh install once ran analyzeHeadless fine while
@@ -35,6 +38,12 @@ grep -n "^MAXMEM" /opt/ghidra/support/analyzeHeadless
 # proves nothing about tree completeness.)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export FIRMWARE_WORKSPACE="${FIRMWARE_WORKSPACE:-$SCRIPT_DIR}"
+# TE loader lives inside the Ghidra tree and verify_ghidra_tree.sh requires
+# it: build it BEFORE verifying, or verification always fails on a fresh
+# install (setup.sh previously never installed it; only reinstall did).
+if [ -f "$SCRIPT_DIR/loaders/te/build.sh" ]; then
+  GHIDRA_HOME=/opt/ghidra bash "$SCRIPT_DIR/loaders/te/build.sh" || exit 1
+fi
 if ! "$SCRIPT_DIR/verify_ghidra_tree.sh" /opt/ghidra; then
   echo "SETUP FAILED: Ghidra tree verification failed — this install is incomplete and its analysis cannot be trusted." >&2
   echo "  Delete /opt/ghidra and re-run setup.sh, or run reinstall_ghidra.sh, then re-run setup.sh." >&2
