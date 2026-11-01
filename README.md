@@ -59,17 +59,21 @@ A binary passed as a path is used directly (no Drive needed); a bare name syncs 
 
 ## Results (extractor v3.26, 36-target regression, 0 mismatches)
 
+Scope: reference-VM verification — 36-target Lean verdicts 31 PASS / 5 FAIL, matching the item7 baseline (workspace evidence: v46-callermask/regression/lean_regression_v46_postfix.txt, Oct 31, 2026; v45-findingc/regression/lean_regression_v45_postfix.txt, Oct 31, 2026); this verification machine (WSL2 Ubuntu, Nov 1, 2026) — 9 targets re-run, 0 mismatches.
+
 | Target | Fixed findings | May | Lean verdict |
 |---|---|---|---|
-| Black Magic Probe v2.0.0 (ARM) | 483 MMIO | 7 sites | bmp PASS, generic PASS |
-| Black Magic Probe, stripped | 335 MMIO | 5 sites | generic PASS only (never bmp mode on stripped input) |
-| STM32F4 UART (-O0 / -O2) | 186 / 187 MMIO | 0 | generic PASS |
+| Black Magic Probe v2.0.0 (ARM) | 483 MMIO | 7 sites † | bmp PASS, generic PASS |
+| Black Magic Probe, stripped | 335 MMIO (binary not in repo; not re-verified on this machine) | 5 sites | generic PASS only (never bmp mode on stripped input) |
+| STM32F4 UART (-O0 / -O2) | 186 / 187 MMIO (-O2 binary not in repo; not re-verified on this machine) | 0 | generic PASS |
 | nRF52 UART (-O3) | 220 MMIO | 0 | generic PASS |
 | RP2040 hello_uart | 268 MMIO | 0 | generic PASS |
 | TinyUSB cdc_msc (RP2040) | 398 MMIO | 0 | generic PASS |
 | Zephyr echo_bot (nRF52840) | 330 MMIO | 0 | generic PASS |
 | OVMF UEFI drivers (7 images) | 0 fixed MMIO · 29 recovered ports | 0 | DxeCore / PciBus / PciHostBridge / QemuVideo PASS (recovered trace only; protocol/BAR-mediated reach unmeasured); Sata / Virtio FAIL (empty trace — coverage FAIL, not a violation) |
 | **Corpus total (6 stacks)** | **1,885** | | |
+
+† sites = may entries; Lean expands to 13 addresses.
 
 OVMF ports, PE+TE twin counted separately: DxeCore 11, PciBus 2, PciHostBridge 10,
 QemuVideo PE 3 + TE 3 (26 counting the twin once). Lean sweep: 6 FAILs, all
