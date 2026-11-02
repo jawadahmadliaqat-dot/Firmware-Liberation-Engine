@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.26-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.27-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -57,7 +57,7 @@ A binary passed as a path is used directly (no Drive needed); a bare name syncs 
 - **Boundary** — no must-proven access crossing a configured security boundary
   (violation, unknown-agent and unknown-region counts reported, never silent).
 
-## Results (extractor v3.26, 36-target regression, 0 mismatches)
+## Results (extractor v3.27, 36-target regression, 0 mismatches)
 
 Scope: reference-VM verification — 36-target Lean verdicts 31 PASS / 5 FAIL, matching the item7 baseline (workspace evidence: v46-callermask/regression/lean_regression_v46_postfix.txt, Oct 31, 2026; v45-findingc/regression/lean_regression_v45_postfix.txt, Oct 31, 2026); this verification machine (WSL2 Ubuntu, Nov 1, 2026) — 9 targets re-run, 0 mismatches.
 
@@ -115,6 +115,7 @@ syndemo-clock-violation, x86-syndemo-port); none is a violation in shipped firmw
 | v3.24 | Phase 3 backlog: stripped 241 → 311, PciHostBridge 10 ports, spinlock 32 exact, 16-bit raw import + segmented adapter, RV64/MIPS64 calls/jump tables on fixtures; USART2 Gap B design-only. |
 | v3.25 | Finding C signed-masking fix (below); class-level negative control fc_signed_mask; 0 corpus-output changes. |
 | v3.26 | Caller-check masking fix (below); two class-level controls cm_caller_mask + cm_caller_gate; 0 corpus-output changes. |
+| v3.27 | Switch-successor observability (below); per-function switch_successor_count + top-level switch_successor_total now emitted; 0 existing-field changes on the 46-target set. |
 | v3.1–v3.13 | Fixpoint tracker, MAY analysis, jump tables, call graph, points-to, tail calls, per-site transfer, clobber refinement, stack slots. |
 
 **v3.21 (V1.5) in short:** a table entry becomes a boundary region only when its
@@ -198,6 +199,22 @@ wide-masking caller-check fixture was built. This is the second
 independent class-level control in the repo (first: intra-function
 guard-existence-without-dominance, `fc_signed_mask`; second:
 caller-callee trust-boundary suppression, `cm_caller_mask`).
+
+**v3.27 (Switch-successor observability) in short:** reports now emit
+per-function `switch_successor_count` and top-level
+`switch_successor_total`, taken from the jump-table recovery map
+(`branchTargets`) before it is merged with indirect successors, so a
+pointer-table indirect call is never counted as a switch successor and
+no function is split. The RV64 matcher already worked — the gap was
+reporting, not matching: on OpenSBI (RV64, 635 functions, mmio 2) the
+total is 56 across exactly 8 switch functions, including
+FUN_80003b32 @ 0x80003b7c = 6 (per-function counts: 6, 7, 7, 7, 9, 9,
+7, 4 = 56). Six-stack switch totals, previously invisible: BMP 177,
+BMP stripped 173, F4 -O0 0, F4 -O2 4, nRF52 9, RP2040 0, cdc 0,
+Zephyr 45. Caveat, stated plainly: this step adds visibility only;
+it changes no matcher, no MMIO/may/indirect count, and no Lean verdict
+on any of the 46 regression targets. The MIPS64 kernel has not been
+re-run with this field yet, so no kernel switch figure is claimed here.
 
 **OVMF evaluation round (v3.23 Lean, counted):** 124 inventoried OVMF targets run — 51 PASS / 73 FAIL, all 73 FAILs empty-trace coverage (0 trace ops) with 0 real bugs and 0 bounds sites. Shell + TlsDxe needed a one-off 1G heap attempt (512M cap restored after); the 512M ceiling is no longer an open gap for this corpus.
 

@@ -9908,6 +9908,13 @@ public class ExtractIR extends GhidraScript {
         Function f;
         OpsResult or;
         Map<Integer, List<Integer>> branchTargets;
+        /** v58 observability ONLY: successor count from
+            recoverJumpTableTargets alone, captured BEFORE the
+            indirect-successor merge below. Summing the merged
+            branchTargets map would double-count indirect
+            successors and is WRONG. No matcher / CFG / MMIO
+            behaviour changes with this field. */
+        int switchSuccessorCount;
         IndirectResult ind;
         TailCallResult tc;
         /** Canonical entry key: the function's raw entry offset. */
@@ -15534,7 +15541,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.26\",");
+        w.println("  \"extractor_version\": \"v3.27\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -15563,6 +15570,8 @@ public class ExtractIR extends GhidraScript {
         int totalMsr = 0;
         int totalIndirect = 0;
         int totalIndSucc = 0;
+        // v58 observability ONLY: jump-table successors only.
+        int totalSwitchSucc = 0;
         int totalMayCallSites = 0;
         int totalMayCallTargets = 0;
         int totalUnresolved = 0;
@@ -16583,6 +16592,13 @@ public class ExtractIR extends GhidraScript {
                 rec.ind = new IndirectResult(new ArrayList<String>(), 0,
                     new HashMap<Integer, List<Integer>>(),
                     new HashSet<Integer>());
+            }
+            // v58 observability ONLY: capture the jump-table
+            // successor count BEFORE the merge below, so the
+            // emitted count is jump-table successors only.
+            rec.switchSuccessorCount = 0;
+            for (List<Integer> s : rec.branchTargets.values()) {
+                rec.switchSuccessorCount += s.size();
             }
             for (Map.Entry<Integer, List<Integer>> e :
                 rec.ind.successors.entrySet()) {
@@ -19052,6 +19068,7 @@ public class ExtractIR extends GhidraScript {
             w.println("      \"indirect_call_count\": " + ind.sites.size() + ",");
             w.println("      \"indirect_call_edges\": " + ind.edges + ",");
             w.println("      \"indirect_successor_count\": " + indSucc + ",");
+            w.println("      \"switch_successor_count\": " + rec.switchSuccessorCount + ",");
             w.println("      \"may_call_edges\": [");
             for (int i = 0; i < pt.maySites.size(); i++) {
                 if (i > 0) w.println(",");
@@ -19094,6 +19111,7 @@ public class ExtractIR extends GhidraScript {
             w.println("      \"bounds_flagged_count\": " + copyFlagged);
             totalIndirect += ind.edges;
             totalIndSucc += indSucc;
+            totalSwitchSucc += rec.switchSuccessorCount;
             totalMayCallSites += pt.maySites.size();
             totalMayCallTargets += pt.mayTargets;
             totalUnresolved += pt.unresolved;
@@ -19219,6 +19237,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"msr_access_total\": " + totalMsr + ",");
         w.println("  \"indirect_call_edges_total\": " + totalIndirect + ",");
         w.println("  \"indirect_successor_total\": " + totalIndSucc + ",");
+        w.println("  \"switch_successor_total\": " + totalSwitchSucc + ",");
         w.println("  \"may_call_site_total\": " + totalMayCallSites + ",");
         w.println("  \"may_call_target_total\": " + totalMayCallTargets + ",");
         w.println("  \"unresolved_indirect_total\": " + totalUnresolved + ",");
