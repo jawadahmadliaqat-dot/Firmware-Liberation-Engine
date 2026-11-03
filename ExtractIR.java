@@ -9915,6 +9915,19 @@ public class ExtractIR extends GhidraScript {
             successors and is WRONG. No matcher / CFG / MMIO
             behaviour changes with this field. */
         int switchSuccessorCount;
+        /** v61 observability ONLY: switch site list from
+            recoverJumpTableTargets alone, captured BEFORE the
+            indirect-successor merge below, in the same place as
+            switchSuccessorCount. Each entry is one JSON object
+            string {"branch": "<BRANCHIND addr>", "targets":
+            ["<successor addr>", ...]}, with addresses taken from
+            the successor ops' instrAddr at capture time (the
+            branchTargets map itself holds op indices, not
+            addresses). Capturing at emission time from the merged
+            map would pollute the list with indirect successors.
+            No matcher / CFG / MMIO behaviour changes with this
+            field. */
+        List<String> switchSites;
         IndirectResult ind;
         TailCallResult tc;
         /** Canonical entry key: the function's raw entry offset. */
@@ -15541,7 +15554,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.27\",");
+        w.println("  \"extractor_version\": \"v3.28\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -16599,6 +16612,44 @@ public class ExtractIR extends GhidraScript {
             rec.switchSuccessorCount = 0;
             for (List<Integer> s : rec.branchTargets.values()) {
                 rec.switchSuccessorCount += s.size();
+            }
+            // v61 observability ONLY: capture the switch site list
+            // HERE, before the merge below, from the pre-merge map
+            // only. Branch sites are emitted in branch-op-index
+            // order (deterministic); targets keep matcher order.
+            // Op indices are converted to instrAddr strings now,
+            // because the map itself holds indices, not addresses.
+            rec.switchSites = new ArrayList<String>();
+            {
+                List<Integer> siteKeys =
+                    new ArrayList<Integer>(rec.branchTargets.keySet());
+                java.util.Collections.sort(siteKeys);
+                for (Integer siteIdx : siteKeys) {
+                    if (siteIdx == null || siteIdx < 0 ||
+                        siteIdx >= pops.size()) continue;
+                    String branchAddr =
+                        pops.get(siteIdx).instrAddr.toString();
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("{\"branch\": \"");
+                    sb.append(branchAddr);
+                    sb.append("\", \"targets\": [");
+                    List<Integer> tgts =
+                        rec.branchTargets.get(siteIdx);
+                    boolean firstT = true;
+                    if (tgts != null) {
+                        for (Integer tj : tgts) {
+                            if (tj == null || tj < 0 ||
+                                tj >= pops.size()) continue;
+                            if (!firstT) sb.append(", ");
+                            firstT = false;
+                            sb.append("\"");
+                            sb.append(pops.get(tj).instrAddr.toString());
+                            sb.append("\"");
+                        }
+                    }
+                    sb.append("]}");
+                    rec.switchSites.add(sb.toString());
+                }
             }
             for (Map.Entry<Integer, List<Integer>> e :
                 rec.ind.successors.entrySet()) {
@@ -19069,6 +19120,15 @@ public class ExtractIR extends GhidraScript {
             w.println("      \"indirect_call_edges\": " + ind.edges + ",");
             w.println("      \"indirect_successor_count\": " + indSucc + ",");
             w.println("      \"switch_successor_count\": " + rec.switchSuccessorCount + ",");
+            w.println("      \"switch_sites\": [");
+            if (rec.switchSites != null) {
+                for (int i = 0; i < rec.switchSites.size(); i++) {
+                    if (i > 0) w.println(",");
+                    w.print("        " + rec.switchSites.get(i));
+                }
+            }
+            w.println();
+            w.println("      ],");
             w.println("      \"may_call_edges\": [");
             for (int i = 0; i < pt.maySites.size(); i++) {
                 if (i > 0) w.println(",");
