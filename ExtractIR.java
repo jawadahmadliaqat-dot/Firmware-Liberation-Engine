@@ -9652,6 +9652,15 @@ public class ExtractIR extends GhidraScript {
         w.add(new long[] {0x18000000L, 0x1C000000L}); // Atheros/Broadcom
         w.add(new long[] {0x1F800000L, 0x1FC00000L}); // PIC32 physical
         w.add(new long[] {0xBF800000L, 0xBFC00000L}); // PIC32 KSEG1
+        // v62 Octeon XKPHYS IO window (cvmx-address.h): an Octeon IO
+        // virtual address is (XKPHYS=2 << 62) | phys, and phys bit 48
+        // is is_io, did is bits 40..47, offset is bits 35..0, so the
+        // window is [0x8001000000000000, 0x8002000000000000). DRAM
+        // through XKPHYS has is_io=0, so its virtual address is
+        // 0x8000000000000000 + phys WITHOUT bit 48 set, and is NOT
+        // in this window. This is a band-only addition: no matcher,
+        // CFG, pointer, or Lean change.
+        w.add(new long[] {0x8001000000000000L, 0x8002000000000000L}); // Octeon XKPHYS IO
         return w;
     }
 
@@ -15554,7 +15563,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.28\",");
+        w.println("  \"extractor_version\": \"v3.29\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
