@@ -407,6 +407,235 @@ public class ExtractIR extends GhidraScript {
     private Map<Long, Prov> structProvSummaries =
         new HashMap<Long, Prov>();
 
+    /** v64 Option B: one ioremap call site in the function currently
+        being emitted. phys == null means the ioremap phys argument
+        was NOT an exact constant at the call site (unknown base).
+        unmapped == true means the function contains an iounmap call
+        whose base argument is the OBJ symbol of this site (see
+        buildIomapSites); such sites are suppressed, not recorded,
+        because a post-unmap address is no longer mapped MMIO.
+        LIMITATIONS (v1, documented, not hidden): provenance is
+        INTRA-procedural only — a base passed as an argument to
+        another function is not tracked there, because OBJ symbols
+        do not cross function boundaries except via struct summaries.
+        Cross-function bases (e.g. stored in a device struct and
+        used in probe/remove) are therefore missed in v1. A function
+        that stores through a base BOTH before and after unmap loses
+        the before-store too in v1 (function-level kill, not a
+        CFG-precise kill) — conservative under-report, never an
+        unsound post-unmap claim. */
+    private static class IomapSite {
+        long callAddr;
+        Long phys;
+        String callee;
+        boolean unmapped;
+        IomapSite(long callAddr, Long phys, String callee) {
+            this.callAddr = callAddr;
+            this.phys = phys;
+            this.callee = callee;
+            this.unmapped = false;
+        }
+    }
+
+    /** v64: the ioremap sites of the function currently being
+        emitted, keyed by call-site offset (the same offset the
+        CALL branch uses for the return OBJ symbol). Null outside
+        the main emission loop; recordMustFindings skips IOMAP
+        handling when this is null, so replay/boundary helpers
+        that run outside emission cannot inherit a stale map. */
+    private Map<Long, IomapSite> curIomapSites = null;
+
+    /** v64: phys-argument index for a known ioremap-family callee,
+        or -1 when the callee takes no direct phys argument (its
+        base is a resource/bar/index, so the site is unknown-base
+        by construction). -2 means "not an ioremap-family callee". */
+    private int iomapPhysArgIndex(String name) {
+        if (name == null) return -2;
+        if (name.equals("ioremap") || name.equals("ioremap_nocache") ||
+            name.equals("ioremap_wc")) return 0;
+        if (name.equals("devm_ioremap")) return 1;
+        if (name.equals("devm_ioremap_resource") ||
+            name.equals("pci_iomap") || name.equals("of_iomap") ||
+            name.equals("of_io_request_and_map")) return -1;
+        return -2;
+    }
+
+    /** v64: base-argument index for a known iounmap-family callee,
+        or -1 when not an iounmap-family callee. Signatures:
+        iounmap(addr) arg0; devm_iounmap(dev, addr) arg1;
+        pci_iounmap(dev, addr) arg1. */
+    private int iounmapBaseArgIndex(String name) {
+        if (name == null) return -1;
+        if (name.equals("iounmap")) return 0;
+        if (name.equals("devm_iounmap") ||
+            name.equals("pci_iounmap")) return 1;
+        return -1;
+    }
+
+    /** v64: build the ioremap site map for one function from its
+        FINAL fixpoint in-states. A site is created for every direct
+        CALL to an ioremap-family callee (by name, via funcByEntry,
+        dual-keyed like retSummaries). Phys is read from the call
+        site's in-state argument register; a non-exact phys (symbol,
+        unknown, or no argument-register convention) yields an
+        unknown-base site, never a guessed address. A second pass
+        marks sites unmapped when an iounmap call in the same
+        function takes that site's OBJ symbol as its base. External
+        callees (no body) are included: their name is still known,
+        and their return is an OBJ symbol like any call return. */
+    private Map<Long, IomapSite> buildIomapSites(List<OpRec> ops,
+        Map<String, Bits>[] inStates,
+        Map<Long, FuncRec> funcByEntry) {
+        Map<Long, IomapSite> out = new HashMap<Long, IomapSite>();
+        if (ops == null || inStates == null || funcByEntry == null)
+            return out;
+        for (int i = 0; i < ops.size(); i++) {
+            OpRec op = ops.get(i);
+            if (!op.mnem.equals("CALL") || op.ins.length < 1) continue;
+            Varnode t = op.ins[0];
+            if (t == null || t.getAddress() == null ||
+                !"ram".equals(t.getAddress().getAddressSpace()
+                    .getName())) continue;
+            FuncRec callee = funcByEntry.get(t.getOffset());
+            if (callee == null) callee = funcByEntry.get(
+                isa.stripInstructionTag(t.getOffset()));
+            if (callee == null || callee.f == null) continue;
+            String nm;
+            try { nm = callee.f.getName(); } catch (Exception e) {
+                continue;
+            }
+            int argIdx = iomapPhysArgIndex(nm);
+            if (argIdx == -2) continue;
+            Long phys = null;
+            if (argIdx >= 0 && i < inStates.length &&
+                inStates[i] != null) {
+                long[] argRegs = null;
+                try {
+                    argRegs = isa.argumentRegisterOffsets(
+                        callConvMap.get(callee.entryKey));
+                } catch (Exception e) {
+                    argRegs = null;
+                }
+                if (argRegs != null && argIdx < argRegs.length) {
+                    Varnode vn = regVarnode(argRegs[argIdx],
+                        isa.pointerSize());
+                    if (vn != null) {
+                        try {
+                            phys = resolveAddressExact(vn,
+                                inStates[i]);
+                        } catch (Exception e) {
+                            phys = null;
+                        }
+                    }
+                }
+            }
+            out.put(op.instrAddr.getOffset(),
+                new IomapSite(op.instrAddr.getOffset(), phys, nm));
+        }
+        for (int i = 0; i < ops.size(); i++) {
+            OpRec op = ops.get(i);
+            if (!op.mnem.equals("CALL") || op.ins.length < 1) continue;
+            Varnode t = op.ins[0];
+            if (t == null || t.getAddress() == null ||
+                !"ram".equals(t.getAddress().getAddressSpace()
+                    .getName())) continue;
+            FuncRec callee = funcByEntry.get(t.getOffset());
+            if (callee == null) callee = funcByEntry.get(
+                isa.stripInstructionTag(t.getOffset()));
+            if (callee == null || callee.f == null) continue;
+            String nm;
+            try { nm = callee.f.getName(); } catch (Exception e) {
+                continue;
+            }
+            int argIdx = iounmapBaseArgIndex(nm);
+            if (argIdx < 0 || i >= inStates.length ||
+                inStates[i] == null) continue;
+            long[] argRegs = null;
+            try {
+                argRegs = isa.argumentRegisterOffsets(
+                    callConvMap.get(callee.entryKey));
+            } catch (Exception e) {
+                argRegs = null;
+            }
+            if (argRegs == null || argIdx >= argRegs.length) continue;
+            Varnode vn = regVarnode(argRegs[argIdx],
+                isa.pointerSize());
+            if (vn == null) continue;
+            Bits base;
+            try {
+                base = resolveBits(vn, inStates[i]);
+            } catch (Exception e) {
+                continue;
+            }
+            if (base == null || base.sym == null) continue;
+            long[] obj = Bits.parseObjSym(base.sym);
+            if (obj == null) continue;
+            IomapSite site = out.get(obj[0]);
+            if (site != null) site.unmapped = true;
+        }
+        return out;
+    }
+
+    /** v64: format one IOMAP entry for the main emission loop and
+        for recordMustFindings. Returns null when the address Bits
+        is not an OBJ symbol of a live (not unmapped) ioremap site.
+        Known sites return a mmio-format entry (provenance "iomap");
+        unknown sites return an iomap-format entry (address null).
+        The caller appends the returned string to the right list
+        and sets mustRecorded; this helper never appends itself,
+        so replay dedup stays with the caller. */
+    private String iomapEntryFor(OpRec op, Map<String, Bits> bvals,
+        Bits valBits, int sz, boolean[] isKnown) {
+        isKnown[0] = false;
+        if (curIomapSites == null || bvals == null ||
+            op.ins.length < 2) return null;
+        Bits addrBits;
+        try {
+            addrBits = resolveBits(op.ins[1], bvals);
+        } catch (Exception e) {
+            return null;
+        }
+        if (addrBits == null || addrBits.sym == null) return null;
+        long[] obj = Bits.parseObjSym(addrBits.sym);
+        if (obj == null) return null;
+        IomapSite site = curIomapSites.get(obj[0]);
+        if (site == null || site.unmapped) return null;
+        long delta = obj[1];
+        if (delta < 0) return null;
+        Long exact = valBits.exactValue(
+            sizeMask(sz == 0 ? 4 : sz));
+        String valStr = (exact == null ? "null" :
+            Long.toUnsignedString(exact));
+        if (site.phys != null) {
+            long addr = site.phys.longValue() + delta;
+            if (addr < 0) return null;
+            isKnown[0] = true;
+            return "{\"instr\": \"" + op.instrAddr +
+                "\", \"op\": \"" + op.mnem +
+                "\", \"address\": \"0x" + Long.toHexString(addr) +
+                "\", \"size\": " + sz +
+                ", \"value\": " + valStr +
+                ", \"value_known_ones\": " +
+                Long.toUnsignedString(valBits.ones) +
+                ", \"value_known_zeroes\": " +
+                Long.toUnsignedString(valBits.zeroes) +
+                ", \"provenance\": \"iomap\"}";
+        }
+        return "{\"instr\": \"" + op.instrAddr +
+            "\", \"op\": \"" + op.mnem +
+            "\", \"base_call\": \"0x" +
+            Long.toHexString(site.callAddr) +
+            "\", \"callee\": \"" + site.callee +
+            "\", \"offset\": " + delta +
+            ", \"address\": null" +
+            ", \"size\": " + sz +
+            ", \"value\": " + valStr +
+            ", \"value_known_ones\": " +
+            Long.toUnsignedString(valBits.ones) +
+            ", \"value_known_zeroes\": " +
+            Long.toUnsignedString(valBits.zeroes) + "}";
+    }
+
     /** Caller-saved set for a CALL/CALLIND op: for direct CALLs
         to a known function, the per-callee Ghidra convention
         (signature-driven, x86); otherwise the conservative union
@@ -4176,9 +4405,11 @@ public class ExtractIR extends GhidraScript {
                 List<String> tPi = new ArrayList<String>();
                 List<String> tSi = new ArrayList<String>();
                 List<String> tBi = new ArrayList<String>();
+                List<String> tI = new ArrayList<String>();
+                List<String> tIi = new ArrayList<String>();
                 recordMustFindings(ops.get(ri), rb, mem,
                     tM, tP, tS, tB, tMi, tPi, tSi, tBi,
-                    null, null, null);
+                    null, null, null, tI, tIi);
                 repMmio.addAll(tMi);
                 repPort.addAll(tPi);
                 repMsr.addAll(tSi);
@@ -4201,9 +4432,11 @@ public class ExtractIR extends GhidraScript {
                         List<String> tPi = new ArrayList<String>();
                         List<String> tSi = new ArrayList<String>();
                         List<String> tBi = new ArrayList<String>();
+                        List<String> tI = new ArrayList<String>();
+                        List<String> tIi = new ArrayList<String>();
                         recordMustFindings(ops.get(ci), cb, mem,
                             tM, tP, tS, tB, tMi, tPi, tSi, tBi,
-                            null, null, null);
+                            null, null, null, tI, tIi);
                         repMmio.addAll(tMi);
                         repPort.addAll(tPi);
                         repMsr.addAll(tSi);
@@ -4509,10 +4742,12 @@ public class ExtractIR extends GhidraScript {
         List<String> tBi = new ArrayList<String>();
         List<BoundaryAccess> tBnd = new ArrayList<BoundaryAccess>();
         List<BoundaryAccess> tBndExt = new ArrayList<BoundaryAccess>();
+        List<String> tI = new ArrayList<String>();
+        List<String> tIi = new ArrayList<String>();
         for (int idx : regionOrder) {
             recordMustFindings(ops.get(idx), unitIn.get(idx), mem,
                 tM, tP, tS, tB, tMi, tPi, tSi, tBi,
-                tBnd, tBndExt, bndProfile);
+                tBnd, tBndExt, bndProfile, tI, tIi);
         }
         if (bndProfile != null) {
             bndAccesses.addAll(tBnd);
@@ -10457,7 +10692,8 @@ public class ExtractIR extends GhidraScript {
         List<String> mmioIds, List<String> portIds,
         List<String> msrIds, List<String> barIds,
         List<BoundaryAccess> bnd, List<BoundaryAccess> bndExt,
-        BoundaryProfile bndProfile) {
+        BoundaryProfile bndProfile,
+        List<String> iomap, List<String> iomapIds) {
         boolean mustRecorded = false;
         if (bvals == null) return false;
         // ---- MMIO recording (LOAD/STORE) ----
@@ -10516,6 +10752,49 @@ public class ExtractIR extends GhidraScript {
                         bndExt.add(new BoundaryAccess(
                             op.instrAddr.toString(), op.mnem,
                             addr.longValue(), extExact));
+                    }
+                } else if (addr == null && !mustRecorded &&
+                    iomap != null && iomapIds != null) {
+                    // v64 Option B, replay form: same rule as
+                    // the emission loop (see iomapEntryFor).
+                    int sz = (op.mnem.equals("STORE") &&
+                        op.ins.length >= 3)
+                        ? op.ins[2].getSize()
+                        : (op.out != null ? op.out.getSize() : 0);
+                    boolean[] isKnown = new boolean[1];
+                    String ie = iomapEntryFor(op, bvals,
+                        valBits, sz, isKnown);
+                    if (ie != null) {
+                        if (isKnown[0]) {
+                            mmio.add(ie);
+                            int ai = ie.indexOf("\"address\": \"0x");
+                            String aidHex = "";
+                            if (ai >= 0) {
+                                int hs = ai + 14;
+                                int he = ie.indexOf("\"", hs);
+                                if (he > hs) aidHex =
+                                    ie.substring(hs, he);
+                            }
+                            mmioIds.add("mmio:" + op.instrAddr +
+                                ":0x" + aidHex);
+                            mustRecorded = true;
+                            if (bnd != null) {
+                                try {
+                                    long av = Long.parseLong(
+                                        aidHex, 16);
+                                    Long exact2 = valBits.exactValue(
+                                        sizeMask(sz == 0 ? 4 : sz));
+                                    bnd.add(new BoundaryAccess(
+                                        op.instrAddr.toString(),
+                                        op.mnem, av, exact2));
+                                } catch (Exception e) {
+                                }
+                            }
+                        } else {
+                            iomap.add(ie);
+                            iomapIds.add("iomap:" + op.instrAddr);
+                            mustRecorded = true;
+                        }
                     }
                 }
             }
@@ -15563,7 +15842,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.29\",");
+        w.println("  \"extractor_version\": \"v3.30\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -15588,6 +15867,7 @@ public class ExtractIR extends GhidraScript {
         int fnCount = 0;
         int totalMmio = 0;
         int totalMay = 0;
+        int totalIomap = 0;
         int totalPortIo = 0;
         int totalMsr = 0;
         int totalIndirect = 0;
@@ -18445,6 +18725,10 @@ public class ExtractIR extends GhidraScript {
             List<String> may = new ArrayList<String>();
             List<String> portIo = new ArrayList<String>();
             List<String> msr = new ArrayList<String>();
+            // v64 Option B: unknown-base iomap sites (additive class;
+            // known-base sites go into mmio with provenance "iomap").
+            List<String> iomap = new ArrayList<String>();
+            List<String> iomapIds = new ArrayList<String>();
             // v7 cfgspace: BAR-relative findings (additive class).
             List<String> barRel = new ArrayList<String>();
             // Phase 4 V1: must accesses for boundary judgment
@@ -18452,6 +18736,15 @@ public class ExtractIR extends GhidraScript {
             List<BoundaryAccess> bndAccesses =
                 new ArrayList<BoundaryAccess>();
             Memory mem = currentProgram.getMemory();
+            // v64 Option B: site map for this function, from its
+            // final fixpoint in-states. A failure here loses only
+            // IOMAP findings for this function, never its MMIO.
+            try {
+                curIomapSites = buildIomapSites(ops, fx.inStates,
+                    funcByEntry);
+            } catch (Exception e) {
+                curIomapSites = new HashMap<Long, IomapSite>();
+            }
             // Successors for the recording-time feasibility filter.
             List<List<Integer>> maySucc = buildSucc(ops, branchTargets);
             for (int i = 0; i < ops.size(); i++) {
@@ -18521,6 +18814,56 @@ public class ExtractIR extends GhidraScript {
                             bndAccesses.add(new BoundaryAccess(
                                 op.instrAddr.toString(), op.mnem,
                                 addr.longValue(), extExact));
+                        } else if (addr == null && !mustRecorded) {
+                            // v64 Option B: LOAD/STORE through an
+                            // ioremap base. Exact resolution failed
+                            // because the address carries an OBJ
+                            // symbol; the site map translates that
+                            // symbol's call site to a phys (known)
+                            // or an unknown-base site. Known sites
+                            // join mmio (provenance "iomap", and
+                            // the Lean window check still applies
+                            // to them in v1 — see DESIGN.md §7);
+                            // unknown sites join iomap_accesses,
+                            // never a guessed fixed address.
+                            // Unmapped sites return null here and
+                            // are dropped, by design.
+                            int sz = (op.mnem.equals("STORE") &&
+                                op.ins.length >= 3)
+                                ? op.ins[2].getSize()
+                                : (op.out != null ? op.out.getSize() : 0);
+                            boolean[] isKnown = new boolean[1];
+                            String ie = iomapEntryFor(op, bvals,
+                                valBits, sz, isKnown);
+                            if (ie != null) {
+                                if (isKnown[0]) {
+                                    mmio.add(ie);
+                                    mustRecorded = true;
+                                    if (bndProfile != null) {
+                                        try {
+                                            int ai = ie.indexOf(
+                                                "\"address\": \"0x");
+                                            if (ai >= 0) {
+                                                int ae = ie.indexOf(
+                                                    "\"", ai + 13);
+                                                long av = Long.parseLong(
+                                                    ie.substring(ai + 13, ae), 16);
+                                                Long exact2 = valBits.exactValue(
+                                                    sizeMask(sz == 0 ? 4 : sz));
+                                                bndAccesses.add(
+                                                    new BoundaryAccess(
+                                                        op.instrAddr.toString(),
+                                                        op.mnem, av, exact2));
+                                            }
+                                        } catch (Exception e) {
+                                        }
+                                    }
+                                } else {
+                                    iomap.add(ie);
+                                    iomapIds.add("iomap:" + op.instrAddr);
+                                    mustRecorded = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -18837,6 +19180,8 @@ public class ExtractIR extends GhidraScript {
                     List<String> rPortIds = new ArrayList<String>();
                     List<String> rMsrIds = new ArrayList<String>();
                     List<String> rBarIds = new ArrayList<String>();
+                    List<String> rIomap = new ArrayList<String>();
+                    List<String> rIomapIds = new ArrayList<String>();
                     for (int ri = 0; ri < ops.size(); ri++) {
                         Map<String, Bits> rb =
                             (ri < fx.inStates.length) ?
@@ -18844,10 +19189,11 @@ public class ExtractIR extends GhidraScript {
                         recordMustFindings(ops.get(ri), rb, mem,
                             rMmio, rPortIo, rMsr, rBarRel,
                             rMmioIds, rPortIds, rMsrIds, rBarIds,
-                            null, null, null);
+                            null, null, null, rIomap, rIomapIds);
                     }
                     if (rMmio.equals(mmio) && rPortIo.equals(portIo) &&
-                        rMsr.equals(msr) && rBarRel.equals(barRel)) {
+                        rMsr.equals(msr) && rBarRel.equals(barRel) &&
+                        rIomap.equals(iomap)) {
                         Set<String> rMmioSet =
                             new HashSet<String>(rMmioIds);
                         Set<String> rPortSet =
@@ -18856,6 +19202,8 @@ public class ExtractIR extends GhidraScript {
                             new HashSet<String>(rMsrIds);
                         Set<String> rBarSet =
                             new HashSet<String>(rBarIds);
+                        Set<String> rIomapSet =
+                            new HashSet<String>(rIomapIds);
                         for (PerSiteGroup g : pgroups) {
                             if (g.fx == null ||
                                 g.fx.inStates == null) continue;
@@ -18875,6 +19223,10 @@ public class ExtractIR extends GhidraScript {
                                 new ArrayList<String>();
                             List<String> tBarIds =
                                 new ArrayList<String>();
+                            List<String> tIomap =
+                                new ArrayList<String>();
+                            List<String> tIomapIds =
+                                new ArrayList<String>();
                             // Phase 4 V1: clone-replay boundary
                             // candidates (mmio-aligned + region
                             // extension). Collected here, deduped
@@ -18893,7 +19245,8 @@ public class ExtractIR extends GhidraScript {
                                     mem, tMmio, tPortIo, tMsr,
                                     tBarRel, tMmioIds, tPortIds,
                                     tMsrIds, tBarIds,
-                                    tBnd, tBndExt, bndProfile);
+                                    tBnd, tBndExt, bndProfile,
+                                    tIomap, tIomapIds);
                             }
                             if (bndProfile != null) {
                                 bndAccesses.addAll(tBnd);
@@ -18927,6 +19280,13 @@ public class ExtractIR extends GhidraScript {
                                 if (rBarSet.add(tBarIds.get(ti))) {
                                     barRel.add(tBarRel.get(ti));
                                     persiteExtraBar++;
+                                } else {
+                                    persiteSkippedIdent++;
+                                }
+                            }
+                            for (int ti = 0; ti < tIomap.size(); ti++) {
+                                if (rIomapSet.add(tIomapIds.get(ti))) {
+                                    iomap.add(tIomap.get(ti));
                                 } else {
                                     persiteSkippedIdent++;
                                 }
@@ -19074,6 +19434,14 @@ public class ExtractIR extends GhidraScript {
             w.println();
             w.println("      ],");
             w.println("      \"may_access_count\": " + may.size() + ",");
+            w.println("      \"iomap_accesses\": [");
+            for (int i = 0; i < iomap.size(); i++) {
+                if (i > 0) w.println(",");
+                w.print("        " + iomap.get(i));
+            }
+            w.println();
+            w.println("      ],");
+            w.println("      \"iomap_access_count\": " + iomap.size() + ",");
             w.println("      \"port_io_accesses\": [");
             for (int i = 0; i < portIo.size(); i++) {
                 if (i > 0) w.println(",");
@@ -19191,6 +19559,7 @@ public class ExtractIR extends GhidraScript {
             totalBarRel += barRel.size();
             totalMmio += mmio.size();
             totalMay += may.size();
+            totalIomap += iomap.size();
             totalPortIo += portIo.size();
             totalMsr += msr.size();
             totalCopySites += copySites.size();
@@ -19302,6 +19671,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"function_count\": " + fnCount + ",");
         w.println("  \"mmio_access_total\": " + totalMmio + ",");
         w.println("  \"may_access_total\": " + totalMay + ",");
+        w.println("  \"iomap_access_total\": " + totalIomap + ",");
         w.println("  \"port_io_access_total\": " + totalPortIo + ",");
         w.println("  \"msr_access_total\": " + totalMsr + ",");
         w.println("  \"indirect_call_edges_total\": " + totalIndirect + ",");
