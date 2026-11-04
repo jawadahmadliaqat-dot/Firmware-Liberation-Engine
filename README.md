@@ -1,6 +1,6 @@
 # Firmware Liberation Engine
 
-![Version](https://img.shields.io/badge/version-v3.30-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/version-v3.31-blue) ![Lean](https://img.shields.io/badge/Lean-4.35.0-purple) ![Ghidra](https://img.shields.io/badge/Ghidra-11.4.2-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 Take a closed firmware binary, extract every hardware address it can touch,
 and machine-check the result with Lean 4 — no execution, no guessing.
@@ -57,7 +57,7 @@ A binary passed as a path is used directly (no Drive needed); a bare name syncs 
 - **Boundary** — no must-proven access crossing a configured security boundary
   (violation, unknown-agent and unknown-region counts reported, never silent).
 
-## Results (extractor v3.30, 46-target regression, 0 mismatches)
+## Results (extractor v3.31, 46-target regression, 0 mismatches)
 
 Scope: reference-VM verification — 36-target Lean verdicts 31 PASS / 5 FAIL, matching the item7 baseline (workspace evidence: v46-callermask/regression/lean_regression_v46_postfix.txt, Oct 31, 2026; v45-findingc/regression/lean_regression_v45_postfix.txt, Oct 31, 2026); this verification machine (WSL2 Ubuntu, Nov 1, 2026) — 9 targets re-run, 0 mismatches.
 
@@ -119,6 +119,7 @@ syndemo-clock-violation, x86-syndemo-port); none is a violation in shipped firmw
 | v3.28 | Switch site list (below); per-function switch_sites (branch + targets) now emitted, captured before the indirect merge; 0 existing-field changes on the 46-target set. |
 | v3.29 | Octeon XKPHYS IO band (below); MIPS MMIO window 0x8001000000000000-0x8002000000000000 added (is_io bit 48); 0 existing-field changes on the 46-target set. |
 | v3.30 | Option B ioremap provenance (below); known ioremap sites go to mmio_accesses with provenance "iomap", unknown-base sites go to new iomap_accesses (no fixed address claimed); 0 existing-field changes on the 46-target set. |
+| v3.31 | Option B, stripped path (below); __ksymtab scan recovers ioremap-family addresses in stripped binaries (FUN_ callees only, real names never overridden); 0 existing-field changes on the 46-target set. |
 | v3.1–v3.13 | Fixpoint tracker, MAY analysis, jump tables, call graph, points-to, tail calls, per-site transfer, clobber refinement, stack slots. |
 
 **v3.21 (V1.5) in short:** a table entry becomes a boundary region only when its
@@ -264,6 +265,26 @@ post-unmap store 0. Limits, stated plainly: v1 is unstripped-only
 bases are missed, a function storing both before and after unmap
 loses the before-store too, and known IOMAP sites still go through
 Lean's window check in v1 (no provenance exemption yet).
+
+**v3.31 (Option B, stripped path) in short:** at analysis start,
+ExtractIR scans program memory once for 24-byte kernel_symbol
+entries (value, name, namespace, program endianness) and accepts
+an entry only when the name resolves to exactly an ioremap-family
+name (suffix folding allowed: "iounmap" inside "pci_iounmap" is
+valid), the value is a loaded address, the namespace resolves to
+an empty string, and a +-24 neighbour shares that namespace
+pointer. The recovered address -> name map is a fallback only
+for FUN_ callees; a real named callee is never overridden, and
+when the scan finds nothing behaviour is exactly v3.30. A
+stripped x86_64 fixture with a fake ksymtab proves it: with
+ksymtab, mmio 1 (0xFED00010, provenance iomap); without ksymtab,
+mmio 0. Limits, stated plainly: 0 corpus-output changes on the
+46-target set (no corpus target carries __ksymtab), the Octeon
+kernel has NOT yet been re-run with this code (that test is on
+the verification machine after the Nov 5 paper), so stripped-B
+is NOT claimed DONE here, and if a scalar retprop summary ever
+applies to an ioremap-family callee the OBJ site mechanism is
+bypassed (same as v1).
 
 **OVMF evaluation round (v3.23 Lean, counted):** 124 inventoried OVMF targets run — 51 PASS / 73 FAIL, all 73 FAILs empty-trace coverage (0 trace ops) with 0 real bugs and 0 bounds sites. Shell + TlsDxe needed a one-off 1G heap attempt (512M cap restored after); the 512M ceiling is no longer an open gap for this corpus.
 

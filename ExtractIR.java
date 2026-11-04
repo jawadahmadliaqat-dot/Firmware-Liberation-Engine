@@ -452,10 +452,16 @@ public class ExtractIR extends GhidraScript {
     private int iomapPhysArgIndex(String name) {
         if (name == null) return -2;
         if (name.equals("ioremap") || name.equals("ioremap_nocache") ||
-            name.equals("ioremap_wc")) return 0;
-        if (name.equals("devm_ioremap")) return 1;
+            name.equals("ioremap_wc") ||
+            name.equals("ioremap_prot")) return 0;
+        if (name.equals("devm_ioremap") ||
+            name.equals("devm_ioremap_wc") ||
+            name.equals("devm_ioremap_uc")) return 1;
         if (name.equals("devm_ioremap_resource") ||
-            name.equals("pci_iomap") || name.equals("of_iomap") ||
+            name.equals("devm_platform_ioremap_resource") ||
+            name.equals("pci_iomap") || name.equals("pci_ioremap_bar") ||
+            name.equals("pci_ioremap_wc_bar") ||
+            name.equals("of_iomap") ||
             name.equals("of_io_request_and_map")) return -1;
         return -2;
     }
@@ -470,6 +476,183 @@ public class ExtractIR extends GhidraScript {
         if (name.equals("devm_iounmap") ||
             name.equals("pci_iounmap")) return 1;
         return -1;
+    }
+
+    /** v64 stripped-B: ioremap/iounmap family names as they appear
+        in __ksymtab_strings. Plain "ioremap" is included for
+        completeness but is NOT exported on Linux 6.6 (macro alias
+        to ioremap); the real implementation there is
+        "ioremap_prot". Suffix folding is real: a name pointer may
+        sit inside a longer string ("iounmap" inside
+        "pci_iounmap"), so matching is bytes-at-pointer == name,
+        never a prev-byte check. */
+    private static final String[] KSYMTAB_IOMAP_NAMES = new String[] {
+        "ioremap", "ioremap_nocache", "ioremap_wc", "ioremap_prot",
+        "devm_ioremap", "devm_ioremap_resource", "devm_ioremap_wc",
+        "devm_ioremap_uc", "devm_platform_ioremap_resource",
+        "pci_iomap", "pci_ioremap_bar", "pci_ioremap_wc_bar",
+        "of_iomap", "of_io_request_and_map",
+        "iounmap", "devm_iounmap", "pci_iounmap"
+    };
+
+    /** v64 stripped-B: callee entry offset -> family name, recovered
+        from __ksymtab in program memory. Null until the first
+        emission-time scan; ksymtabScanned gates re-scans, so an
+        empty result costs one scan, never one per function. The
+        scan is internal (no new flag, no new input file, same
+        one-command pipeline); when it finds nothing, behaviour is
+        exactly v1 (name lookup only). */
+    private Map<Long, String> ksymtabIomapNames = null;
+    private boolean ksymtabScanned = false;
+
+    private boolean ksymtabIsFamilyName(String s) {
+        if (s == null) return false;
+        for (int i = 0; i < KSYMTAB_IOMAP_NAMES.length; i++) {
+            if (KSYMTAB_IOMAP_NAMES[i].equals(s)) return true;
+        }
+        return false;
+    }
+
+    /** v64 stripped-B: family name for a call target offset from
+        the ksymtab map, or null. Dual-keyed like funcByEntry. */
+    private String ksymtabNameFor(long target) {
+        if (ksymtabIomapNames == null) return null;
+        String nm = ksymtabIomapNames.get(target);
+        if (nm != null) return nm;
+        try {
+            return ksymtabIomapNames.get(
+                isa.stripInstructionTag(target));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** v64 stripped-B: one lazy scan of program memory for
+        __ksymtab entries (24-byte kernel_symbol: value, name,
+        namespace, pointer size, program endianness). An entry is
+        accepted only when ALL hold: the name pointer resolves to
+        exactly a family name, the value is a non-zero address
+        inside a loaded block, the namespace pointer resolves to
+        an empty string, and a +-24 neighbour entry shares the
+        namespace pointer and resolves to a non-empty name. A
+        failure anywhere yields an empty map, never a partial
+        guess, and never loses non-IOMAP findings. */
+    private void ensureKsymtabMap(Memory mem) {
+        if (ksymtabScanned) return;
+        ksymtabScanned = true;
+        ksymtabIomapNames = new HashMap<Long, String>();
+        if (mem == null) return;
+        try {
+            boolean bigEndian = currentProgram.getLanguage()
+                .isBigEndian();
+            int ps = isa.pointerSize();
+            if (ps != 8) return;
+            MemoryBlock[] blocks = mem.getBlocks();
+            java.util.List<MemoryBlock> bl = new ArrayList<MemoryBlock>();
+            java.util.List<byte[]> by = new ArrayList<byte[]>();
+            java.util.List<Long> st = new ArrayList<Long>();
+            java.util.List<Long> en = new ArrayList<Long>();
+            for (int b = 0; b < blocks.length; b++) {
+                MemoryBlock block = blocks[b];
+                if (block == null || !block.isInitialized()) continue;
+                long start = block.getStart().getOffset();
+                long end = block.getEnd().getOffset();
+                if (end <= start || end - start > 64L * 1024L * 1024L)
+                    continue;
+                int len = (int) (end - start + 1L);
+                byte[] buf = new byte[len];
+                int got = mem.getBytes(block.getStart(), buf);
+                if (got < len) continue;
+                bl.add(block);
+                by.add(buf);
+                st.add(start);
+                en.add(end);
+            }
+            for (int b = 0; b < by.size(); b++) {
+                byte[] buf = by.get(b);
+                for (int i = 0; i + 24 <= buf.length; i += 8) {
+                    long value = ksymtabU64(buf, i, bigEndian);
+                    long namePtr = ksymtabU64(buf, i + 8, bigEndian);
+                    long nsPtr = ksymtabU64(buf, i + 16, bigEndian);
+                    if (value == 0) continue;
+                    String nm = ksymtabResolve(by, st, en, namePtr);
+                    if (nm == null || !ksymtabIsFamilyName(nm)) continue;
+                    if (!ksymtabInBlocks(st, en, value)) continue;
+                    if (!ksymtabIsEmptyString(by, st, en, nsPtr)) continue;
+                    boolean neighbourOk = false;
+                    for (int d = -24; d <= 24; d += 48) {
+                        int j = i + d;
+                        if (j < 0 || j + 24 > buf.length) continue;
+                        long ns2 = ksymtabU64(buf, j + 16, bigEndian);
+                        if (ns2 != nsPtr) continue;
+                        long np2 = ksymtabU64(buf, j + 8, bigEndian);
+                        String nm2 = ksymtabResolve(by, st, en, np2);
+                        if (nm2 != null && nm2.length() > 0)
+                            neighbourOk = true;
+                    }
+                    if (!neighbourOk) continue;
+                    ksymtabIomapNames.put(value, nm);
+                    try {
+                        long stripped = isa.stripInstructionTag(value);
+                        if (stripped != value)
+                            ksymtabIomapNames.put(stripped, nm);
+                    } catch (Exception e) {
+                    }
+                }
+            }
+        } catch (Exception e) {
+            ksymtabIomapNames = new HashMap<Long, String>();
+        }
+        println("[*] ksymtab: " + ksymtabIomapNames.size() +
+            " ioremap-family entries recovered: " +
+            ksymtabIomapNames.toString());
+    }
+
+    private long ksymtabU64(byte[] buf, int off, boolean bigEndian) {
+        long v = 0;
+        if (bigEndian) {
+            for (int k = 0; k < 8; k++)
+                v = (v << 8) | (buf[off + k] & 0xFFL);
+        } else {
+            for (int k = 7; k >= 0; k--)
+                v = (v << 8) | (buf[off + k] & 0xFFL);
+        }
+        return v;
+    }
+
+    private boolean ksymtabInBlocks(java.util.List<Long> st,
+        java.util.List<Long> en, long addr) {
+        for (int i = 0; i < st.size(); i++) {
+            if (addr >= st.get(i) && addr <= en.get(i)) return true;
+        }
+        return false;
+    }
+
+    private String ksymtabResolve(java.util.List<byte[]> by,
+        java.util.List<Long> st, java.util.List<Long> en, long ptr) {
+        for (int i = 0; i < by.size(); i++) {
+            if (ptr < st.get(i) || ptr > en.get(i)) continue;
+            int off = (int) (ptr - st.get(i));
+            byte[] buf = by.get(i);
+            int end = off;
+            while (end < buf.length && buf[end] != 0 &&
+                end - off < 64) end++;
+            if (end >= buf.length || buf[end] != 0) return null;
+            if (end == off) return "";
+            return new String(buf, off, end - off,
+                java.nio.charset.StandardCharsets.US_ASCII);
+        }
+        return null;
+    }
+
+    private boolean ksymtabIsEmptyString(java.util.List<byte[]> by,
+        java.util.List<Long> st, java.util.List<Long> en, long ptr) {
+        for (int i = 0; i < by.size(); i++) {
+            if (ptr < st.get(i) || ptr > en.get(i)) continue;
+            int off = (int) (ptr - st.get(i));
+            return by.get(i)[off] == 0;
+        }
+        return false;
     }
 
     /** v64: build the ioremap site map for one function from its
@@ -499,11 +682,21 @@ public class ExtractIR extends GhidraScript {
             FuncRec callee = funcByEntry.get(t.getOffset());
             if (callee == null) callee = funcByEntry.get(
                 isa.stripInstructionTag(t.getOffset()));
-            if (callee == null || callee.f == null) continue;
-            String nm;
-            try { nm = callee.f.getName(); } catch (Exception e) {
-                continue;
+            String nm = null;
+            if (callee != null && callee.f != null) {
+                try { nm = callee.f.getName(); } catch (Exception e) {
+                    nm = null;
+                }
             }
+            // Stripped-B fallback: a Ghidra FUN_ name (or no
+            // function record at all) is not a real callee name,
+            // so a ksymtab-recovered family name may replace it.
+            // A real named callee is never overridden by ksymtab.
+            if ((nm == null || nm.startsWith("FUN_"))) {
+                String kn = ksymtabNameFor(t.getOffset());
+                if (kn != null) nm = kn;
+            }
+            if (nm == null) continue;
             int argIdx = iomapPhysArgIndex(nm);
             if (argIdx == -2) continue;
             Long phys = null;
@@ -512,7 +705,8 @@ public class ExtractIR extends GhidraScript {
                 long[] argRegs = null;
                 try {
                     argRegs = isa.argumentRegisterOffsets(
-                        callConvMap.get(callee.entryKey));
+                        callConvMap.get(callee == null ? null :
+                            callee.entryKey));
                 } catch (Exception e) {
                     argRegs = null;
                 }
@@ -542,18 +736,28 @@ public class ExtractIR extends GhidraScript {
             FuncRec callee = funcByEntry.get(t.getOffset());
             if (callee == null) callee = funcByEntry.get(
                 isa.stripInstructionTag(t.getOffset()));
-            if (callee == null || callee.f == null) continue;
-            String nm;
-            try { nm = callee.f.getName(); } catch (Exception e) {
-                continue;
+            String nm = null;
+            if (callee != null && callee.f != null) {
+                try { nm = callee.f.getName(); } catch (Exception e) {
+                    nm = null;
+                }
             }
+            // Stripped-B fallback, same rule as the site pass:
+            // FUN_ or missing callee may take a ksymtab name,
+            // a real named callee is never overridden.
+            if ((nm == null || nm.startsWith("FUN_"))) {
+                String kn = ksymtabNameFor(t.getOffset());
+                if (kn != null) nm = kn;
+            }
+            if (nm == null) continue;
             int argIdx = iounmapBaseArgIndex(nm);
             if (argIdx < 0 || i >= inStates.length ||
                 inStates[i] == null) continue;
             long[] argRegs = null;
             try {
                 argRegs = isa.argumentRegisterOffsets(
-                    callConvMap.get(callee.entryKey));
+                    callConvMap.get(callee == null ? null :
+                        callee.entryKey));
             } catch (Exception e) {
                 argRegs = null;
             }
@@ -15842,7 +16046,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.30\",");
+        w.println("  \"extractor_version\": \"v3.31\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -18739,7 +18943,11 @@ public class ExtractIR extends GhidraScript {
             // v64 Option B: site map for this function, from its
             // final fixpoint in-states. A failure here loses only
             // IOMAP findings for this function, never its MMIO.
+            // Stripped-B: the ksymtab scan runs once (lazy, and
+            // a no-op after the first call), so the site map can
+            // use recovered family names for FUN_ callees.
             try {
+                ensureKsymtabMap(mem);
                 curIomapSites = buildIomapSites(ops, fx.inStates,
                     funcByEntry);
             } catch (Exception e) {
