@@ -286,6 +286,21 @@ is NOT claimed DONE here, and if a scalar retprop summary ever
 applies to an ioremap-family callee the OBJ site mechanism is
 bypassed (same as v1).
 
+**Indirect-call classifier (v3.31 code, log-only, no version change):**
+ExtractIR also writes a `<report>_indirect_classifier.txt` next to each
+report: per unresolved indirect/tail site it classifies the terminal
+definition (LOAD/COPY/INT_ADD/arg/PHI), address shape, section name, and
+base provenance, plus a resolved-set fan-out histogram and a
+constant-address-store-into-.rodata list. It changes no JSON field and no
+Lean input (verified: 46-target regression 0 diffs, 5-target re-verify
+canonically identical). Known limits, stated plainly: the address-taken
+column is a raw image-word scan — on unstripped/debug binaries it also
+matches `.symtab`/`.debug_*` overlay blocks (blackmagic: 1034/1034 vs
+368/1034 in runtime-loaded sections), relocation addends are caught only
+by alignment luck, and `lui`/`addiu`-materialised addresses are not
+counted — so it must not be used as a class-D completeness proof until
+those are fixed.
+
 **OVMF evaluation round (v3.23 Lean, counted):** 124 inventoried OVMF targets run — 51 PASS / 73 FAIL, all 73 FAILs empty-trace coverage (0 trace ops) with 0 real bugs and 0 bounds sites. Shell + TlsDxe needed a one-off 1G heap attempt (512M cap restored after); the 512M ceiling is no longer an open gap for this corpus.
 
 ## Honest limits (one line each)
@@ -355,3 +370,4 @@ setup.sh                  # JDK + Ghidra + Lean install
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
+

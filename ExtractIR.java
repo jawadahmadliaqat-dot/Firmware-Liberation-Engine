@@ -505,6 +505,59 @@ public class ExtractIR extends GhidraScript {
     private Map<Long, String> ksymtabIomapNames = null;
     private boolean ksymtabScanned = false;
 
+    /** v65 indirect-gap classifier: every validated __ksymtab
+        entry's address (all names, not just the ioremap family),
+        for the classifier's "exported" column. Built by the same
+        scan as ksymtabIomapNames; null until scanned. */
+    private java.util.Set<Long> ksymtabExported = null;
+
+    /** v65 indirect-gap classifier (log-only, no JSON change, no
+        edges). Per-program ranges and sets, built once before
+        Phase A: .rodata / .init.text ranges by section NAME
+        (flags are useless: a single RWE PT_LOAD marks .rodata WA),
+        address-taken function entries from an image-word scan,
+        constant-address stores into .rodata, and per-site lines. */
+    private long clsRodataStart = -1L;
+    private long clsRodataEnd = -1L;
+    private long clsInitStart = -1L;
+    private long clsInitEnd = -1L;
+    private int clsRodataStoreCount = 0;
+    private java.util.List<String> clsRodataStoreSamples =
+        new ArrayList<String>();
+    private java.util.Set<Long> clsTakenEntries =
+        new HashSet<Long>();
+    private java.util.List<String> clsLines =
+        new ArrayList<String>();
+    private boolean clsDumpDone = false;
+    private java.util.List<String> clsDump =
+        new ArrayList<String>();
+
+    /** v65: plausible C identifier (kernel symbol names). Rejects
+        empty names and relocation-table garbage bytes. */
+    private boolean ksymtabIsIdent(String s) {
+        if (s == null || s.length() < 2) return false;
+        char c0 = s.charAt(0);
+        if (!(c0 == '_' || (c0 >= 'A' && c0 <= 'Z') ||
+            (c0 >= 'a' && c0 <= 'z'))) return false;
+        for (int i = 1; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (!(c == '_' || (c >= 'A' && c <= 'Z') ||
+                (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
+                return false;
+        }
+        return true;
+    }
+
+    /** v65: true when addr is a known function entry. */
+    private boolean isFuncEntry(long addr) {
+        try {
+            return currentProgram.getFunctionManager()
+                .getFunctionAt(toAddr(addr)) != null;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private boolean ksymtabIsFamilyName(String s) {
         if (s == null) return false;
         for (int i = 0; i < KSYMTAB_IOMAP_NAMES.length; i++) {
@@ -541,6 +594,7 @@ public class ExtractIR extends GhidraScript {
         if (ksymtabScanned) return;
         ksymtabScanned = true;
         ksymtabIomapNames = new HashMap<Long, String>();
+        ksymtabExported = new HashSet<Long>();
         if (mem == null) return;
         try {
             boolean bigEndian = currentProgram.getLanguage()
@@ -576,7 +630,7 @@ public class ExtractIR extends GhidraScript {
                     long nsPtr = ksymtabU64(buf, i + 16, bigEndian);
                     if (value == 0) continue;
                     String nm = ksymtabResolve(by, st, en, namePtr);
-                    if (nm == null || !ksymtabIsFamilyName(nm)) continue;
+                    if (nm == null) continue;
                     if (!ksymtabInBlocks(st, en, value)) continue;
                     if (!ksymtabIsEmptyString(by, st, en, nsPtr)) continue;
                     boolean neighbourOk = false;
@@ -591,6 +645,25 @@ public class ExtractIR extends GhidraScript {
                             neighbourOk = true;
                     }
                     if (!neighbourOk) continue;
+                    // v65: exported = validated entry whose name is a
+                    // plausible C identifier AND whose value is a
+                    // known function entry. The raw gates alone also
+                    // match relocation-table garbage (OpenSBI
+                    // .rela.dyn: 341 false positives from r_info=0x3
+                    // resolving to a zero byte in an address-0
+                    // metadata block), so neither condition alone is
+                    // enough. The family map below is unchanged
+                    // (same gates, same entries as v3.31).
+                    if (ksymtabIsIdent(nm) && isFuncEntry(value))
+                        ksymtabExported.add(value);
+                    try {
+                        long stripped = isa.stripInstructionTag(value);
+                        if (stripped != value &&
+                            ksymtabIsIdent(nm) && isFuncEntry(stripped))
+                            ksymtabExported.add(stripped);
+                    } catch (Exception e) {
+                    }
+                    if (!ksymtabIsFamilyName(nm)) continue;
                     ksymtabIomapNames.put(value, nm);
                     try {
                         long stripped = isa.stripInstructionTag(value);
@@ -602,10 +675,14 @@ public class ExtractIR extends GhidraScript {
             }
         } catch (Exception e) {
             ksymtabIomapNames = new HashMap<Long, String>();
+            ksymtabExported = new HashSet<Long>();
         }
         println("[*] ksymtab: " + ksymtabIomapNames.size() +
             " ioremap-family entries recovered: " +
-            ksymtabIomapNames.toString());
+            ksymtabIomapNames.toString() +
+            " (exported entries: " +
+            (ksymtabExported == null ? 0 : ksymtabExported.size()) +
+            ")");
     }
 
     private long ksymtabU64(byte[] buf, int off, boolean bigEndian) {
@@ -6548,14 +6625,41 @@ public class ExtractIR extends GhidraScript {
         keyed by destination -- a resolved address, a constant
         address, or a [reg + const offset] field offset. The offset
         key deliberately merges different structs sharing one offset:
-        the resulting may-set is a superset (safe for "could call"),
-        never a claim of certainty. */
+        the resulting may-set is a candidate set for "could call",
+        never a claim of certainty -- and NOT a proven-complete
+        superset: stores through addresses this pass cannot resolve
+        are missed, and the TABLE tier's 64-entry scan stops at the
+        first non-function word, so it is a prefix, not a superset.
+        Consumers must never treat may_call_edges as exhaustive. */
     private void collectFuncPtrStores(List<OpRec> ops, Memory mem,
         FunctionManager fm, Map<Long, Set<String>> byOffset,
         Map<Long, Set<String>> byAddr) {
         for (int i = 0; i < ops.size(); i++) {
             OpRec op = ops.get(i);
             if (!op.mnem.equals("STORE") || op.ins.length < 3) continue;
+            // v65: constant-address store into .rodata, whatever
+            // the value -- .data..ro_after_init input is merged
+            // into the .rodata output section by the kernel linker
+            // script, so image bytes in .rodata are not
+            // necessarily the final value. Counted here, before
+            // the value check, because ANY store matters.
+            Varnode a = op.ins[1];
+            Long destAddr = null;
+            if (a.isConstant()) {
+                destAddr = a.getOffset();
+            } else {
+                destAddr = resolveValue(a, ops, mem, i, 4);
+            }
+            if (destAddr != null && clsRodataStart >= 0 &&
+                destAddr.longValue() >= clsRodataStart &&
+                destAddr.longValue() <= clsRodataEnd) {
+                clsRodataStoreCount++;
+                if (clsRodataStoreSamples.size() < 20) {
+                    clsRodataStoreSamples.add(
+                        ops.get(i).instrAddr + " -> 0x" +
+                        Long.toHexString(destAddr.longValue()));
+                }
+            }
             // Value: any chain that resolves to a function entry
             // (const, COPY, LOAD from a flash table, ...).
             Long val = resolveValue(op.ins[2], ops, mem, i, 4);
@@ -6569,11 +6673,10 @@ public class ExtractIR extends GhidraScript {
                 continue;
             }
             if (funcName == null) continue;
-            Varnode a = op.ins[1];
             if (a.isConstant()) {
                 putStore(byAddr, a.getOffset(), funcName);
             } else {
-                Long av = resolveValue(a, ops, mem, i, 4);
+                Long av = destAddr;
                 if (av != null) {
                     // Guard against null-base artifacts (a base
                     // that resolved to ~0 plus a field offset).
@@ -6738,9 +6841,10 @@ public class ExtractIR extends GhidraScript {
         construction (constant/resolvable address -> ADDR,
         scaled table index -> TABLE, else [reg + const] ->
         OFFSET), so the tier names the evidence class, not
-        just the set. Only recoverTailCalls reads the tier;
-        recoverPointsTo keeps the set-only wrapper above,
-        so CALLIND may-edges are byte-identical. */
+        just the set. recoverTailCalls reads the tier for its
+        veto; since v65 recoverPointsTo reads it too, for the
+        classifier only -- the returned set is byte-identical
+        either way (tierOut is extra output, same function). */
     private static final int TIER_NONE = 0;
     private static final int TIER_ADDR = 1;
     private static final int TIER_TABLE = 2;
@@ -6849,6 +6953,11 @@ public class ExtractIR extends GhidraScript {
                                 }
                             }
                             if (scaled) {
+                                // v65: prefix, not superset -- the
+                                // scan stops at the first
+                                // non-function word, so entries past
+                                // a NULL/data word are missed. May
+                                // channel only, never must.
                                 tier = TIER_TABLE;
                                 for (int k = 0; k < 64; k++) {
                                     long ea = cval + (long) isa.pointerSize() * k;
@@ -6879,6 +6988,305 @@ public class ExtractIR extends GhidraScript {
         }
         if (tierOut != null) tierOut[0] = tier;
         return tset;
+    }
+
+    /** v65 classifier: section NAME for an address (flags are
+        useless: a single RWE PT_LOAD marks .rodata WA). */
+    private String clsSectionName(Memory mem, long addr) {
+        try {
+            MemoryBlock blk = mem.getBlock(toAddr(addr));
+            if (blk == null) return "?";
+            String n = blk.getName();
+            return n == null ? "?" : n;
+        } catch (Exception e) {
+            return "?";
+        }
+    }
+
+    /** v65 classifier: one-line provenance for a base varnode.
+        arg = no def in the 40-op findDef window (a live-in or a
+        parameter, NOT proven to be an argument); call = def is a
+        CALL/CALLIND; load[...] = def is a LOAD (sp when the load
+        address is stack-derived); const = a constant; ? = other. */
+    private String clsProv(List<OpRec> ops, Varnode v, int pos,
+        int depth) {
+        if (v == null) return "?";
+        if (v.isConstant()) return "const";
+        if (depth <= 0) return "?";
+        int d = findDef(ops, vkey(v), pos);
+        if (d < 0) {
+            if (memSpOff >= 0 && v.getAddress() != null) {
+                try {
+                    if (v.getOffset() == memSpOff) return "sp";
+                } catch (Exception e) {
+                }
+            }
+            return "arg";
+        }
+        OpRec dd = ops.get(d);
+        if (dd.mnem.equals("CALL") || dd.mnem.equals("CALLIND"))
+            return "call";
+        if (dd.mnem.equals("LOAD"))
+            return dd.addrIsStack ? "sp"
+                : "load[" + clsProv(ops, dd.ins[1], d, depth - 1) + "]";
+        if (dd.mnem.equals("COPY") && dd.ins.length == 1)
+            return clsProv(ops, dd.ins[0], d, depth - 1);
+        if (dd.mnem.equals("INT_ADD") || dd.mnem.equals("INT_SUB"))
+            return "arith";
+        return "?";
+    }
+
+    /** v65 classifier: transitive constant value of a varnode
+        (COPY chains, INT_ADD/INT_SUB of constants, tag-mask
+        INT_AND). The resolver's own const-side check is direct
+        only, so a COPY-of-constant is missed there -- this helper
+        exists so the classifier can see it. */
+    private Long clsConstValue(List<OpRec> ops, Varnode v, int pos,
+        int depth) {
+        if (v == null) return null;
+        if (v.isConstant()) return v.getOffset();
+        if (depth <= 0) return null;
+        int d = findDef(ops, vkey(v), pos);
+        if (d < 0) return null;
+        OpRec dd = ops.get(d);
+        if (dd.mnem.equals("COPY") && dd.ins.length == 1)
+            return clsConstValue(ops, dd.ins[0], d, depth - 1);
+        if ((dd.mnem.equals("INT_ADD") || dd.mnem.equals("INT_SUB")) &&
+            dd.ins.length == 2) {
+            Long a = clsConstValue(ops, dd.ins[0], d, depth - 1);
+            Long b = clsConstValue(ops, dd.ins[1], d, depth - 1);
+            if (a == null || b == null) return null;
+            return dd.mnem.equals("INT_ADD") ? a.longValue() + b.longValue()
+                : a.longValue() - b.longValue();
+        }
+        if (dd.mnem.equals("INT_AND") && dd.ins.length == 2) {
+            for (int ss = 0; ss < 2; ss++) {
+                Varnode vv = dd.ins[ss];
+                if (vv.isConstant() &&
+                    isa.isInstructionTagMask(vv.getOffset()))
+                    return clsConstValue(ops, dd.ins[1 - ss], d,
+                        depth - 1);
+            }
+        }
+        return null;
+    }
+
+    /** v65: classify ONE indirect site (CALLIND or BRANCHIND) for
+        the log-only classifier. Appends one tab-separated line to
+        clsLines; never affects the report. tier is the TIER_* the
+        resolver produced; resolved is whether it produced a
+        non-empty set. */
+    private void clsSite(List<OpRec> ops, Memory mem, int i,
+        boolean isTail, long funcEntry, int tier, boolean resolved,
+        int ntargets) {
+        try {
+            OpRec call = ops.get(i);
+            Varnode tgt = call.ins.length > 0 ? call.ins[0] : null;
+            String term = "?";
+            int copyHops = 0;
+            int loadSize = 0;
+            String shape = "?";
+            String sec = "?";
+            String base = "?";
+            if (tgt != null) {
+                if (tgt.isConstant()) {
+                    term = "const";
+                    shape = "const";
+                    sec = clsSectionName(mem, tgt.getOffset());
+                } else {
+                    int d = findDef(ops, vkey(tgt), i);
+                    if (d < 0) {
+                        term = "arg";
+                    } else {
+                        int cur = d;
+                        OpRec curOp = ops.get(d);
+                        for (int hop = 0; hop < 8; hop++) {
+                            if (!curOp.mnem.equals("COPY") ||
+                                curOp.ins.length != 1 ||
+                                curOp.ins[0].isConstant()) break;
+                            int du = findDef(ops,
+                                vkey(curOp.ins[0]), cur);
+                            if (du < 0) break;
+                            copyHops++;
+                            cur = du;
+                            curOp = ops.get(cur);
+                        }
+                        if (curOp.mnem.equals("INT_AND") &&
+                            curOp.ins.length == 2) {
+                            for (int ss = 0; ss < 2; ss++) {
+                                Varnode vv = curOp.ins[ss];
+                                if (vv.isConstant() &&
+                                    isa.isInstructionTagMask(
+                                        vv.getOffset())) {
+                                    int du = findDef(ops,
+                                        vkey(curOp.ins[1 - ss]), cur);
+                                    if (du >= 0) {
+                                        cur = du;
+                                        curOp = ops.get(cur);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        term = curOp.mnem;
+                        if (curOp.mnem.equals("LOAD") &&
+                            curOp.ins.length >= 2) {
+                            loadSize = curOp.out == null ? 0 :
+                                curOp.out.getSize();
+                            if (curOp.addrIsStack) {
+                                shape = "sp-reload";
+                                base = "sp";
+                            } else {
+                                Varnode av = curOp.ins[1];
+                                if (av.isConstant()) {
+                                    shape = "const";
+                                    sec = clsSectionName(mem,
+                                        av.getOffset());
+                                } else {
+                                    Long a = resolveValue(av, ops, mem,
+                                        cur, 4);
+                                    if (a != null) {
+                                        shape = "const";
+                                        sec = clsSectionName(mem,
+                                            a.longValue());
+                                    } else {
+                                        int da = findDef(ops,
+                                            vkey(av), cur);
+                                        if (da >= 0) {
+                                            OpRec ad = ops.get(da);
+                                            if (ad.mnem.equals("INT_ADD") &&
+                                                ad.ins.length == 2) {
+                                                Long c0 = clsConstValue(ops,
+                                                    ad.ins[0], da, 4);
+                                                Long c1 = clsConstValue(ops,
+                                                    ad.ins[1], da, 4);
+                                                Varnode regSide = null;
+                                                if (c0 != null && c1 == null) {
+                                                    regSide = ad.ins[1];
+                                                } else if (c1 != null && c0 == null) {
+                                                    regSide = ad.ins[0];
+                                                }
+                                                if (c0 == null && c1 == null) {
+                                                    shape = "reg+reg";
+                                                    String b0 = clsProv(ops,
+                                                        ad.ins[0], da, 3);
+                                                    String b1 = clsProv(ops,
+                                                        ad.ins[1], da, 3);
+                                                    base = b0 + "+" + b1;
+                                                } else if (c0 != null && c1 != null) {
+                                                    shape = "const";
+                                                    sec = clsSectionName(mem,
+                                                        c0.longValue() +
+                                                        c1.longValue());
+                                                } else if (regSide != null) {
+                                                    int dr = findDef(ops,
+                                                        vkey(regSide), da);
+                                                    boolean scaled = false;
+                                                    if (dr >= 0) {
+                                                        OpRec rd = ops.get(dr);
+                                                        if (rd.mnem.equals("INT_LEFT") &&
+                                                            rd.ins.length == 2 &&
+                                                            rd.ins[1].isConstant() &&
+                                                            rd.ins[1].getOffset() == (long) isa.pointerIndexShift())
+                                                            scaled = true;
+                                                        else if (rd.mnem.equals("INT_MULT") &&
+                                                            rd.ins.length == 2) {
+                                                            for (int t = 0; t < 2; t++) {
+                                                                if (rd.ins[t].isConstant() &&
+                                                                    rd.ins[t].getOffset() == (long) isa.pointerSize())
+                                                                    scaled = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    shape = scaled ?
+                                                        "reg+reg*scale" :
+                                                        "reg+const";
+                                                    base = clsProv(ops,
+                                                        regSide, da, 3);
+                                                } else {
+                                                    shape = "reg+?";
+                                                    base = clsProv(ops, av,
+                                                        cur, 3);
+                                                }
+                                            } else {
+                                                shape = "reg+?";
+                                                base = clsProv(ops, av,
+                                                    cur, 3);
+                                            }
+                                        } else {
+                                            shape = "reg";
+                                            base = clsProv(ops, av, cur, 3);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if (curOp.mnem.equals("CALL") ||
+                            curOp.mnem.equals("CALLIND")) {
+                            term = "call-return";
+                        } else if (curOp.mnem.equals("MULTIEQUAL")) {
+                            term = "PHI";
+                        }
+                    }
+                }
+            }
+            boolean taken = clsTakenEntries.contains(funcEntry);
+            boolean exported = ksymtabExported != null &&
+                ksymtabExported.contains(funcEntry);
+            boolean inInit = clsInitStart >= 0 &&
+                funcEntry >= clsInitStart && funcEntry <= clsInitEnd;
+            String tierName = tier == TIER_ADDR ? "ADDR" :
+                tier == TIER_TABLE ? "TABLE" :
+                tier == TIER_OFFSET ? "OFFSET" : "NONE";
+            StringBuilder sb = new StringBuilder();
+            sb.append(call.instrAddr).append("\t")
+                .append(isTail ? "BRANCHIND" : "CALLIND").append("\t")
+                .append(call.instrAsm == null ? "?" :
+                    call.instrAsm.replace("\t", " ")).append("\t")
+                .append("term=").append(term).append("\t")
+                .append("copyhops=").append(copyHops).append("\t")
+                .append("loadsize=").append(loadSize).append("\t")
+                .append("shape=").append(shape).append("\t")
+                .append("sec=").append(sec).append("\t")
+                .append("sitesection=").append(
+                    clsSectionName(mem, call.instrAddr.getOffset())).append("\t")
+                .append("base=").append(base).append("\t")
+                .append("resolved=").append(resolved).append("\t")
+                .append("tier=").append(tierName).append("\t")
+                .append("targets=").append(ntargets).append("\t")
+                .append("taken=").append(taken).append("\t")
+                .append("exported=").append(exported).append("\t")
+                .append("init=").append(inInit);
+            clsLines.add(sb.toString());
+            // v65: one raw P-code dump of the first unresolved jalr
+            // site, to settle the delay-slot/COPY question.
+            if (!clsDumpDone && !isTail && !resolved &&
+                call.instrAsm != null &&
+                call.instrAsm.trim().startsWith("jalr")) {
+                clsDumpDone = true;
+                clsDump.add("site=" + call.instrAddr +
+                    " func=0x" + Long.toHexString(funcEntry));
+                int lo = Math.max(0, i - 10);
+                int hi = Math.min(ops.size() - 1, i + 10);
+                for (int k = lo; k <= hi; k++) {
+                    OpRec o = ops.get(k);
+                    StringBuilder db = new StringBuilder();
+                    db.append(k == i ? ">> " : "   ");
+                    db.append(o.instrAddr).append(" ")
+                        .append(o.instrAsm == null ? "?" : o.instrAsm)
+                        .append(" | ").append(o.mnem);
+                    if (o.ins != null) {
+                        for (int q = 0; q < o.ins.length; q++) {
+                            db.append(" in").append(q).append("=")
+                                .append(o.ins[q]);
+                        }
+                    }
+                    if (o.out != null) db.append(" out=").append(o.out);
+                    clsDump.add(db.toString());
+                }
+            }
+        } catch (Exception e) {
+            // classifier never breaks the report
+        }
     }
 
     /** v3.23 item 4: a normalized struct-field address key.
@@ -8127,7 +8535,8 @@ public class ExtractIR extends GhidraScript {
         false, preserving v3.5 behaviour exactly. */
     private PointsToResult recoverPointsTo(List<OpRec> ops, Memory mem,
         FunctionManager fm, Map<Long, Set<String>> byOffset,
-        Map<Long, Set<String>> byAddr, Set<Integer> certainCalls) {
+        Map<Long, Set<String>> byAddr, Set<Integer> certainCalls,
+        long funcEntry) {
         List<String> out = new ArrayList<String>();
         int targets = 0;
         int unresolved = 0;
@@ -8135,8 +8544,11 @@ public class ExtractIR extends GhidraScript {
             OpRec call = ops.get(i);
             if (!call.mnem.equals("CALLIND") || call.ins.length < 1) continue;
             if (certainCalls.contains(i)) continue;
-            Set<String> tset = resolveIndirectSet(ops, mem, fm,
-                byOffset, byAddr, i, false);
+            int[] tierBox = new int[1];
+            Set<String> tset = resolveIndirectSetTier(ops, mem, fm,
+                byOffset, byAddr, i, false, tierBox);
+            clsSite(ops, mem, i, false, funcEntry, tierBox[0],
+                !tset.isEmpty(), tset.size());
             if (tset.isEmpty()) {
                 unresolved++;
             } else {
@@ -8199,8 +8611,11 @@ public class ExtractIR extends GhidraScript {
                 call.ins.length < 1) continue;
             if (resolvedBranchInds.contains(i)) continue;
             if (jumpTableBranchInds.contains(i)) continue;
-            Set<String> tset = resolveIndirectSet(ops, mem, fm,
-                byOffset, byAddr, i, true);
+            int[] tierBox = new int[1];
+            Set<String> tset = resolveIndirectSetTier(ops, mem, fm,
+                byOffset, byAddr, i, true, tierBox);
+            clsSite(ops, mem, i, true, funcStart, tierBox[0],
+                !tset.isEmpty(), tset.size());
             if (!tset.isEmpty()) {
                 List<String> sorted = new ArrayList<String>(tset);
                 java.util.Collections.sort(sorted);
@@ -16099,6 +16514,79 @@ public class ExtractIR extends GhidraScript {
         Map<String, Integer> totalFormCounts =
             new HashMap<String, Integer>();
         int totalTransferCalls = 0;
+        // v65 classifier setup (log-only): section ranges by NAME,
+        // early ksymtab scan (for the exported set), and the
+        // address-taken image scan. All best-effort; failures leave
+        // classifier columns empty, never break the report.
+        try {
+            Memory mem0 = currentProgram.getMemory();
+            for (MemoryBlock blk : mem0.getBlocks()) {
+                if (blk == null) continue;
+                String bn = blk.getName();
+                if (".rodata".equals(bn)) {
+                    clsRodataStart = blk.getStart().getOffset();
+                    clsRodataEnd = blk.getEnd().getOffset();
+                } else if (".init.text".equals(bn)) {
+                    clsInitStart = blk.getStart().getOffset();
+                    clsInitEnd = blk.getEnd().getOffset();
+                }
+            }
+        } catch (Exception e) {
+            // ranges stay -1; columns report "?"
+        }
+        try {
+            ensureKsymtabMap(currentProgram.getMemory());
+        } catch (Exception e) {
+            // exported set stays empty
+        }
+        try {
+            java.util.Set<Long> entries = new HashSet<Long>();
+            FunctionIterator efns =
+                currentProgram.getFunctionManager().getFunctions(true);
+            while (efns.hasNext()) {
+                Function ef = efns.next();
+                if (ef == null || ef.getEntryPoint() == null) continue;
+                entries.add(ef.getEntryPoint().getOffset());
+            }
+            boolean be = currentProgram.getLanguage().isBigEndian();
+            int ps = isa.pointerSize();
+            MemoryBlock[] blks = currentProgram.getMemory().getBlocks();
+            for (int b = 0; b < blks.length; b++) {
+                MemoryBlock blk = blks[b];
+                if (blk == null || !blk.isInitialized()) continue;
+                long bs = blk.getStart().getOffset();
+                long be2 = blk.getEnd().getOffset();
+                if (be2 <= bs || be2 - bs > 64L * 1024L * 1024L) continue;
+                int len = (int) (be2 - bs + 1L);
+                byte[] buf = new byte[len];
+                int got = currentProgram.getMemory().getBytes(
+                    blk.getStart(), buf);
+                if (got < len) continue;
+                for (int o = 0; o + ps <= buf.length; o += ps) {
+                    long wv = 0;
+                    if (be) {
+                        for (int k = 0; k < ps; k++)
+                            wv = (wv << 8) | (buf[o + k] & 0xFFL);
+                    } else {
+                        for (int k = ps - 1; k >= 0; k--)
+                            wv = (wv << 8) | (buf[o + k] & 0xFFL);
+                    }
+                    if (wv == 0) continue;
+                    if (entries.contains(wv)) clsTakenEntries.add(wv);
+                    try {
+                        long st2 = isa.stripInstructionTag(wv);
+                        if (st2 != wv && entries.contains(st2))
+                            clsTakenEntries.add(st2);
+                    } catch (Exception e) {
+                    }
+                }
+            }
+            println("[*] classify: " + clsTakenEntries.size() +
+                " of " + entries.size() +
+                " functions address-taken in image words");
+        } catch (Exception e) {
+            println("[!] classify: address-taken scan failed: " + e);
+        }
         // v3.5 pass 1: function-pointer store map for the whole
         // program, before any function is printed (may-edges need
         // cross-function stores). Best-effort: a failure here only
@@ -19697,7 +20185,7 @@ public class ExtractIR extends GhidraScript {
                 ptCertain.addAll(protoResolved);
                 pt = recoverPointsTo(ops, currentProgram.getMemory(),
                     currentProgram.getFunctionManager(), funcPtrByOffset,
-                    funcPtrByAddr, ptCertain);
+                    funcPtrByAddr, ptCertain, rec.entryKey);
             } catch (Exception e) {
                 pt = new PointsToResult(new ArrayList<String>(), 0, 0);
             }
@@ -20048,6 +20536,117 @@ public class ExtractIR extends GhidraScript {
         w.println("  }");
         w.println("}");
         w.close();
+        // v65 indirect-gap classifier output (log-only): one file
+        // next to the report JSON, plus a stdout summary. Never
+        // touches the JSON.
+        try {
+            String clsPath = outputJson;
+            if (clsPath.endsWith(".json")) {
+                clsPath = clsPath.substring(0, clsPath.length() - 5) +
+                    "_indirect_classifier.txt";
+            } else {
+                clsPath = clsPath + "_indirect_classifier.txt";
+            }
+            PrintWriter cw = new PrintWriter(new FileWriter(clsPath));
+            cw.println("# indirect classifier (v65, log-only)");
+            cw.println("# columns: site op asm term copyhops loadsize shape sec sitesection base resolved tier targets taken exported init");
+            cw.println("# arg = no def in the 40-op findDef window (live-in/parameter); sec = section NAME (flags useless: single RWE PT_LOAD)");
+            cw.println("# rodata_store_check: constant-address stores into .rodata range (any value, not just function pointers)");
+            cw.println("rodata_range=" + (clsRodataStart < 0 ? "none" :
+                "0x" + Long.toHexString(clsRodataStart) +
+                "..0x" + Long.toHexString(clsRodataEnd)));
+            cw.println("init_text_range=" + (clsInitStart < 0 ? "none" :
+                "0x" + Long.toHexString(clsInitStart) +
+                "..0x" + Long.toHexString(clsInitEnd)));
+            cw.println("rodata_store_count=" + clsRodataStoreCount);
+            for (int si = 0; si < clsRodataStoreSamples.size(); si++) {
+                cw.println("rodata_store_sample=" + clsRodataStoreSamples.get(si));
+            }
+            cw.println("ksymtab_exported_count=" +
+                (ksymtabExported == null ? 0 : ksymtabExported.size()));
+            cw.println("address_taken_count=" + clsTakenEntries.size());
+            for (int li = 0; li < clsLines.size(); li++) {
+                cw.println(clsLines.get(li));
+            }
+            // v65 fan-out histogram over resolved sites, written
+            // into the file: bucket the resolved-set size, so a
+            // may-set of a hundred targets cannot hide among
+            // singletons. The OFFSET tier has a tail-edge veto
+            // only -- no call-edge veto -- so this is the check
+            // that decides whether one is needed.
+            int[] buckets = new int[6];
+            int maxSet = 0;
+            for (int li = 0; li < clsLines.size(); li++) {
+                String[] parts = clsLines.get(li).split("\t");
+                String rs = "?";
+                int tg = 0;
+                for (int pi = 0; pi < parts.length; pi++) {
+                    if (parts[pi].startsWith("resolved="))
+                        rs = parts[pi].substring(9);
+                    if (parts[pi].startsWith("targets=")) {
+                        try {
+                            tg = Integer.parseInt(
+                                parts[pi].substring(8));
+                        } catch (Exception e) {
+                            tg = 0;
+                        }
+                    }
+                }
+                if (!"true".equals(rs) || tg <= 0) continue;
+                if (tg > maxSet) maxSet = tg;
+                if (tg == 1) buckets[0]++;
+                else if (tg == 2) buckets[1]++;
+                else if (tg <= 5) buckets[2]++;
+                else if (tg <= 20) buckets[3]++;
+                else if (tg <= 100) buckets[4]++;
+                else buckets[5]++;
+            }
+            cw.println("resolved_set_fanout_max=" + maxSet);
+            cw.println("resolved_set_histogram_1=" + buckets[0]);
+            cw.println("resolved_set_histogram_2=" + buckets[1]);
+            cw.println("resolved_set_histogram_3_5=" + buckets[2]);
+            cw.println("resolved_set_histogram_6_20=" + buckets[3]);
+            cw.println("resolved_set_histogram_21_100=" + buckets[4]);
+            cw.println("resolved_set_histogram_101plus=" + buckets[5]);
+            cw.println("# --- jalr P-code dump (first unresolved jalr CALLIND, if any) ---");
+            if (clsDump.isEmpty()) {
+                cw.println("# (no unresolved jalr site found)");
+            } else {
+                for (int di = 0; di < clsDump.size(); di++) {
+                    cw.println(clsDump.get(di));
+                }
+            }
+            cw.close();
+            java.util.Map<String, Integer> cnt =
+                new java.util.TreeMap<String, Integer>();
+            for (int li = 0; li < clsLines.size(); li++) {
+                String ln = clsLines.get(li);
+                String[] parts = ln.split("\t");
+                String t = "?";
+                String r = "?";
+                for (int pi = 0; pi < parts.length; pi++) {
+                    if (parts[pi].startsWith("term="))
+                        t = parts[pi].substring(5);
+                    if (parts[pi].startsWith("resolved="))
+                        r = parts[pi].substring(9);
+                }
+                String k = t + "/" + r;
+                Integer c = cnt.get(k);
+                cnt.put(k, c == null ? 1 : c.intValue() + 1);
+            }
+            println("[*] classify: wrote " + clsPath +
+                " sites=" + clsLines.size() +
+                " rodata_stores=" + clsRodataStoreCount);
+            for (java.util.Map.Entry<String, Integer> e : cnt.entrySet()) {
+                println("[*] classify: " + e.getKey() + "=" + e.getValue());
+            }
+            println("[*] classify: fan-out max=" + maxSet +
+                " 1=" + buckets[0] + " 2=" + buckets[1] +
+                " 3-5=" + buckets[2] + " 6-20=" + buckets[3] +
+                " 21-100=" + buckets[4] + " 101+=" + buckets[5]);
+        } catch (Exception e) {
+            println("[!] classify: output failed: " + e);
+        }
         println("[*] cfgspace: " + totalBarRel + " bar-relative findings");
         println("[*] persite: extra findings mmio=" +
             persiteExtraMmio + " port=" + persiteExtraPort +
