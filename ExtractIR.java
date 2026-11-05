@@ -7037,10 +7037,11 @@ public class ExtractIR extends GhidraScript {
     }
 
     /** v65 classifier: transitive constant value of a varnode
-        (COPY chains, INT_ADD/INT_SUB of constants, tag-mask
-        INT_AND). The resolver's own const-side check is direct
-        only, so a COPY-of-constant is missed there -- this helper
-        exists so the classifier can see it. */
+        (COPY chains, INT_ADD/INT_SUB of constants, INT_2COMP /
+        INT_NEGATE of a constant, tag-mask INT_AND). The resolver's
+        own const-side check is direct only, so a COPY-of-constant
+        is missed there -- this helper exists so the classifier can
+        see it. */
     private Long clsConstValue(List<OpRec> ops, Varnode v, int pos,
         int depth) {
         if (v == null) return null;
@@ -7058,6 +7059,21 @@ public class ExtractIR extends GhidraScript {
             if (a == null || b == null) return null;
             return dd.mnem.equals("INT_ADD") ? a.longValue() + b.longValue()
                 : a.longValue() - b.longValue();
+        }
+        // v65 AND-unwrap: the MIPS jalr bit-0 clear is INT_AND(value,
+        // INT_2COMP(2)); the mask side is only a constant through
+        // this case (mirrors MipsIsa.maskConst: INT_2COMP -> -const,
+        // INT_NEGATE -> ~const). INT_NEGATE is the RISC-V analogue
+        // (INT_NEGATE(1)). Without this case the classifier's
+        // transitive const resolution stops at the mask and the
+        // AND-unwrap in clsSite can never fire on MIPS.
+        if ((dd.mnem.equals("INT_2COMP") ||
+            dd.mnem.equals("INT_NEGATE")) &&
+            dd.ins.length == 1) {
+            Long a = clsConstValue(ops, dd.ins[0], d, depth - 1);
+            if (a == null) return null;
+            return dd.mnem.equals("INT_2COMP") ? -a.longValue()
+                : ~a.longValue();
         }
         if (dd.mnem.equals("INT_AND") && dd.ins.length == 2) {
             for (int ss = 0; ss < 2; ss++) {
@@ -7113,6 +7129,7 @@ public class ExtractIR extends GhidraScript {
                         }
                         if (curOp.mnem.equals("INT_AND") &&
                             curOp.ins.length == 2) {
+                            boolean unwrapped = false;
                             for (int ss = 0; ss < 2; ss++) {
                                 Varnode vv = curOp.ins[ss];
                                 if (vv.isConstant() &&
@@ -7124,7 +7141,35 @@ public class ExtractIR extends GhidraScript {
                                         cur = du;
                                         curOp = ops.get(cur);
                                     }
+                                    unwrapped = true;
                                     break;
+                                }
+                            }
+                            // v65 AND-unwrap: the MIPS jalr bit-0
+                            // clear is INT_AND(value, INT_2COMP(2));
+                            // the mask is NOT a literal const input,
+                            // so the direct check above misses it.
+                            // Resolve each side transitively; if one
+                            // side folds to a tag mask, follow the
+                            // other side exactly like the direct
+                            // path. Fail-closed: only a value whose
+                            // low 32 bits are 0xFFFFFFFE unwraps.
+                            if (!unwrapped) {
+                                for (int ss = 0; ss < 2; ss++) {
+                                    Long mv = clsConstValue(ops,
+                                        curOp.ins[ss], cur, 4);
+                                    if (mv != null &&
+                                        isa.isInstructionTagMask(
+                                            mv.longValue())) {
+                                        int du = findDef(ops,
+                                            vkey(curOp.ins[1 - ss]),
+                                            cur);
+                                        if (du >= 0) {
+                                            cur = du;
+                                            curOp = ops.get(cur);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -16521,15 +16566,44 @@ public class ExtractIR extends GhidraScript {
         try {
             Memory mem0 = currentProgram.getMemory();
             for (MemoryBlock blk : mem0.getBlocks()) {
-                if (blk == null) continue;
-                String bn = blk.getName();
-                if (".rodata".equals(bn)) {
-                    clsRodataStart = blk.getStart().getOffset();
-                    clsRodataEnd = blk.getEnd().getOffset();
-                } else if (".init.text".equals(bn)) {
-                    clsInitStart = blk.getStart().getOffset();
-                    clsInitEnd = blk.getEnd().getOffset();
+                // v65 AND-unwrap fix 2: one bad block must not abort
+                // the loop (a silent miss here left both ranges none
+                // on the kernel run, making rodata_store_count=0
+                // vacuous with nothing in the log to explain it).
+                try {
+                    if (blk == null) continue;
+                    String bn = blk.getName();
+                    if (".rodata".equals(bn)) {
+                        clsRodataStart = blk.getStart().getOffset();
+                        clsRodataEnd = blk.getEnd().getOffset();
+                    } else if (".init.text".equals(bn)) {
+                        clsInitStart = blk.getStart().getOffset();
+                        clsInitEnd = blk.getEnd().getOffset();
+                    }
+                } catch (Exception e) {
+                    // skip this block, keep scanning
                 }
+            }
+            // Headless-log diagnostic only (NOT into the classifier
+            // file): if a range is still missing, print the real
+            // block names so the next run shows why.
+            if (clsRodataStart < 0 || clsInitStart < 0) {
+                StringBuilder nb = new StringBuilder();
+                nb.append("[*] classify: range missing (rodata=")
+                    .append(clsRodataStart < 0 ? "missing" : "ok")
+                    .append(" init.text=")
+                    .append(clsInitStart < 0 ? "missing" : "ok")
+                    .append(") blocks:");
+                for (MemoryBlock blk : mem0.getBlocks()) {
+                    try {
+                        nb.append(" ")
+                            .append(blk == null ? "<null>" :
+                                blk.getName());
+                    } catch (Exception e) {
+                        nb.append(" <?>");
+                    }
+                }
+                println(nb.toString());
             }
         } catch (Exception e) {
             // ranges stay -1; columns report "?"
