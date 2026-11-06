@@ -524,6 +524,35 @@ public class ExtractIR extends GhidraScript {
     private int clsRodataStoreCount = 0;
     private java.util.List<String> clsRodataStoreSamples =
         new ArrayList<String>();
+    /** v65 step-2: range-found flags. The ranges are signed Java
+        longs; a kernel .rodata start (0xffffffff819bf000) is
+        negative, so the old "< 0 means missing" test reported a
+        correctly-set range as missing. The flags are the only
+        missing-test now; -1L stays the initial value but is never
+        tested as a sentinel. */
+    private boolean clsRodataFound = false;
+    private boolean clsInitFound = false;
+    /** v65 step-2: positive control for the rodata store scan:
+        every STORE whose destination resolves to a constant
+        address, in ANY section. A rodata_store_count of 0 is
+        only meaningful next to a non-zero total. */
+    private int clsConstAddrStoreTotal = 0;
+    /** v65 step-2: tier=ADDR diagnostic sites (address, section,
+        value) recorded in clsSite; printed in the header. */
+    private java.util.List<String> clsAddrSites =
+        new ArrayList<String>();
+    /** v65 step-2: INT_AND mask histogram over terminal INT_AND
+        sites (mask hex -> count; "unresolved" when neither side
+        folds to a constant), plus per-site lines for masks that
+        are neither the jalr mask nor unresolved (cap 20). */
+    private java.util.Map<String, Integer> clsIntAndMaskHist =
+        new java.util.TreeMap<String, Integer>();
+    private java.util.List<String> clsIntAndMaskSites =
+        new ArrayList<String>();
+    /** v65 step-2: exported-entry counts per ksymtab table, to
+        prove both __ksymtab and __ksymtab_gpl contribute. */
+    private int clsExportedKsymtab = 0;
+    private int clsExportedKsymtabGpl = 0;
     private java.util.Set<Long> clsTakenEntries =
         new HashSet<Long>();
     private java.util.List<String> clsLines =
@@ -624,6 +653,18 @@ public class ExtractIR extends GhidraScript {
             }
             for (int b = 0; b < by.size(); b++) {
                 byte[] buf = by.get(b);
+                // v65 step-2: the table this entry lives in, so the
+                // header can prove BOTH __ksymtab and __ksymtab_gpl
+                // contribute to the exported set (the scan covers
+                // all blocks, no name filter -- the counts are the
+                // evidence, not an assumption).
+                String tblName = null;
+                try {
+                    MemoryBlock tb = bl.get(b);
+                    tblName = tb == null ? null : tb.getName();
+                } catch (Exception e) {
+                    tblName = null;
+                }
                 for (int i = 0; i + 24 <= buf.length; i += 8) {
                     long value = ksymtabU64(buf, i, bigEndian);
                     long namePtr = ksymtabU64(buf, i + 8, bigEndian);
@@ -654,13 +695,28 @@ public class ExtractIR extends GhidraScript {
                     // metadata block), so neither condition alone is
                     // enough. The family map below is unchanged
                     // (same gates, same entries as v3.31).
-                    if (ksymtabIsIdent(nm) && isFuncEntry(value))
-                        ksymtabExported.add(value);
+                    if (ksymtabIsIdent(nm) && isFuncEntry(value)) {
+                        // Set.add returns true only when the set
+                        // grew, so a value exported twice is
+                        // counted once per table, not per add.
+                        if (ksymtabExported.add(value)) {
+                            if ("__ksymtab".equals(tblName))
+                                clsExportedKsymtab++;
+                            else if ("__ksymtab_gpl".equals(tblName))
+                                clsExportedKsymtabGpl++;
+                        }
+                    }
                     try {
                         long stripped = isa.stripInstructionTag(value);
                         if (stripped != value &&
-                            ksymtabIsIdent(nm) && isFuncEntry(stripped))
-                            ksymtabExported.add(stripped);
+                            ksymtabIsIdent(nm) && isFuncEntry(stripped)) {
+                            if (ksymtabExported.add(stripped)) {
+                                if ("__ksymtab".equals(tblName))
+                                    clsExportedKsymtab++;
+                                else if ("__ksymtab_gpl".equals(tblName))
+                                    clsExportedKsymtabGpl++;
+                            }
+                        }
                     } catch (Exception e) {
                     }
                     if (!ksymtabIsFamilyName(nm)) continue;
@@ -6650,7 +6706,10 @@ public class ExtractIR extends GhidraScript {
             } else {
                 destAddr = resolveValue(a, ops, mem, i, 4);
             }
-            if (destAddr != null && clsRodataStart >= 0 &&
+            // v65 step-2 positive control: every STORE with a
+            // constant destination, any section.
+            if (destAddr != null) clsConstAddrStoreTotal++;
+            if (destAddr != null && clsRodataFound &&
                 destAddr.longValue() >= clsRodataStart &&
                 destAddr.longValue() <= clsRodataEnd) {
                 clsRodataStoreCount++;
@@ -7008,11 +7067,22 @@ public class ExtractIR extends GhidraScript {
         parameter, NOT proven to be an argument); call = def is a
         CALL/CALLIND; load[...] = def is a LOAD (sp when the load
         address is stack-derived); const = a constant; ? = other. */
+    /** v65 classifier: one-line provenance for a base varnode.
+        step-2 vocabulary: arg = no def in the 40-op findDef window
+        (a live-in or a parameter, NOT proven to be an argument);
+        call-return = def is a CALL/CALLIND; load[...] = def is a
+        LOAD (sp when the load address is stack-derived; nesting
+        shows depth, e.g. load[load[global]] is depth 2); sp = the
+        stack pointer or a stack LOAD; global = a constant address;
+        unknown = anything else, including INT_ADD/INT_SUB
+        arithmetic that does not fold (the old "arith") and the old
+        "?". Transparent ops (COPY, OR/ADD with const 0, SUB with
+        const-0 subtrahend, SEXT/ZEXT) are followed through. */
     private String clsProv(List<OpRec> ops, Varnode v, int pos,
         int depth) {
-        if (v == null) return "?";
-        if (v.isConstant()) return "const";
-        if (depth <= 0) return "?";
+        if (v == null) return "unknown";
+        if (v.isConstant()) return "global";
+        if (depth <= 0) return "unknown";
         int d = findDef(ops, vkey(v), pos);
         if (d < 0) {
             if (memSpOff >= 0 && v.getAddress() != null) {
@@ -7025,15 +7095,14 @@ public class ExtractIR extends GhidraScript {
         }
         OpRec dd = ops.get(d);
         if (dd.mnem.equals("CALL") || dd.mnem.equals("CALLIND"))
-            return "call";
+            return "call-return";
         if (dd.mnem.equals("LOAD"))
             return dd.addrIsStack ? "sp"
                 : "load[" + clsProv(ops, dd.ins[1], d, depth - 1) + "]";
-        if (dd.mnem.equals("COPY") && dd.ins.length == 1)
-            return clsProv(ops, dd.ins[0], d, depth - 1);
-        if (dd.mnem.equals("INT_ADD") || dd.mnem.equals("INT_SUB"))
-            return "arith";
-        return "?";
+        Varnode nx = clsTransparentNext(dd, ops, d);
+        if (nx != null)
+            return clsProv(ops, nx, d, depth - 1);
+        return "unknown";
     }
 
     /** v65 classifier: transitive constant value of a varnode
@@ -7075,6 +7144,38 @@ public class ExtractIR extends GhidraScript {
             return dd.mnem.equals("INT_2COMP") ? -a.longValue()
                 : ~a.longValue();
         }
+        // v65 step-2 peel: lui (INT_LEFT of constants), single-input
+        // extensions, and OR with const 0 (MIPS "move" is
+        // or rd,rs,$zero). INT_ADD/INT_SUB with const 0 need no
+        // branch: the both-const case above already folds them.
+        if (dd.mnem.equals("INT_LEFT") && dd.ins.length == 2) {
+            Long lv = clsConstValue(ops, dd.ins[0], d, depth - 1);
+            Long s = clsConstValue(ops, dd.ins[1], d, depth - 1);
+            if (lv == null || s == null) return null;
+            long sh = s.longValue();
+            if (sh < 0 || sh >= 64) return null;
+            return lv.longValue() << sh;
+        }
+        if ((dd.mnem.equals("INT_SEXT") ||
+            dd.mnem.equals("INT_ZEXT")) && dd.ins.length == 1) {
+            Long lv = clsConstValue(ops, dd.ins[0], d, depth - 1);
+            if (lv == null) return null;
+            int bits = 8 * dd.ins[0].getSize();
+            if (bits >= 64) return lv.longValue();
+            long lowMask = (1L << bits) - 1L;
+            if (dd.mnem.equals("INT_SEXT") &&
+                ((lv.longValue() >> (bits - 1)) & 1L) != 0) {
+                return lv.longValue() | ~lowMask;
+            }
+            return lv.longValue() & lowMask;
+        }
+        if (dd.mnem.equals("INT_OR") && dd.ins.length == 2) {
+            Long a = clsConstValue(ops, dd.ins[0], d, depth - 1);
+            Long b = clsConstValue(ops, dd.ins[1], d, depth - 1);
+            if (a != null && a.longValue() == 0L) return b;
+            if (b != null && b.longValue() == 0L) return a;
+            return null;
+        }
         if (dd.mnem.equals("INT_AND") && dd.ins.length == 2) {
             for (int ss = 0; ss < 2; ss++) {
                 Varnode vv = dd.ins[ss];
@@ -7085,6 +7186,64 @@ public class ExtractIR extends GhidraScript {
             }
         }
         return null;
+    }
+
+    /** v65 step-2: the next varnode when following through one
+        transparent op, or null when the op is not transparent.
+        Transparent = COPY, INT_OR/INT_ADD with a side folding to
+        const 0, INT_SUB with the subtrahend folding to const 0,
+        INT_SEXT, INT_ZEXT. (INT_SUB with a const-0 minuend is
+        negation, NOT transparent.) The 0-tests use clsConstValue,
+        so they are transitive, not literal-only. */
+    private Varnode clsTransparentNext(OpRec d, List<OpRec> ops,
+        int defIdx) {
+        if (d == null) return null;
+        if (d.mnem.equals("COPY") && d.ins.length == 1)
+            return d.ins[0];
+        if ((d.mnem.equals("INT_SEXT") ||
+            d.mnem.equals("INT_ZEXT")) && d.ins.length == 1)
+            return d.ins[0];
+        if ((d.mnem.equals("INT_OR") || d.mnem.equals("INT_ADD")) &&
+            d.ins.length == 2) {
+            Long c0 = clsConstValue(ops, d.ins[0], defIdx, 4);
+            Long c1 = clsConstValue(ops, d.ins[1], defIdx, 4);
+            if (c0 != null && c0.longValue() == 0L) return d.ins[1];
+            if (c1 != null && c1.longValue() == 0L) return d.ins[0];
+            return null;
+        }
+        if (d.mnem.equals("INT_SUB") && d.ins.length == 2) {
+            Long c1 = clsConstValue(ops, d.ins[1], defIdx, 4);
+            if (c1 != null && c1.longValue() == 0L) return d.ins[0];
+            return null;
+        }
+        return null;
+    }
+
+    /** v65 step-2: follow a def chain through transparent ops and
+        return the index of the first NON-transparent def, or the
+        index passed in when it is already non-transparent, or -1
+        when no def is found. Every step uses findDef -- the LATEST
+        def in op-sequence order before the use -- so a varnode
+        defined twice (unique:0x180 = COPY const 0, then COPY
+        computed, in one instruction) resolves to the latest def
+        before the use, never "last def in the function" (hazard
+        811373ac: move t9,s6 precedes ld s6,0x38(sp)). findDef
+        already implements this order; this helper only adds the
+        transparent-op following on top of it. */
+    private int clsPeelDef(List<OpRec> ops, Varnode v, int pos,
+        int maxHops) {
+        if (v == null || v.isConstant()) return -1;
+        int cur = findDef(ops, vkey(v), pos);
+        for (int hop = 0; hop < maxHops && cur >= 0; hop++) {
+            OpRec d = ops.get(cur);
+            Varnode nx = clsTransparentNext(d, ops, cur);
+            if (nx == null) break;
+            if (nx.isConstant()) break;
+            int nu = findDef(ops, vkey(nx), cur);
+            if (nu < 0) break;
+            cur = nu;
+        }
+        return cur;
     }
 
     /** v65: classify ONE indirect site (CALLIND or BRANCHIND) for
@@ -7101,14 +7260,24 @@ public class ExtractIR extends GhidraScript {
             String term = "?";
             int copyHops = 0;
             int loadSize = 0;
-            String shape = "?";
+            // v65 step-2: shape reg+const / reg+reg / unknown
+            // (the old reg+? / ? are gone); base arg / load[...] /
+            // call-return / sp / global / unknown (the old arith /
+            // ? are gone). sp-reload keeps its meaning: a LOAD
+            // whose address is stack-derived, base=sp.
+            String shape = "unknown";
             String sec = "?";
-            String base = "?";
+            String base = "unknown";
+            // v65 step-2: tier=ADDR diagnostic address, set only
+            // where the classifier itself resolves a constant
+            // address (direct const target, or a LOAD below).
+            Long addrDiag = null;
             if (tgt != null) {
                 if (tgt.isConstant()) {
                     term = "const";
                     shape = "const";
                     sec = clsSectionName(mem, tgt.getOffset());
+                    addrDiag = tgt.getOffset();
                 } else {
                     int d = findDef(ops, vkey(tgt), i);
                     if (d < 0) {
@@ -7116,51 +7285,33 @@ public class ExtractIR extends GhidraScript {
                     } else {
                         int cur = d;
                         OpRec curOp = ops.get(d);
+                        // v65 step-2: one transparent-chain loop.
+                        // Each step follows COPY, INT_OR/INT_ADD
+                        // with const 0, INT_SUB with const-0
+                        // subtrahend, INT_SEXT, INT_ZEXT, or the
+                        // jalr/jr tag-mask INT_AND (direct const,
+                        // then transitive via clsConstValue).
+                        // Every step uses findDef -- the LATEST def
+                        // in op-sequence order before the use -- so
+                        // a varnode defined twice resolves to the
+                        // latest def before the use, never "last def
+                        // in the function" (hazard 811373ac: move
+                        // t9,s6 precedes ld s6,0x38(sp)).
+                        // copyHops counts transparent (non-AND)
+                        // hops; the AND unwrap is a mask strip,
+                        // not a copy, and is not counted.
                         for (int hop = 0; hop < 8; hop++) {
-                            if (!curOp.mnem.equals("COPY") ||
-                                curOp.ins.length != 1 ||
-                                curOp.ins[0].isConstant()) break;
-                            int du = findDef(ops,
-                                vkey(curOp.ins[0]), cur);
-                            if (du < 0) break;
-                            copyHops++;
-                            cur = du;
-                            curOp = ops.get(cur);
-                        }
-                        if (curOp.mnem.equals("INT_AND") &&
-                            curOp.ins.length == 2) {
-                            boolean unwrapped = false;
-                            for (int ss = 0; ss < 2; ss++) {
-                                Varnode vv = curOp.ins[ss];
-                                if (vv.isConstant() &&
-                                    isa.isInstructionTagMask(
-                                        vv.getOffset())) {
-                                    int du = findDef(ops,
-                                        vkey(curOp.ins[1 - ss]), cur);
-                                    if (du >= 0) {
-                                        cur = du;
-                                        curOp = ops.get(cur);
-                                    }
-                                    unwrapped = true;
-                                    break;
-                                }
-                            }
-                            // v65 AND-unwrap: the MIPS jalr bit-0
-                            // clear is INT_AND(value, INT_2COMP(2));
-                            // the mask is NOT a literal const input,
-                            // so the direct check above misses it.
-                            // Resolve each side transitively; if one
-                            // side folds to a tag mask, follow the
-                            // other side exactly like the direct
-                            // path. Fail-closed: only a value whose
-                            // low 32 bits are 0xFFFFFFFE unwraps.
-                            if (!unwrapped) {
+                            // AND unwrap (tag mask): direct, then
+                            // transitive. Fires at most once per
+                            // hop; the loop then continues past it.
+                            if (curOp.mnem.equals("INT_AND") &&
+                                curOp.ins.length == 2) {
+                                boolean unwrapped = false;
                                 for (int ss = 0; ss < 2; ss++) {
-                                    Long mv = clsConstValue(ops,
-                                        curOp.ins[ss], cur, 4);
-                                    if (mv != null &&
+                                    Varnode vv = curOp.ins[ss];
+                                    if (vv.isConstant() &&
                                         isa.isInstructionTagMask(
-                                            mv.longValue())) {
+                                            vv.getOffset())) {
                                         int du = findDef(ops,
                                             vkey(curOp.ins[1 - ss]),
                                             cur);
@@ -7168,9 +7319,114 @@ public class ExtractIR extends GhidraScript {
                                             cur = du;
                                             curOp = ops.get(cur);
                                         }
+                                        unwrapped = true;
                                         break;
                                     }
                                 }
+                                // v65 AND-unwrap: the MIPS jalr
+                                // bit-0 clear is INT_AND(value,
+                                // INT_2COMP(2)); the mask is NOT a
+                                // literal const input, so the direct
+                                // check above misses it. Resolve
+                                // each side transitively; if one
+                                // side folds to a tag mask, follow
+                                // the other side exactly like the
+                                // direct path. Fail-closed: only a
+                                // value whose low 32 bits are
+                                // 0xFFFFFFFE unwraps.
+                                if (!unwrapped) {
+                                    for (int ss = 0; ss < 2; ss++) {
+                                        Long mv = clsConstValue(ops,
+                                            curOp.ins[ss], cur, 4);
+                                        if (mv != null &&
+                                            isa.isInstructionTagMask(
+                                                mv.longValue())) {
+                                            int du = findDef(ops,
+                                                vkey(curOp.ins[1 - ss]),
+                                                cur);
+                                            if (du >= 0) {
+                                                cur = du;
+                                                curOp = ops.get(cur);
+                                            }
+                                            unwrapped = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (unwrapped) continue;
+                                break;
+                            }
+                            Varnode nx = clsTransparentNext(curOp,
+                                ops, cur);
+                            if (nx == null) break;
+                            if (nx.isConstant()) break;
+                            int du = findDef(ops, vkey(nx), cur);
+                            if (du < 0) break;
+                            copyHops++;
+                            cur = du;
+                            curOp = ops.get(cur);
+                        }
+                        // v65 step-2: terminal INT_AND mask log.
+                        // The unwrap above did not fire, so neither
+                        // side folded to a tag mask AND had a
+                        // followable def. Record what DID fold: the
+                        // mask itself when a side folds to a tag
+                        // mask (the common jalr case -- the value
+                        // side then has no def in the window), or
+                        // the VALUE side when only it folds (e.g. a
+                        // constant function address) and the mask
+                        // itself did not fold. The two are labelled
+                        // differently -- a value is not a mask.
+                        if (curOp.mnem.equals("INT_AND") &&
+                            curOp.ins.length == 2) {
+                            String maskKey = "unresolved";
+                            String valueKey = null;
+                            for (int ss = 0; ss < 2; ss++) {
+                                Long mv = clsConstValue(ops,
+                                    curOp.ins[ss], cur, 4);
+                                if (mv == null) continue;
+                                // A folded constant is the MASK when
+                                // it is the ISA's tag mask, or when
+                                // it is mask-shaped (high 1s, low 0s
+                                // -- e.g. -2, the jalr bit-0 clear,
+                                // which the RISC-V ISA does not
+                                // report as a tag mask even though
+                                // the AND is the same operation).
+                                // Anything else that folds is the
+                                // VALUE side (e.g. a constant
+                                // function address), labelled so.
+                                long mvv = mv.longValue();
+                                boolean isMask =
+                                    isa.isInstructionTagMask(mvv) ||
+                                    (mvv < 0 &&
+                                        ((~mvv & (~mvv + 1L)) == 0L));
+                                if (isMask) {
+                                    maskKey = "0x" +
+                                        Long.toHexString(mvv);
+                                    break;
+                                }
+                                if (valueKey == null) {
+                                    valueKey = "value=0x" +
+                                        Long.toHexString(mvv);
+                                }
+                            }
+                            if (maskKey.equals("unresolved") &&
+                                valueKey != null) {
+                                maskKey = valueKey;
+                            }
+                            Integer mc =
+                                clsIntAndMaskHist.get(maskKey);
+                            clsIntAndMaskHist.put(maskKey,
+                                mc == null ? 1 : mc.intValue() + 1);
+                            if (!maskKey.equals("unresolved") &&
+                                !maskKey.equals(
+                                    "0xfffffffffffffffe") &&
+                                clsIntAndMaskSites.size() < 20) {
+                                clsIntAndMaskSites.add(
+                                    call.instrAddr + " " +
+                                    (maskKey.startsWith("value=") ?
+                                        maskKey :
+                                        "mask=" + maskKey));
                             }
                         }
                         term = curOp.mnem;
@@ -7187,6 +7443,7 @@ public class ExtractIR extends GhidraScript {
                                     shape = "const";
                                     sec = clsSectionName(mem,
                                         av.getOffset());
+                                    addrDiag = av.getOffset();
                                 } else {
                                     Long a = resolveValue(av, ops, mem,
                                         cur, 4);
@@ -7194,9 +7451,15 @@ public class ExtractIR extends GhidraScript {
                                         shape = "const";
                                         sec = clsSectionName(mem,
                                             a.longValue());
+                                        addrDiag = a;
                                     } else {
-                                        int da = findDef(ops,
-                                            vkey(av), cur);
+                                        // v65 step-2: peel the address
+                                        // def through transparent ops
+                                        // (COPY of an INT_ADD, etc.)
+                                        // so the INT_ADD branch below
+                                        // sees the real op, not a COPY.
+                                        int da = clsPeelDef(ops, av,
+                                            cur, 8);
                                         if (da >= 0) {
                                             OpRec ad = ops.get(da);
                                             if (ad.mnem.equals("INT_ADD") &&
@@ -7223,6 +7486,8 @@ public class ExtractIR extends GhidraScript {
                                                     sec = clsSectionName(mem,
                                                         c0.longValue() +
                                                         c1.longValue());
+                                                    addrDiag = c0.longValue() +
+                                                        c1.longValue();
                                                 } else if (regSide != null) {
                                                     int dr = findDef(ops,
                                                         vkey(regSide), da);
@@ -7249,17 +7514,17 @@ public class ExtractIR extends GhidraScript {
                                                     base = clsProv(ops,
                                                         regSide, da, 3);
                                                 } else {
-                                                    shape = "reg+?";
+                                                    shape = "unknown";
                                                     base = clsProv(ops, av,
                                                         cur, 3);
                                                 }
                                             } else {
-                                                shape = "reg+?";
+                                                shape = "unknown";
                                                 base = clsProv(ops, av,
                                                     cur, 3);
                                             }
                                         } else {
-                                            shape = "reg";
+                                            shape = "unknown";
                                             base = clsProv(ops, av, cur, 3);
                                         }
                                     }
@@ -7274,11 +7539,60 @@ public class ExtractIR extends GhidraScript {
                     }
                 }
             }
+            // v65 step-2: tier=ADDR diagnostic. The tier is the
+            // resolver's (unchanged); this only prints the address,
+            // section and value the resolver resolved, so the 4 ADDR
+            // sites on the kernel can be checked by hand. addrDiag
+            // is set only where the classifier itself resolved a
+            // constant address above.
+            if (tier == TIER_ADDR) {
+                if (addrDiag != null) {
+                    long av2 = addrDiag.longValue();
+                    String asec =
+                        clsSectionName(mem, av2);
+                    Long aval = null;
+                    try {
+                        aval = Long.valueOf(
+                            isa.readPointer(mem,
+                                toAddr(av2)));
+                    } catch (Exception e) {
+                        aval = null;
+                    }
+                    boolean isFunc = false;
+                    if (aval != null) {
+                        try {
+                            isFunc = isFuncEntry(
+                                aval.longValue());
+                        } catch (Exception e) {
+                            isFunc = false;
+                        }
+                    }
+                    clsAddrSites.add(
+                        call.instrAddr + "\t" +
+                        (isTail ? "BRANCHIND" : "CALLIND") +
+                        "\tload_addr=0x" +
+                        Long.toHexString(av2) +
+                        "\tsection=" + asec +
+                        "\tvalue=" + (aval == null ? "?" :
+                            "0x" + Long.toHexString(
+                                aval.longValue())) +
+                        "\tis_func=" + isFunc);
+                } else {
+                    clsAddrSites.add(
+                        call.instrAddr + "\t" +
+                        (isTail ? "BRANCHIND" : "CALLIND") +
+                        "\tload_addr=?\tsection=?\tvalue=?" +
+                        "\t(classifier did not resolve)");
+                }
+            }
             boolean taken = clsTakenEntries.contains(funcEntry);
             boolean exported = ksymtabExported != null &&
                 ksymtabExported.contains(funcEntry);
-            boolean inInit = clsInitStart >= 0 &&
-                funcEntry >= clsInitStart && funcEntry <= clsInitEnd;
+            // v65 step-2: init flag by section NAME, not by the
+            // range (the range is a signed long; the name is
+            // direct and immune to the sign bug).
+            boolean inInit =
+                ".init.text".equals(clsSectionName(mem, funcEntry));
             String tierName = tier == TIER_ADDR ? "ADDR" :
                 tier == TIER_TABLE ? "TABLE" :
                 tier == TIER_OFFSET ? "OFFSET" : "NONE";
@@ -16576,9 +16890,11 @@ public class ExtractIR extends GhidraScript {
                     if (".rodata".equals(bn)) {
                         clsRodataStart = blk.getStart().getOffset();
                         clsRodataEnd = blk.getEnd().getOffset();
+                        clsRodataFound = true;
                     } else if (".init.text".equals(bn)) {
                         clsInitStart = blk.getStart().getOffset();
                         clsInitEnd = blk.getEnd().getOffset();
+                        clsInitFound = true;
                     }
                 } catch (Exception e) {
                     // skip this block, keep scanning
@@ -16587,12 +16903,16 @@ public class ExtractIR extends GhidraScript {
             // Headless-log diagnostic only (NOT into the classifier
             // file): if a range is still missing, print the real
             // block names so the next run shows why.
-            if (clsRodataStart < 0 || clsInitStart < 0) {
+            // v65 step-2: the missing-test is the found-flag,
+            // NOT "< 0". A kernel .rodata start is
+            // 0xffffffff819bf000, a negative signed long, so the
+            // old test reported a correctly-set range as missing.
+            if (!clsRodataFound || !clsInitFound) {
                 StringBuilder nb = new StringBuilder();
                 nb.append("[*] classify: range missing (rodata=")
-                    .append(clsRodataStart < 0 ? "missing" : "ok")
+                    .append(!clsRodataFound ? "missing" : "ok")
                     .append(" init.text=")
-                    .append(clsInitStart < 0 ? "missing" : "ok")
+                    .append(!clsInitFound ? "missing" : "ok")
                     .append(") blocks:");
                 for (MemoryBlock blk : mem0.getBlocks()) {
                     try {
@@ -20625,20 +20945,63 @@ public class ExtractIR extends GhidraScript {
             cw.println("# indirect classifier (v65, log-only)");
             cw.println("# columns: site op asm term copyhops loadsize shape sec sitesection base resolved tier targets taken exported init");
             cw.println("# arg = no def in the 40-op findDef window (live-in/parameter); sec = section NAME (flags useless: single RWE PT_LOAD)");
+            cw.println("# step-2: shape reg+const/reg+reg/unknown (sp-reload kept); base arg/load[...]/call-return/sp/global/unknown; copyhops counts transparent peels (COPY, OR/ADD x,0, SUB x,0, SEXT/ZEXT)");
             cw.println("# rodata_store_check: constant-address stores into .rodata range (any value, not just function pointers)");
-            cw.println("rodata_range=" + (clsRodataStart < 0 ? "none" :
+            // v65 step-2: the missing-test is the found-flag, NOT
+            // "< 0" (a kernel .rodata start is a negative signed
+            // long, so the old test reported a set range as none).
+            cw.println("rodata_range=" + (!clsRodataFound ? "none" :
                 "0x" + Long.toHexString(clsRodataStart) +
                 "..0x" + Long.toHexString(clsRodataEnd)));
-            cw.println("init_text_range=" + (clsInitStart < 0 ? "none" :
+            cw.println("init_text_range=" + (!clsInitFound ? "none" :
                 "0x" + Long.toHexString(clsInitStart) +
                 "..0x" + Long.toHexString(clsInitEnd)));
             cw.println("rodata_store_count=" + clsRodataStoreCount);
             for (int si = 0; si < clsRodataStoreSamples.size(); si++) {
                 cw.println("rodata_store_sample=" + clsRodataStoreSamples.get(si));
             }
+            // v65 step-2 positive control: const-address stores in
+            // ANY section. A rodata_store_count of 0 is only
+            // meaningful next to a non-zero total.
+            cw.println("const_addr_store_total=" + clsConstAddrStoreTotal);
             cw.println("ksymtab_exported_count=" +
                 (ksymtabExported == null ? 0 : ksymtabExported.size()));
+            // v65 step-2: exported entries per ksymtab table
+            // (proves both __ksymtab and __ksymtab_gpl
+            // contribute; the two may sum below the total when an
+            // entry validated in another block).
+            cw.println("ksymtab_exported_ksymtab=" + clsExportedKsymtab);
+            cw.println("ksymtab_exported_ksymtab_gpl=" + clsExportedKsymtabGpl);
             cw.println("address_taken_count=" + clsTakenEntries.size());
+            // v65 step-2: tier=ADDR diagnostic sites (address,
+            // section, value). "(none)" when the resolver produced
+            // no ADDR site, so absence is explicit.
+            if (clsAddrSites.isEmpty()) {
+                cw.println("# addr_sites: (none)");
+            } else {
+                for (int ai = 0; ai < clsAddrSites.size(); ai++) {
+                    cw.println("addr_site=" + clsAddrSites.get(ai));
+                }
+            }
+            // v65 step-2: INT_AND mask histogram over terminal
+            // INT_AND sites.
+            {
+                StringBuilder hb = new StringBuilder();
+                hb.append("int_and_mask_histogram=");
+                boolean firstH = true;
+                for (java.util.Map.Entry<String, Integer> e :
+                    clsIntAndMaskHist.entrySet()) {
+                    if (!firstH) hb.append(",");
+                    firstH = false;
+                    hb.append(e.getKey()).append("=")
+                        .append(e.getValue());
+                }
+                cw.println(hb.toString());
+            }
+            for (int mi = 0; mi < clsIntAndMaskSites.size(); mi++) {
+                cw.println("int_and_mask_site=" +
+                    clsIntAndMaskSites.get(mi));
+            }
             for (int li = 0; li < clsLines.size(); li++) {
                 cw.println(clsLines.get(li));
             }
@@ -20710,7 +21073,9 @@ public class ExtractIR extends GhidraScript {
             }
             println("[*] classify: wrote " + clsPath +
                 " sites=" + clsLines.size() +
-                " rodata_stores=" + clsRodataStoreCount);
+                " rodata_stores=" + clsRodataStoreCount +
+                " const_addr_stores=" + clsConstAddrStoreTotal +
+                " addr_sites=" + clsAddrSites.size());
             for (java.util.Map.Entry<String, Integer> e : cnt.entrySet()) {
                 println("[*] classify: " + e.getKey() + "=" + e.getValue());
             }
