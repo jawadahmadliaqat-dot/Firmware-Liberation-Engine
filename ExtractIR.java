@@ -6751,7 +6751,10 @@ public class ExtractIR extends GhidraScript {
                 // offset map) never saw it -- that hid the DP init
                 // stores (write_no_check, dp_read, ...) from every
                 // may-set even though the stores were recorded.
-                int da = findDef(ops, vkey(a), i);
+                // v65 resolver-side peel (step-3): same peel as
+                // the tier path -- the store address's def may be
+                // a COPY of the INT_ADD result.
+                int da = resPeelDef(ops, mem, a, i, 20);
                 if (da >= 0) {
                     OpRec ad = ops.get(da);
                     if (ad.mnem.equals("INT_ADD") &&
@@ -6760,6 +6763,29 @@ public class ExtractIR extends GhidraScript {
                             if (ad.ins[s].isConstant()) {
                                 putStore(byOffset,
                                     ad.ins[s].getOffset(), funcName);
+                                break;
+                            }
+                        }
+                    }
+                }
+                // v65 resolver-peel fix: ALSO record under the
+                // direct-def key (old behavior). The peel alone
+                // re-keys a store through INT_ADD(INT_ADD(base,
+                // C), 0) from 0 to C, orphaning offset-0 loads
+                // that fall back to key 0. Recording both keys
+                // makes the new may-sets a superset of the old
+                // ones: no old edge can be lost, all new gains
+                // are kept. (putStore targets a Set, so recording
+                // the same key twice is harmless.)
+                int dd = findDef(ops, vkey(a), i);
+                if (dd >= 0) {
+                    OpRec ddOp = ops.get(dd);
+                    if (ddOp.mnem.equals("INT_ADD") &&
+                        ddOp.ins.length == 2) {
+                        for (int s = 0; s < 2; s++) {
+                            if (ddOp.ins[s].isConstant()) {
+                                putStore(byOffset,
+                                    ddOp.ins[s].getOffset(), funcName);
                                 break;
                             }
                         }
@@ -6820,6 +6846,37 @@ public class ExtractIR extends GhidraScript {
             }
             return null;
         }
+        // v65 resolver-side peel (step-3): INT_SEXT / INT_LEFT /
+        // INT_2COMP of folded constants. SEXT sign-extends from
+        // the INPUT size (lui+daddiu assembles 64-bit addresses
+        // as INT_LEFT + INT_SEXT + COPY through unique
+        // temporaries); returning the input const unchanged
+        // would drop the high bits (0x81b60000 instead of
+        // 0xffffffff81b60000) and mis-resolve the address.
+        // INT_2COMP folds the jalr tag mask (-2), so the
+        // INT_AND-mask peel in resTransparentNext can test it.
+        // Fail-closed: any side that does not fold -> null.
+        if (dd.mnem.equals("INT_SEXT") && dd.ins.length == 1) {
+            Long a = resolveValue(dd.ins[0], ops, mem, d, depth - 1);
+            if (a == null) return null;
+            int inSize = dd.ins[0].getSize();
+            if (inSize < 1 || inSize > 8) return null;
+            int shift = 64 - inSize * 8;
+            return (a.longValue() << shift) >> shift;
+        }
+        if (dd.mnem.equals("INT_LEFT") && dd.ins.length == 2) {
+            Long a = resolveValue(dd.ins[0], ops, mem, d, depth - 1);
+            Long b = resolveValue(dd.ins[1], ops, mem, d, depth - 1);
+            if (a == null || b == null) return null;
+            if (b.longValue() < 0L || b.longValue() >= 64L)
+                return null;
+            return a.longValue() << b.longValue();
+        }
+        if (dd.mnem.equals("INT_2COMP") && dd.ins.length == 1) {
+            Long a = resolveValue(dd.ins[0], ops, mem, d, depth - 1);
+            if (a == null) return null;
+            return -a.longValue();
+        }
         if (dd.mnem.equals("LOAD") && dd.ins.length >= 2) {
             Long a = resolveValue(dd.ins[1], ops, mem, d, depth - 1);
             if (a == null) return null;
@@ -6866,6 +6923,35 @@ public class ExtractIR extends GhidraScript {
             }
             return null;
         }
+        // v65 resolver-side peel (step-3): mirror of the
+        // INT_SEXT / INT_LEFT / INT_2COMP cases in resolveValue
+        // (see the comment there); Wide stays identical except
+        // findDefWide, as documented.
+        if (dd.mnem.equals("INT_SEXT") && dd.ins.length == 1) {
+            Long a = resolveValueWide(dd.ins[0], ops, mem, d,
+                depth - 1);
+            if (a == null) return null;
+            int inSize = dd.ins[0].getSize();
+            if (inSize < 1 || inSize > 8) return null;
+            int shift = 64 - inSize * 8;
+            return (a.longValue() << shift) >> shift;
+        }
+        if (dd.mnem.equals("INT_LEFT") && dd.ins.length == 2) {
+            Long a = resolveValueWide(dd.ins[0], ops, mem, d,
+                depth - 1);
+            Long b = resolveValueWide(dd.ins[1], ops, mem, d,
+                depth - 1);
+            if (a == null || b == null) return null;
+            if (b.longValue() < 0L || b.longValue() >= 64L)
+                return null;
+            return a.longValue() << b.longValue();
+        }
+        if (dd.mnem.equals("INT_2COMP") && dd.ins.length == 1) {
+            Long a = resolveValueWide(dd.ins[0], ops, mem, d,
+                depth - 1);
+            if (a == null) return null;
+            return -a.longValue();
+        }
         if (dd.mnem.equals("LOAD") && dd.ins.length >= 2) {
             Long a = resolveValueWide(dd.ins[1], ops, mem, d,
                 depth - 1);
@@ -6877,6 +6963,99 @@ public class ExtractIR extends GhidraScript {
             }
         }
         return null;
+    }
+
+    /** v65 resolver-side peel (step-3): the next varnode when
+        following through one transparent op, or null when the op
+        is not transparent. Transparent = COPY, INT_SEXT,
+        INT_ZEXT, CAST, INT_OR/INT_ADD with a side folding to
+        const 0, INT_SUB with the subtrahend folding to const 0,
+        INT_AND with a side folding to the ISA instruction tag
+        mask (the jalr low-bit mask; function entries are even,
+        so the mask does not change which entry the value
+        points to). The 0/mask tests use resolveValue, so they
+        are transitive. INT_LEFT is deliberately NOT here: it
+        changes the value, so following it would corrupt the
+        INT_ADD const the tier branch reads; INT_LEFT folds
+        inside resolveValue instead (which is what the lui
+        chain needs). */
+    private Varnode resTransparentNext(OpRec d, List<OpRec> ops,
+        Memory mem, int defIdx) {
+        if (d == null) return null;
+        if (d.mnem.equals("COPY") && d.ins.length == 1)
+            return d.ins[0];
+        if ((d.mnem.equals("INT_SEXT") ||
+            d.mnem.equals("INT_ZEXT") ||
+            d.mnem.equals("CAST")) && d.ins.length == 1)
+            return d.ins[0];
+        if ((d.mnem.equals("INT_OR") || d.mnem.equals("INT_ADD")) &&
+            d.ins.length == 2) {
+            Long c0 = resolveValue(d.ins[0], ops, mem, defIdx, 4);
+            Long c1 = resolveValue(d.ins[1], ops, mem, defIdx, 4);
+            if (c0 != null && c0.longValue() == 0L) return d.ins[1];
+            if (c1 != null && c1.longValue() == 0L) return d.ins[0];
+            return null;
+        }
+        if (d.mnem.equals("INT_SUB") && d.ins.length == 2) {
+            Long c1 = resolveValue(d.ins[1], ops, mem, defIdx, 4);
+            if (c1 != null && c1.longValue() == 0L) return d.ins[0];
+            return null;
+        }
+        if (d.mnem.equals("INT_AND") && d.ins.length == 2) {
+            Long c0 = resolveValue(d.ins[0], ops, mem, defIdx, 4);
+            Long c1 = resolveValue(d.ins[1], ops, mem, defIdx, 4);
+            if (c0 != null &&
+                isa.isInstructionTagMask(c0.longValue()))
+                return d.ins[1];
+            if (c1 != null &&
+                isa.isInstructionTagMask(c1.longValue()))
+                return d.ins[0];
+            return null;
+        }
+        return null;
+    }
+
+    /** v65 resolver-side peel (step-3): follow a def chain
+        through transparent ops and return the index of the
+        first NON-transparent def, or the index passed in when
+        it is already non-transparent, or -1 when no def is
+        found. Mirrors the classifier's clsPeelDef (step-2).
+        Every step uses findDef -- the LATEST def in
+        op-sequence order before the use. Cap 20 hops,
+        fail-closed beyond. */
+    private int resPeelDef(List<OpRec> ops, Memory mem,
+        Varnode v, int pos, int maxHops) {
+        if (v == null || v.isConstant()) return -1;
+        int cur = findDef(ops, vkey(v), pos);
+        for (int hop = 0; hop < maxHops && cur >= 0; hop++) {
+            OpRec d = ops.get(cur);
+            Varnode nx = resTransparentNext(d, ops, mem, cur);
+            if (nx == null) break;
+            if (nx.isConstant()) break;
+            int nu = findDef(ops, vkey(nx), cur);
+            if (nu < 0) break;
+            cur = nu;
+        }
+        return cur;
+    }
+
+    /** v65 resolver-peel fix: an INT_ADD def is usable for the
+        OFFSET/TABLE tier only when it has one constant side
+        (the field offset) and one register side (the base).
+        Used by the tier-path fallback in
+        resolveIndirectSetTier. */
+    private static boolean resUsableIntAdd(List<OpRec> ops, int idx) {
+        if (idx < 0) return false;
+        OpRec ad = ops.get(idx);
+        if (!ad.mnem.equals("INT_ADD") || ad.ins.length != 2)
+            return false;
+        boolean hasConst = false;
+        boolean hasReg = false;
+        for (int s = 0; s < 2; s++) {
+            if (ad.ins[s].isConstant()) hasConst = true;
+            else hasReg = true;
+        }
+        return hasConst && hasReg;
     }
 
     /** v3.6: shared indirect-target resolution for one indirect site
@@ -6975,7 +7154,30 @@ public class ExtractIR extends GhidraScript {
                 Set<String> st = byAddr.get(a.longValue());
                 if (st != null) tset.addAll(st);
             } else {
-                int da = findDef(ops, vkey(addrV), def);
+                // v65 resolver-side peel (step-3): the address
+                // varnode's def may be a COPY (or SEXT/ZEXT/
+                // CAST/mask) of the INT_ADD result, not the
+                // INT_ADD itself (kernel 81109cc8: unique:0x180
+                // is a COPY of the INT_ADD result). Peel
+                // transparent ops first, then test the opcode.
+                int da = resPeelDef(ops, mem, addrV, def, 20);
+                // v65 resolver-peel fix: if the peel yields no
+                // usable INT_ADD, fall back to the direct def.
+                // The peel treats INT_ADD(x, 0) as transparent
+                // and follows it to the base register's def; for
+                // struct-field loads at offset 0 the base is a
+                // live-in with no INT_ADD def, so the tier found
+                // no INT_ADD and the byOffset key 0 was never
+                // looked up (cdc_msc, rp2040, zephyr, blackmagic
+                // losses). The direct def IS the INT_ADD(reg, 0)
+                // the old code used. Gains are unaffected: the
+                // peel succeeds for COPY-of-INT_ADD(+4) and
+                // nested (base+C)+0, so the fallback never fires
+                // for them.
+                if (!resUsableIntAdd(ops, da)) {
+                    int dd = findDef(ops, vkey(addrV), def);
+                    if (dd >= 0) da = dd;
+                }
                 if (da >= 0) {
                     OpRec ad = ops.get(da);
                     if (ad.mnem.equals("INT_ADD") &&
@@ -7038,6 +7240,51 @@ public class ExtractIR extends GhidraScript {
                                     byOffset.get(cval);
                                 if (st != null) {
                                     tset.addAll(st);
+                                }
+                                // v65 resolver-peel refined fix:
+                                // when the peeled OFFSET lookup
+                                // yields an EMPTY set, ALSO look up
+                                // the direct-def key and union it in
+                                // (only if the direct def is a usable
+                                // INT_ADD with a different const).
+                                // The peel follows +0 to the inner
+                                // INT_ADD(reg,8) for (base+8)+0
+                                // loads; for zephyr 00002e18 the +8
+                                // is the ARRAY STRIDE, not a field
+                                // offset, so key 8 is empty while
+                                // sys_clock_timeout_handler is stored
+                                // under key 0. The qspi site 12019270
+                                // has the identical pcode shape but
+                                // key 8 is correct there, so the
+                                // fallback must fire only on empty
+                                // (non-empty peeled sets are left
+                                // precise). Blackmagic COPY-of-INT_ADD
+                                // gains are unaffected: their direct
+                                // def is a COPY, not a usable
+                                // INT_ADD, so no fallback fires.
+                                if (st == null || st.isEmpty()) {
+                                    int directDef = findDef(ops,
+                                        vkey(addrV), def);
+                                    if (directDef >= 0 &&
+                                        directDef != da &&
+                                        resUsableIntAdd(ops,
+                                            directDef)) {
+                                        OpRec dad =
+                                            ops.get(directDef);
+                                        long directCval = -1;
+                                        for (int s = 0; s < 2; s++) {
+                                            if (dad.ins[s].isConstant())
+                                                directCval =
+                                                    dad.ins[s].getOffset();
+                                        }
+                                        if (directCval != cval) {
+                                            Set<String> dst =
+                                                byOffset.get(directCval);
+                                            if (dst != null) {
+                                                tset.addAll(dst);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -10717,8 +10964,11 @@ public class ExtractIR extends GhidraScript {
 
     /** v3.6 whole-image literal scan. Reads every word of initialized
         program memory; a word equal to a function entry (Thumb bit
-        masked) is a stored pointer. Pointers already in the store
-        map need nothing. The rest are attributed to a field by name
+        masked) is a stored pointer. v3.32: a pointer already in the
+        store map is skipped only when it is recorded at one of the
+        matched field's offsets (field-precise suppression); a name
+        recorded at an unrelated offset is still attributed. The
+        rest are attributed to a field by name
         (exact field name, or longest field-name suffix: a name
         ending in _field, or containing _field_); ties and
         non-matches are listed as unattributed, never guessed.
@@ -10727,6 +10977,15 @@ public class ExtractIR extends GhidraScript {
     private LiteralScanResult scanLiteralStores(Memory mem,
         FunctionManager fm, Map<Long, Set<String>> byOffset,
         Map<Long, Set<String>> byAddr) {
+        // v3.32 field-precise suppression: `covered` (the union of
+        // all byOffset/byAddr values) is used only where no field
+        // is matched (command handlers, ties, non-matches, fields
+        // with no known offsets). A name matched to a field is
+        // skipped only when it is already recorded at one of THAT
+        // field's offsets (checked below via byOffset.get(offs[q])):
+        // a function can be a first-field callback of one struct
+        // (offset 0) and a detach callback of another (offset 8),
+        // and the global-name rule conflated the two.
         Set<String> covered = new HashSet<String>();
         for (Set<String> s : byOffset.values()) covered.addAll(s);
         for (Set<String> s : byAddr.values()) covered.addAll(s);
@@ -10757,8 +11016,7 @@ public class ExtractIR extends GhidraScript {
                     }
                     if (fn == null) continue;
                     String name = fn.getName();
-                    if (covered.contains(name)) continue;
-                    if (!seen.add(name)) continue;
+                    if (seen.contains(name)) continue;
                     // Command handlers (GDB monitor commands,
                     // remote-protocol handlers, target commands)
                     // are stored in command tables, never in ops
@@ -10770,6 +11028,10 @@ public class ExtractIR extends GhidraScript {
                         name.startsWith("exec_") ||
                         name.startsWith("target_cmd_") ||
                         name.contains("_cmd_")) {
+                        // No field is matched for command handlers:
+                        // keep the old global-name rule here.
+                        if (covered.contains(name)) continue;
+                        seen.add(name);
                         unattributed.add(name);
                         continue;
                     }
@@ -10790,15 +11052,38 @@ public class ExtractIR extends GhidraScript {
                         }
                     }
                     if (best == null || tie) {
+                        // No field matched: keep the old global-name
+                        // rule here.
+                        if (covered.contains(name)) continue;
+                        seen.add(name);
                         unattributed.add(name);
                     } else {
+                        long[] offs = fieldOffsets(best);
+                        if (offs == null || offs.length == 0) {
+                            if (covered.contains(name)) continue;
+                        } else {
+                            // Field-precise suppression: skip only
+                            // when the name is already recorded at
+                            // one of THIS field's offsets.
+                            boolean coveredHere = false;
+                            for (int q = 0; q < offs.length; q++) {
+                                Set<String> atOff =
+                                    byOffset.get(offs[q]);
+                                if (atOff != null &&
+                                    atOff.contains(name)) {
+                                    coveredHere = true;
+                                    break;
+                                }
+                            }
+                            if (coveredHere) continue;
+                        }
+                        seen.add(name);
                         Set<String> s = attributions.get(best);
                         if (s == null) {
                             s = new HashSet<String>();
                             attributions.put(best, s);
                         }
                         s.add(name);
-                        long[] offs = fieldOffsets(best);
                         if (offs != null) {
                             for (int q = 0; q < offs.length; q++) {
                                 putStore(byOffset, offs[q], name);
@@ -16820,7 +17105,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.31\",");
+        w.println("  \"extractor_version\": \"v3.32\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
