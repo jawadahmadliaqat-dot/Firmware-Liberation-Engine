@@ -6990,6 +6990,24 @@ public class ExtractIR extends GhidraScript {
             if (a == null) return null;
             return -a.longValue();
         }
+        // v66 mask wall: INT_AND with a tag-mask side (the jalr
+        // bit-0 clear). Fold both sides exactly; when one side is
+        // the ISA instruction tag mask, the result is the true
+        // masked address (for an even function address C,
+        // C & -2 == C). Any other mask stays fail-closed (null):
+        // a field-extracting mask does not preserve the function
+        // address and must not fold through here. Mirrors
+        // constFold's INT_AND case, restricted to tag masks.
+        if (dd.mnem.equals("INT_AND") && dd.ins.length == 2) {
+            Long a = resolveValueCore(dd.ins[0], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
+            Long b = resolveValueCore(dd.ins[1], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
+            if (a == null || b == null) return null;
+            if (isa.isInstructionTagMask(a.longValue()))
+                return b.longValue() & a.longValue();
+            if (isa.isInstructionTagMask(b.longValue()))
+                return a.longValue() & b.longValue();
+            return null;
+        }
         if (dd.mnem.equals("LOAD") && dd.ins.length >= 2) {
             Long a = resolveValueCore(dd.ins[1], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
             if (a == null) return null;
@@ -7064,6 +7082,21 @@ public class ExtractIR extends GhidraScript {
                 depth - 1);
             if (a == null) return null;
             return -a.longValue();
+        }
+        // v66 mask wall: mirror of the INT_AND case in
+        // resolveValueCore (see the comment there); Wide stays
+        // identical except findDefWide, as documented.
+        if (dd.mnem.equals("INT_AND") && dd.ins.length == 2) {
+            Long a = resolveValueWide(dd.ins[0], ops, mem, d,
+                depth - 1);
+            Long b = resolveValueWide(dd.ins[1], ops, mem, d,
+                depth - 1);
+            if (a == null || b == null) return null;
+            if (isa.isInstructionTagMask(a.longValue()))
+                return b.longValue() & a.longValue();
+            if (isa.isInstructionTagMask(b.longValue()))
+                return a.longValue() & b.longValue();
+            return null;
         }
         if (dd.mnem.equals("LOAD") && dd.ins.length >= 2) {
             Long a = resolveValueWide(dd.ins[1], ops, mem, d,
@@ -7267,6 +7300,43 @@ public class ExtractIR extends GhidraScript {
         OpRec d = ops.get(def);
         if (!d.mnem.equals("LOAD") || d.ins.length < 2 ||
             d.out == null || d.out.getSize() != isa.pointerSize()) {
+            // v66 mask wall: the target may fold to a constant
+            // through a tag-mask INT_AND (la+and+jalr) or a
+            // COPY-of-const chain even though it is not a LOAD.
+            // Try the target fold (exact, kill-aware); on a const,
+            // ADDR tier with the same addMemFunc + byAddr lookup
+            // as the LOAD branch. Fires only here, after the LOAD
+            // branch did not: a LOAD whose address does not fold
+            // cannot fold as a target either (same fold, less
+            // depth), so the LOAD-empty case needs no second try.
+            // Depth 8, not the usual 4: a jalr-masked target chain
+            // is ~6 levels deep (COPY + jalr AND + explicit AND +
+            // INT_ADD + INT_SEXT + INT_LEFT for lui+daddiu), and
+            // depth 4 exhausts before the lui (proven by the
+            // blob control: caller_b stayed unresolved at 4).
+            Long c = resolveValueCore(call.ins[0], ops, mem, i, 8, killMips, true, "tier-target-fold", i);
+            if (c != null) {
+                tier = TIER_ADDR;
+                // c is a CONSTANT target address, and it can be
+                // either (i) a function entry itself (la+and+jalr)
+                // or (ii) a pointer variable's address (the true
+                // target is the word stored there). The LOAD
+                // branch's addMemFunc covers (ii) only: it reads
+                // the word AT c, which for (i) is the callee's
+                // first instruction bytes, not a pointer. So do
+                // both lookups: the function AT c, and the pointer
+                // stored at c, plus any runtime stores at c. The
+                // wrong ones return null/empty harmlessly.
+                try {
+                    Function fn = fm.getFunctionAt(
+                        toAddr(c.longValue()));
+                    if (fn != null) tset.add(fn.getName());
+                } catch (Exception e) {
+                }
+                addMemFunc(mem, fm, c.longValue(), tset);
+                Set<String> st = byAddr.get(c.longValue());
+                if (st != null) tset.addAll(st);
+            }
             if (tierOut != null) tierOut[0] = tier;
             return tset;
         }
@@ -7912,6 +7982,27 @@ public class ExtractIR extends GhidraScript {
                             term = "call-return";
                         } else if (curOp.mnem.equals("MULTIEQUAL")) {
                             term = "PHI";
+                        } else {
+                            // v66 mask wall: the target chain folds
+                            // to a constant (la+and+jalr, COPY-of-
+                            // const) even though the terminal op is
+                            // not a LOAD. Mirror the tier's target
+                            // fold so the term agrees with the
+                            // resolution; diagnostic only, no JSON.
+                            // (kill=false, as the resolveValue call
+                            // above; a call-clobbered fold can read
+                            // const here while the tier stays NONE.)
+                            // Depth 8, not 4, for the same reason as
+                            // the tier's target fold: a jalr-masked
+                            // chain is ~6 levels deep.
+                            Long a = resolveValue(tgt, ops, mem, i, 8);
+                            if (a != null) {
+                                term = "const";
+                                shape = "const";
+                                sec = clsSectionName(mem,
+                                    a.longValue());
+                                addrDiag = a;
+                            }
                         }
                     }
                 }
@@ -17235,7 +17326,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.33\",");
+        w.println("  \"extractor_version\": \"v3.34\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
