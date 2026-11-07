@@ -560,6 +560,18 @@ public class ExtractIR extends GhidraScript {
     private boolean clsDumpDone = false;
     private java.util.List<String> clsDump =
         new ArrayList<String>();
+    /** v65 call-clobber kill (step-4): shadow log of folds killed
+        (MIPS) or would-be killed (other ISAs, log-only) by an
+        intervening CALL/CALLIND whose clobber set overlaps the
+        sought register. One line per kill: site = use instruction,
+        reg = sought varnode key, call = intervening CALL address,
+        olddef = def index the old code would have used (-1 none),
+        consumer = the fold that was killed, applied = whether the
+        kill took effect (MIPS only). */
+    private java.util.List<String> clsClobberKills =
+        new ArrayList<String>();
+    private int clsClobberKillApplied = 0;
+    private int clsClobberKillWouldBe = 0;
 
     /** v65: plausible C identifier (kernel symbol names). Rejects
         empty names and relocation-table garbage bytes. */
@@ -5917,6 +5929,88 @@ public class ExtractIR extends GhidraScript {
         return -1;
     }
 
+    /** v65 call-clobber kill (step-4): the kill applies on MIPS
+        only; other ISAs get a shadow-log entry and the old fold.
+        MIPS is the ISA whose call-clobbered mis-folds are proven
+        (kernel rodata_store_count 268); other ISAs are log-only
+        until their own evidence exists. */
+    private boolean killForMips() {
+        return isa != null && isa.name().equals("MIPS");
+    }
+
+    /** v65 call-clobber kill (step-4): findDef's loop and 40-op
+        window, with a kill. At each j, first the def-match (as
+        findDef); otherwise, if op j is a CALL/CALLIND whose clobber
+        set (clobberForCall) overlaps the sought varnode v -- a
+        register interval overlap from the Varnode offset/size, NOT
+        the vkey string; on MIPS64 each clobbered register is an
+        8-byte slot (isa.pointerSize()) -- the fold is dead: log a
+        witness and return -2 when applyKill, else log a would-be
+        kill and keep walking (the old fold stands). Only registers
+        are checked (uniques never span a call; constants have no
+        def). The use op itself (pos) is never scanned, so a CALLIND
+        being resolved cannot kill itself. A def in a delay slot sits
+        BEFORE its CALL op in the list, so walking back from a use
+        after the CALL meets the CALL first: the delay-slot def is
+        killed too. Returns the def index, -1 when none, -2 when
+        killed. Only the NEAREST clobbering CALL is logged per
+        lookup. CALLOTHER is not scanned (known limitation). */
+    private int findDefKillCall(List<OpRec> ops, Varnode v, int pos,
+        boolean applyKill, String consumer, int sitePos) {
+        if (v == null) return -1;
+        String key = vkey(v);
+        boolean regSpace = false;
+        long vOff = 0L;
+        long vSize = 0L;
+        try {
+            if (v.getAddress() != null &&
+                "register".equals(v.getAddress().getAddressSpace().getName())) {
+                regSpace = true;
+                vOff = v.getOffset();
+                vSize = v.getSize();
+            }
+        } catch (Exception e) {
+            regSpace = false;
+        }
+        boolean logged = false;
+        for (int j = pos - 1; j >= 0 && j >= pos - 40; j--) {
+            Varnode out = ops.get(j).out;
+            if (out != null && vkey(out).equals(key)) return j;
+            if (!regSpace || logged) continue;
+            OpRec oj = ops.get(j);
+            if (!oj.mnem.equals("CALL") && !oj.mnem.equals("CALLIND")) continue;
+            long[] clob = null;
+            try {
+                clob = clobberForCall(oj);
+            } catch (Exception e) {
+                clob = null;
+            }
+            if (clob == null) continue;
+            long ext = isa.pointerSize();
+            boolean overlap = false;
+            for (int c = 0; c < clob.length; c++) {
+                long cs = clob[c];
+                long ce = cs + ext;
+                if (vOff < ce && cs < vOff + vSize) { overlap = true; break; }
+            }
+            if (!overlap) continue;
+            logged = true;
+            int olddef = findDef(ops, key, j);
+            String site = "?";
+            String callAddr = "?";
+            try { site = ops.get(sitePos).instrAddr.toString(); } catch (Exception e) { }
+            try { callAddr = ops.get(j).instrAddr.toString(); } catch (Exception e) { }
+            clsClobberKills.add("clobber_kill site=" + site +
+                " reg=" + key + " call=" + callAddr +
+                " olddef=" + olddef + " consumer=" + consumer +
+                " applied=" + applyKill);
+            if (applyKill) clsClobberKillApplied++;
+            else clsClobberKillWouldBe++;
+            if (applyKill) return -2;
+        }
+        return -1;
+    }
+
     /** v2 item #3, Prov-pass ONLY def lookup (window 200).
         x86-64 P-Code expands each instruction into many ops, so
         argument setup (e.g. an R9 GUID loaded 60+ ops before its
@@ -6690,6 +6784,8 @@ public class ExtractIR extends GhidraScript {
     private void collectFuncPtrStores(List<OpRec> ops, Memory mem,
         FunctionManager fm, Map<Long, Set<String>> byOffset,
         Map<Long, Set<String>> byAddr) {
+        // v65 call-clobber kill (step-4): MIPS-only, once per function.
+        boolean killMips = killForMips();
         for (int i = 0; i < ops.size(); i++) {
             OpRec op = ops.get(i);
             if (!op.mnem.equals("STORE") || op.ins.length < 3) continue;
@@ -6704,7 +6800,7 @@ public class ExtractIR extends GhidraScript {
             if (a.isConstant()) {
                 destAddr = a.getOffset();
             } else {
-                destAddr = resolveValue(a, ops, mem, i, 4);
+                destAddr = resolveValueCore(a, ops, mem, i, 4, killMips, true, "store-dest", i);
             }
             // v65 step-2 positive control: every STORE with a
             // constant destination, any section.
@@ -6721,7 +6817,7 @@ public class ExtractIR extends GhidraScript {
             }
             // Value: any chain that resolves to a function entry
             // (const, COPY, LOAD from a flash table, ...).
-            Long val = resolveValue(op.ins[2], ops, mem, i, 4);
+            Long val = resolveValueCore(op.ins[2], ops, mem, i, 4, killMips, true, "store-value", i);
             if (val == null) continue;
             long funcAddr = isa.stripInstructionTag(val.longValue());
             String funcName = null;
@@ -6754,7 +6850,7 @@ public class ExtractIR extends GhidraScript {
                 // v65 resolver-side peel (step-3): same peel as
                 // the tier path -- the store address's def may be
                 // a COPY of the INT_ADD result.
-                int da = resPeelDef(ops, mem, a, i, 20);
+                int da = resPeelDef(ops, mem, a, i, 20, killMips, true, "store-peel", i);
                 if (da >= 0) {
                     OpRec ad = ops.get(da);
                     if (ad.mnem.equals("INT_ADD") &&
@@ -6815,6 +6911,18 @@ public class ExtractIR extends GhidraScript {
         the caller counts those as unresolved, never guesses. */
     private Long resolveValue(Varnode v, List<OpRec> ops, Memory mem,
         int pos, int depth) {
+        // v65 call-clobber kill (step-4): old signature preserved
+        // for the out-of-scope callers (classifier clsSite,
+        // storeAddrNumeric, applyTailVeto, recoverTailCalls); they
+        // keep the old fold (kill=false, shadow=false). In-scope
+        // callers use resolveValueCore directly.
+        return resolveValueCore(v, ops, mem, pos, depth,
+            false, false, "resolveValue", pos);
+    }
+
+    private Long resolveValueCore(Varnode v, List<OpRec> ops, Memory mem,
+        int pos, int depth, boolean kill, boolean shadow,
+        String consumer, int sitePos) {
         if (v.isConstant()) return v.getOffset();
         // A varnode in a memory space (e.g. "ram") is a memory
         // cell, not a computed value: its value is the word at
@@ -6832,15 +6940,20 @@ public class ExtractIR extends GhidraScript {
             }
         }
         if (depth <= 0) return null;
-        int d = findDef(ops, vkey(v), pos);
+        int d;
+        if (kill || shadow) {
+            d = findDefKillCall(ops, v, pos, kill, consumer, sitePos);
+        } else {
+            d = findDef(ops, vkey(v), pos);
+        }
         if (d < 0) return null;
         OpRec dd = ops.get(d);
         if (dd.mnem.equals("COPY") && dd.ins.length == 1) {
-            return resolveValue(dd.ins[0], ops, mem, d, depth - 1);
+            return resolveValueCore(dd.ins[0], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
         }
         if (dd.mnem.equals("INT_ADD") && dd.ins.length == 2) {
-            Long a = resolveValue(dd.ins[0], ops, mem, d, depth - 1);
-            Long b = resolveValue(dd.ins[1], ops, mem, d, depth - 1);
+            Long a = resolveValueCore(dd.ins[0], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
+            Long b = resolveValueCore(dd.ins[1], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
             if (a != null && b != null) {
                 return a.longValue() + b.longValue();
             }
@@ -6857,7 +6970,7 @@ public class ExtractIR extends GhidraScript {
         // INT_AND-mask peel in resTransparentNext can test it.
         // Fail-closed: any side that does not fold -> null.
         if (dd.mnem.equals("INT_SEXT") && dd.ins.length == 1) {
-            Long a = resolveValue(dd.ins[0], ops, mem, d, depth - 1);
+            Long a = resolveValueCore(dd.ins[0], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
             if (a == null) return null;
             int inSize = dd.ins[0].getSize();
             if (inSize < 1 || inSize > 8) return null;
@@ -6865,20 +6978,20 @@ public class ExtractIR extends GhidraScript {
             return (a.longValue() << shift) >> shift;
         }
         if (dd.mnem.equals("INT_LEFT") && dd.ins.length == 2) {
-            Long a = resolveValue(dd.ins[0], ops, mem, d, depth - 1);
-            Long b = resolveValue(dd.ins[1], ops, mem, d, depth - 1);
+            Long a = resolveValueCore(dd.ins[0], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
+            Long b = resolveValueCore(dd.ins[1], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
             if (a == null || b == null) return null;
             if (b.longValue() < 0L || b.longValue() >= 64L)
                 return null;
             return a.longValue() << b.longValue();
         }
         if (dd.mnem.equals("INT_2COMP") && dd.ins.length == 1) {
-            Long a = resolveValue(dd.ins[0], ops, mem, d, depth - 1);
+            Long a = resolveValueCore(dd.ins[0], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
             if (a == null) return null;
             return -a.longValue();
         }
         if (dd.mnem.equals("LOAD") && dd.ins.length >= 2) {
-            Long a = resolveValue(dd.ins[1], ops, mem, d, depth - 1);
+            Long a = resolveValueCore(dd.ins[1], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
             if (a == null) return null;
             try {
                 return isa.readPointer(mem, toAddr(a.longValue()));
@@ -6980,7 +7093,8 @@ public class ExtractIR extends GhidraScript {
         inside resolveValue instead (which is what the lui
         chain needs). */
     private Varnode resTransparentNext(OpRec d, List<OpRec> ops,
-        Memory mem, int defIdx) {
+        Memory mem, int defIdx, boolean kill, boolean shadow,
+        String consumer, int sitePos) {
         if (d == null) return null;
         if (d.mnem.equals("COPY") && d.ins.length == 1)
             return d.ins[0];
@@ -6990,20 +7104,20 @@ public class ExtractIR extends GhidraScript {
             return d.ins[0];
         if ((d.mnem.equals("INT_OR") || d.mnem.equals("INT_ADD")) &&
             d.ins.length == 2) {
-            Long c0 = resolveValue(d.ins[0], ops, mem, defIdx, 4);
-            Long c1 = resolveValue(d.ins[1], ops, mem, defIdx, 4);
+            Long c0 = resolveValueCore(d.ins[0], ops, mem, defIdx, 4, kill, shadow, consumer, sitePos);
+            Long c1 = resolveValueCore(d.ins[1], ops, mem, defIdx, 4, kill, shadow, consumer, sitePos);
             if (c0 != null && c0.longValue() == 0L) return d.ins[1];
             if (c1 != null && c1.longValue() == 0L) return d.ins[0];
             return null;
         }
         if (d.mnem.equals("INT_SUB") && d.ins.length == 2) {
-            Long c1 = resolveValue(d.ins[1], ops, mem, defIdx, 4);
+            Long c1 = resolveValueCore(d.ins[1], ops, mem, defIdx, 4, kill, shadow, consumer, sitePos);
             if (c1 != null && c1.longValue() == 0L) return d.ins[0];
             return null;
         }
         if (d.mnem.equals("INT_AND") && d.ins.length == 2) {
-            Long c0 = resolveValue(d.ins[0], ops, mem, defIdx, 4);
-            Long c1 = resolveValue(d.ins[1], ops, mem, defIdx, 4);
+            Long c0 = resolveValueCore(d.ins[0], ops, mem, defIdx, 4, kill, shadow, consumer, sitePos);
+            Long c1 = resolveValueCore(d.ins[1], ops, mem, defIdx, 4, kill, shadow, consumer, sitePos);
             if (c0 != null &&
                 isa.isInstructionTagMask(c0.longValue()))
                 return d.ins[1];
@@ -7024,15 +7138,29 @@ public class ExtractIR extends GhidraScript {
         op-sequence order before the use. Cap 20 hops,
         fail-closed beyond. */
     private int resPeelDef(List<OpRec> ops, Memory mem,
-        Varnode v, int pos, int maxHops) {
+        Varnode v, int pos, int maxHops,
+        boolean kill, boolean shadow, String consumer, int sitePos) {
         if (v == null || v.isConstant()) return -1;
-        int cur = findDef(ops, vkey(v), pos);
+        int cur;
+        if (kill || shadow) {
+            cur = findDefKillCall(ops, v, pos, kill, consumer, sitePos);
+        } else {
+            cur = findDef(ops, vkey(v), pos);
+        }
+        if (cur < 0) return cur;
         for (int hop = 0; hop < maxHops && cur >= 0; hop++) {
             OpRec d = ops.get(cur);
-            Varnode nx = resTransparentNext(d, ops, mem, cur);
+            Varnode nx = resTransparentNext(d, ops, mem, cur,
+                kill, shadow, consumer, sitePos);
             if (nx == null) break;
             if (nx.isConstant()) break;
-            int nu = findDef(ops, vkey(nx), cur);
+            int nu;
+            if (kill || shadow) {
+                nu = findDefKillCall(ops, nx, cur, kill, consumer, sitePos);
+            } else {
+                nu = findDef(ops, vkey(nx), cur);
+            }
+            if (nu == -2) return -2;
             if (nu < 0) break;
             cur = nu;
         }
@@ -7095,6 +7223,8 @@ public class ExtractIR extends GhidraScript {
         Set<String> tset = new HashSet<String>();
         int tier = TIER_NONE;
         OpRec call = ops.get(i);
+        // v65 call-clobber kill (step-4): MIPS-only, once per site.
+        boolean killMips = killForMips();
         if (call.ins.length < 1) {
             if (tierOut != null) tierOut[0] = tier;
             return tset;
@@ -7110,7 +7240,7 @@ public class ExtractIR extends GhidraScript {
                     Varnode vv = dd.ins[s];
                     if (vv.isConstant() &&
                         isa.isInstructionTagMask(vv.getOffset())) {
-                        int du = findDef(ops, vkey(dd.ins[1 - s]), def);
+                        int du = findDefKillCall(ops, dd.ins[1 - s], def, killMips, "tier-mask", i);
                         if (du >= 0) {
                             def = du;
                             dd = ops.get(def);
@@ -7123,7 +7253,7 @@ public class ExtractIR extends GhidraScript {
                 for (int hop = 0; hop < 2; hop++) {
                     if (!dd.mnem.equals("COPY") || dd.ins.length != 1 ||
                         dd.ins[0].isConstant()) break;
-                    int du = findDef(ops, vkey(dd.ins[0]), def);
+                    int du = findDefKillCall(ops, dd.ins[0], def, killMips, "tier-copy", i);
                     if (du < 0) break;
                     def = du;
                     dd = ops.get(def);
@@ -7147,7 +7277,7 @@ public class ExtractIR extends GhidraScript {
             Set<String> st = byAddr.get(addrV.getOffset());
             if (st != null) tset.addAll(st);
         } else {
-            Long a = resolveValue(addrV, ops, mem, def, 4);
+            Long a = resolveValueCore(addrV, ops, mem, def, 4, killMips, true, "tier-addr", i);
             if (a != null) {
                 tier = TIER_ADDR;
                 addMemFunc(mem, fm, a.longValue(), tset);
@@ -7160,7 +7290,7 @@ public class ExtractIR extends GhidraScript {
                 // INT_ADD itself (kernel 81109cc8: unique:0x180
                 // is a COPY of the INT_ADD result). Peel
                 // transparent ops first, then test the opcode.
-                int da = resPeelDef(ops, mem, addrV, def, 20);
+                int da = resPeelDef(ops, mem, addrV, def, 20, killMips, true, "tier-peel", i);
                 // v65 resolver-peel fix: if the peel yields no
                 // usable INT_ADD, fall back to the direct def.
                 // The peel treats INT_ADD(x, 0) as transparent
@@ -7193,8 +7323,8 @@ public class ExtractIR extends GhidraScript {
                         }
                         if (constSide >= 0 && regSide >= 0) {
                             long cval = ad.ins[constSide].getOffset();
-                            int dr = findDef(ops,
-                                vkey(ad.ins[regSide]), da);
+                            int dr = findDefKillCall(ops,
+                                ad.ins[regSide], da, killMips, "tier-table", i);
                             boolean scaled = false;
                             if (dr >= 0) {
                                 OpRec rd = ops.get(dr);
@@ -17105,7 +17235,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.32\",");
+        w.println("  \"extractor_version\": \"v3.33\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
@@ -21330,6 +21460,15 @@ public class ExtractIR extends GhidraScript {
             cw.println("resolved_set_histogram_6_20=" + buckets[3]);
             cw.println("resolved_set_histogram_21_100=" + buckets[4]);
             cw.println("resolved_set_histogram_101plus=" + buckets[5]);
+            // v65 call-clobber kill (step-4): shadow log. Applied
+            // kills (MIPS) removed a fold; would-be kills (other
+            // ISAs) are log-only -- the fold stands. Every removed
+            // edge/store names its call.
+            cw.println("clobber_kill_total=" + clsClobberKillApplied);
+            cw.println("clobber_wouldbe_total=" + clsClobberKillWouldBe);
+            for (int ki = 0; ki < clsClobberKills.size(); ki++) {
+                cw.println(clsClobberKills.get(ki));
+            }
             cw.println("# --- jalr P-code dump (first unresolved jalr CALLIND, if any) ---");
             if (clsDump.isEmpty()) {
                 cw.println("# (no unresolved jalr site found)");
@@ -21368,6 +21507,8 @@ public class ExtractIR extends GhidraScript {
                 " 1=" + buckets[0] + " 2=" + buckets[1] +
                 " 3-5=" + buckets[2] + " 6-20=" + buckets[3] +
                 " 21-100=" + buckets[4] + " 101+=" + buckets[5]);
+            println("[*] classify: clobber kills=" + clsClobberKillApplied +
+                " would-be=" + clsClobberKillWouldBe);
         } catch (Exception e) {
             println("[!] classify: output failed: " + e);
         }
