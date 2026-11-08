@@ -6800,7 +6800,15 @@ public class ExtractIR extends GhidraScript {
             if (a.isConstant()) {
                 destAddr = a.getOffset();
             } else {
-                destAddr = resolveValueCore(a, ops, mem, i, 4, killMips, true, "store-dest", i);
+                // v67 chain wall (H2): depth 12, not 4 -- a LOAD hop
+                // costs 3 levels (the LOAD itself plus Ghidra's
+                // per-load address temporaries: an INT_ADD reg,0
+                // and a COPY through reused unique varnodes), and a
+                // lui+daddiu base costs 3 more; depth 4 silently
+                // dropped stores whose dest chain is 5+ levels deep.
+                // Recalibrated from 8 after blob control A5 failed
+                // at 8: its 2-hop value chain is 9 levels.
+                destAddr = resolveValueCore(a, ops, mem, i, 12, killMips, true, "store-dest", i);
             }
             // v65 step-2 positive control: every STORE with a
             // constant destination, any section.
@@ -6817,7 +6825,9 @@ public class ExtractIR extends GhidraScript {
             }
             // Value: any chain that resolves to a function entry
             // (const, COPY, LOAD from a flash table, ...).
-            Long val = resolveValueCore(op.ins[2], ops, mem, i, 4, killMips, true, "store-value", i);
+            // v67 chain wall (H2): depth 12 (same reason as
+            // the dest fold above).
+            Long val = resolveValueCore(op.ins[2], ops, mem, i, 12, killMips, true, "store-value", i);
             if (val == null) continue;
             long funcAddr = isa.stripInstructionTag(val.longValue());
             String funcName = null;
@@ -6959,6 +6969,32 @@ public class ExtractIR extends GhidraScript {
             }
             return null;
         }
+        // v67 chain wall (H1): INT_OR / INT_SUB with a side folding
+        // to const 0 are register moves (MIPS `move` is INT_OR with
+        // $zero; `subu x, y, $zero` is INT_SUB with a 0 subtrahend).
+        // They are identities (x|0 == x, x-0 == x), so they fold to
+        // the other side. The peel (resTransparentNext) already
+        // treats both as transparent and the classifier fold
+        // (clsConstValue) already has them; the resolver fold did
+        // not, so any `move` in the middle of a chain killed it.
+        // General INT_OR / INT_SUB are NOT folded here: a bitwise-or
+        // of two non-zero values is not an address identity.
+        // Fail-closed: any side that does not fold -> null.
+        if (dd.mnem.equals("INT_OR") && dd.ins.length == 2) {
+            Long a = resolveValueCore(dd.ins[0], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
+            Long b = resolveValueCore(dd.ins[1], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
+            if (a == null || b == null) return null;
+            if (a.longValue() == 0L) return b;
+            if (b.longValue() == 0L) return a;
+            return null;
+        }
+        if (dd.mnem.equals("INT_SUB") && dd.ins.length == 2) {
+            Long a = resolveValueCore(dd.ins[0], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
+            Long b = resolveValueCore(dd.ins[1], ops, mem, d, depth - 1, kill, shadow, consumer, sitePos);
+            if (a == null || b == null) return null;
+            if (b.longValue() == 0L) return a;
+            return null;
+        }
         // v65 resolver-side peel (step-3): INT_SEXT / INT_LEFT /
         // INT_2COMP of folded constants. SEXT sign-extends from
         // the INPUT size (lui+daddiu assembles 64-bit addresses
@@ -7052,6 +7088,28 @@ public class ExtractIR extends GhidraScript {
             if (a != null && b != null) {
                 return a.longValue() + b.longValue();
             }
+            return null;
+        }
+        // v67 chain wall (H1): mirror of the INT_OR-0 / INT_SUB-0
+        // cases in resolveValueCore (see the comment there); Wide
+        // stays identical except findDefWide, as documented.
+        if (dd.mnem.equals("INT_OR") && dd.ins.length == 2) {
+            Long a = resolveValueWide(dd.ins[0], ops, mem, d,
+                depth - 1);
+            Long b = resolveValueWide(dd.ins[1], ops, mem, d,
+                depth - 1);
+            if (a == null || b == null) return null;
+            if (a.longValue() == 0L) return b;
+            if (b.longValue() == 0L) return a;
+            return null;
+        }
+        if (dd.mnem.equals("INT_SUB") && dd.ins.length == 2) {
+            Long a = resolveValueWide(dd.ins[0], ops, mem, d,
+                depth - 1);
+            Long b = resolveValueWide(dd.ins[1], ops, mem, d,
+                depth - 1);
+            if (a == null || b == null) return null;
+            if (b.longValue() == 0L) return a;
             return null;
         }
         // v65 resolver-side peel (step-3): mirror of the
@@ -7200,23 +7258,50 @@ public class ExtractIR extends GhidraScript {
         return cur;
     }
 
-    /** v65 resolver-peel fix: an INT_ADD def is usable for the
-        OFFSET/TABLE tier only when it has one constant side
-        (the field offset) and one register side (the base).
-        Used by the tier-path fallback in
-        resolveIndirectSetTier. */
-    private static boolean resUsableIntAdd(List<OpRec> ops, int idx) {
-        if (idx < 0) return false;
+    /** v67 chain wall (H3): an INT_ADD def is usable for the
+        OFFSET/TABLE tier when at least one side is a literal const
+        or folds to one (tierIntAddSides); both sides folding makes
+        it a constant ADDRESS (ADDR path). Supersedes the v65
+        syntactic rule (one literal const side + one register side),
+        which read a computed const side as unusable. Used by the
+        tier-path fallback in resolveIndirectSetTier. */
+    /** v67 chain wall (H3): fold each side of the INT_ADD at idx to
+        a constant (a literal, or resolveValueCore at depth 4,
+        kill-aware). Returns a 2-element array: sideVal[s] is the
+        const value of side s, or null when that side does not fold
+        to a constant. Returns null when idx is not an INT_ADD.
+        The tier branch uses it so a computed offset (lui+daddiu
+        chain) produces an OFFSET key like a literal one; both sides
+        folding means the INT_ADD is a constant ADDRESS. May-only
+        (tier path). Fail-closed: any fold miss -> null entry. */
+    private Long[] tierIntAddSides(List<OpRec> ops, Memory mem, int idx,
+        boolean kill, int sitePos) {
+        if (idx < 0) return null;
         OpRec ad = ops.get(idx);
         if (!ad.mnem.equals("INT_ADD") || ad.ins.length != 2)
-            return false;
-        boolean hasConst = false;
-        boolean hasReg = false;
+            return null;
+        Long[] sideVal = new Long[2];
         for (int s = 0; s < 2; s++) {
-            if (ad.ins[s].isConstant()) hasConst = true;
-            else hasReg = true;
+            if (ad.ins[s].isConstant()) {
+                sideVal[s] = ad.ins[s].getOffset();
+            } else {
+                sideVal[s] = resolveValueCore(ad.ins[s], ops, mem,
+                    idx, 4, kill, true, "tier-const-side", sitePos);
+            }
         }
-        return hasConst && hasReg;
+        return sideVal;
+    }
+
+    /** v67 chain wall (H3): fold-aware replacement for the old
+        syntactic resUsableIntAdd (deleted: it tested isConstant()
+        directly, so a computed const side read as unusable). An
+        INT_ADD is usable when at least one side is a literal const
+        or folds to one; both sides folding is usable too (the
+        caller takes the ADDR path for it). */
+    private boolean resUsableIntAddFolded(List<OpRec> ops, Memory mem,
+        int idx, boolean kill, int sitePos) {
+        Long[] sv = tierIntAddSides(ops, mem, idx, kill, sitePos);
+        return sv != null && (sv[0] != null || sv[1] != null);
     }
 
     /** v3.6: shared indirect-target resolution for one indirect site
@@ -7347,7 +7432,14 @@ public class ExtractIR extends GhidraScript {
             Set<String> st = byAddr.get(addrV.getOffset());
             if (st != null) tset.addAll(st);
         } else {
-            Long a = resolveValueCore(addrV, ops, mem, def, 4, killMips, true, "tier-addr", i);
+            // v67 chain wall (H1): depth 12, not 4 -- a LOAD hop
+            // costs 3 levels (LOAD + INT_ADD reg,0 + COPY through
+            // reused unique temporaries), so a 3-hop chain through
+            // a lui+daddiu base is 11 levels and exhausts depth 8
+            // (blob control A failed at 8; recalibrated to 12,
+            // which covers 3-hop chains; the 15-level control A3
+            // still proves the cap).
+            Long a = resolveValueCore(addrV, ops, mem, def, 12, killMips, true, "tier-addr", i);
             if (a != null) {
                 tier = TIER_ADDR;
                 addMemFunc(mem, fm, a.longValue(), tset);
@@ -7374,7 +7466,7 @@ public class ExtractIR extends GhidraScript {
                 // peel succeeds for COPY-of-INT_ADD(+4) and
                 // nested (base+C)+0, so the fallback never fires
                 // for them.
-                if (!resUsableIntAdd(ops, da)) {
+                if (!resUsableIntAddFolded(ops, mem, da, killMips, i)) {
                     int dd = findDef(ops, vkey(addrV), def);
                     if (dd >= 0) da = dd;
                 }
@@ -7382,17 +7474,38 @@ public class ExtractIR extends GhidraScript {
                     OpRec ad = ops.get(da);
                     if (ad.mnem.equals("INT_ADD") &&
                         ad.ins.length == 2) {
+                        // v67 chain wall (H3): each INT_ADD side is a
+                        // const when it is a literal OR folds to one
+                        // (tierIntAddSides, depth 4, kill-aware). The
+                        // old code tested isConstant() directly, so a
+                        // computed offset (lui+daddiu chain) never
+                        // produced an OFFSET key even though the
+                        // classifier folded it (blob control A4).
+                        Long[] sideVal = tierIntAddSides(ops, mem, da,
+                            killMips, i);
+                        if (sideVal == null) sideVal = new Long[2];
                         int constSide = -1;
                         int regSide = -1;
-                        for (int s = 0; s < 2; s++) {
-                            if (ad.ins[s].isConstant()) {
-                                constSide = s;
-                            } else {
-                                regSide = s;
-                            }
+                        if (sideVal[0] != null && sideVal[1] == null) {
+                            constSide = 0;
+                            regSide = 1;
+                        } else if (sideVal[1] != null &&
+                            sideVal[0] == null) {
+                            constSide = 1;
+                            regSide = 0;
                         }
-                        if (constSide >= 0 && regSide >= 0) {
-                            long cval = ad.ins[constSide].getOffset();
+                        if (sideVal[0] != null && sideVal[1] != null) {
+                            // Both sides folded: the INT_ADD is a
+                            // constant ADDRESS, not an offset. Same
+                            // lookups as the tier-addr path.
+                            long c = sideVal[0].longValue()
+                                + sideVal[1].longValue();
+                            tier = TIER_ADDR;
+                            addMemFunc(mem, fm, c, tset);
+                            Set<String> st = byAddr.get(c);
+                            if (st != null) tset.addAll(st);
+                        } else if (constSide >= 0 && regSide >= 0) {
+                            long cval = sideVal[constSide].longValue();
                             int dr = findDefKillCall(ops,
                                 ad.ins[regSide], da, killMips, "tier-table", i);
                             boolean scaled = false;
@@ -7467,15 +7580,29 @@ public class ExtractIR extends GhidraScript {
                                         vkey(addrV), def);
                                     if (directDef >= 0 &&
                                         directDef != da &&
-                                        resUsableIntAdd(ops,
-                                            directDef)) {
+                                        resUsableIntAddFolded(ops, mem,
+                                            directDef, killMips, i)) {
                                         OpRec dad =
                                             ops.get(directDef);
+                                        // v67 chain wall (H3): the
+                                        // direct def's const side may
+                                        // itself be computed, not a
+                                        // literal -- fold it like the
+                                        // main branch does.
+                                        Long[] dSideVal =
+                                            tierIntAddSides(ops, mem,
+                                                directDef, killMips, i);
                                         long directCval = -1;
-                                        for (int s = 0; s < 2; s++) {
-                                            if (dad.ins[s].isConstant())
-                                                directCval =
-                                                    dad.ins[s].getOffset();
+                                        if (dSideVal != null &&
+                                            dSideVal[0] != null &&
+                                            dSideVal[1] == null) {
+                                            directCval =
+                                                dSideVal[0].longValue();
+                                        } else if (dSideVal != null &&
+                                            dSideVal[1] != null &&
+                                            dSideVal[0] == null) {
+                                            directCval =
+                                                dSideVal[1].longValue();
                                         }
                                         if (directCval != cval) {
                                             Set<String> dst =
@@ -17326,7 +17453,7 @@ public class ExtractIR extends GhidraScript {
         w.println("  \"binary_name\": \"" + esc(currentProgram.getName()) + "\",");
         w.println("  \"language\": \"" +
             esc(currentProgram.getLanguage().getLanguageID().getIdAsString()) + "\",");
-        w.println("  \"extractor_version\": \"v3.34\",");
+        w.println("  \"extractor_version\": \"v3.35\",");
         // Effective MMIO bands, so the Lean verifier can check the
         // trace against this platform's bands (single source of
         // truth: the adapter's own constants, not a user-retyped
